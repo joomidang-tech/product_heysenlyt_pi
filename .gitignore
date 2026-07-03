@@ -1,0 +1,13 @@
+# Dart / Pub
+.dart_tool/
+.packages
+build/
+doc/api/
+*.dart.js
+*.info.json
+*.js.map
+.dart_tool/package_config.json
+
+# IDE
+.idea/
+*.iml
