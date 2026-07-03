@@ -57,7 +57,7 @@ DispenserTokenPayload? peekTokenPayload(String? token) {
     final Object? exp = decoded['exp'];
     final Object? iat = decoded['iat'];
     if (sub is! String || sub.isEmpty) return null;
-    if (role != dispenserRole) return null;
+    if (role is! String || role != dispenserRole) return null;
     if (exp is! int) return null;
     return DispenserTokenPayload(
       sub: sub,
