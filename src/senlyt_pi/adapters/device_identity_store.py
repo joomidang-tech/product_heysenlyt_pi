@@ -1,0 +1,99 @@
+"""디바이스 등록 정체성(deviceId·dispenserToken) 파일 영속 — 계약 RegisterResponse.
+
+등록(POST /api/dispensers/register) 결과를 로컬에 저장해 재부팅 간 유지한다.
+file_idempotency_ledger 의 crash-safe 결(temp 파일 + os.replace atomic swap + fsync)을
+따르되, 단일 JSON 문서(정체성 1건)라 append 로그는 불필요.
+
+토큰은 **opaque**(부록A P-5) — 여기서는 문자열 그대로 저장/전송만. 만료 판단은
+RegisterResponse.exp(epoch 초) 필드로 한다(payload 재파싱 불필요·서버 검증 대체 아님).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceIdentity:
+    """등록 정체성 — RegisterResponse + 등록에 쓴 hardwareId."""
+
+    device_id: str
+    dispenser_token: str  # opaque(부록A P-5) — 저장/전송만.
+    exp: int  # 만료 epoch(초) — RegisterResponse.exp
+    hardware_id: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "deviceId": self.device_id,
+            "dispenserToken": self.dispenser_token,
+            "exp": self.exp,
+            "hardwareId": self.hardware_id,
+        }
+
+    @staticmethod
+    def from_json(j: Any) -> "DeviceIdentity | None":
+        """방어 파싱 — 형식이 어긋나면 None(재등록 유도·crash 금지)."""
+        if not isinstance(j, dict):
+            return None
+        device_id = j.get("deviceId")
+        token = j.get("dispenserToken")
+        exp = j.get("exp")
+        hardware_id = j.get("hardwareId")
+        if not isinstance(device_id, str) or device_id == "":
+            return None
+        if not isinstance(token, str) or token == "":
+            return None
+        if isinstance(exp, bool) or not isinstance(exp, int):
+            return None
+        if not isinstance(hardware_id, str) or hardware_id == "":
+            return None
+        return DeviceIdentity(
+            device_id=device_id, dispenser_token=token, exp=exp, hardware_id=hardware_id
+        )
+
+
+def is_identity_expired(identity: DeviceIdentity, *, now_seconds: int) -> bool:
+    """exp ≤ now 면 만료(strict — dispenser_session.is_token_expired 와 동일 결).
+    만료 시 재등록으로 재발급(계약 RegisterResponse.dispenserToken)."""
+    return identity.exp <= now_seconds
+
+
+class DeviceIdentityStore:
+    """정체성 파일 저장소 — 원자 저장(temp+replace+fsync)·방어 로드."""
+
+    def __init__(self, path: Path | str) -> None:
+        self.path = Path(path)
+
+    def load(self) -> DeviceIdentity | None:
+        """저장된 정체성 로드. 부재/파손 → None(재등록 유도)."""
+        try:
+            raw = self.path.read_text(encoding="utf-8")
+        except (FileNotFoundError, OSError):
+            return None
+        try:
+            decoded = json.loads(raw)
+        except ValueError:
+            return None
+        return DeviceIdentity.from_json(decoded)
+
+    def save(self, identity: DeviceIdentity) -> None:
+        """원자 저장 — temp 파일에 쓰고 fsync 후 os.replace(atomic swap)."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        data = json.dumps(identity.to_json(), ensure_ascii=False)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.path)
+
+    def clear(self) -> None:
+        """정체성 삭제(재등록 강제)."""
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass

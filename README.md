@@ -3,7 +3,7 @@
 hey_senlyt **v1.2.0** 라즈베리파이4 headless 디스펜서 데몬 — 순수 Dart CLI(Firebase 무의존).
 3-서비스(web 주문 / monitor-web 관제 / **pi 디스펜서**) 중 pi 트랙.
 
-> **동결 계약 SoT** = `developer/hey_senlyt/v1.2.0/04_erd/hey_senlyt_v1.2.0_frozen_contract_sot.md`
+> **동결 계약 SoT** = `developer/hey_senlyt/v1.2.0/04_erd/hey_senlyt_erd.md`
 > 이 코드베이스의 `lib/core/*` 는 그 SoT를 **바이트 동일** 포팅한다. 서버 TS(`heysenlyt-web`)와
 > 동일 통과가 목표(부록A P-1~P-10 급소).
 

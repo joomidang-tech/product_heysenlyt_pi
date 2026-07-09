@@ -1,0 +1,29 @@
+# senlyt-pi — hey senlyt 라즈베리파이 데몬 (Dart → Python 재작성, v1.2.0).
+#
+# 포팅 오라클 = 이 레포의 Dart 구현(lib/·test/). 수치 정본 = heysenlyt-web
+# lib/server/pumpGuard.ts + settingsClamp.ts (서버 TS와 바이트-parity).
+# 외부 의존 최소(표준 라이브러리 우선). ⛔ firebase 계열 의존 0.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "senlyt-pi"
+version = "1.2.0"
+description = "hey senlyt pi daemon (hexagonal, Python port of the Dart implementation)"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+senlytd = "senlyt_pi.app.senlytd:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
