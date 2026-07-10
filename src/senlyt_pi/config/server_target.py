@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Mapping
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 # 환경 선택 env 키 (브랜치=환경 → 이 값 하나로 서버 타겟이 고정).
 SENLYT_ENV_KEY = "SENLYT_ENV"
@@ -128,9 +128,11 @@ def join_url(base_url: str, path: str) -> str:
 PATH_REGISTER = "/api/dispensers/register"
 PATH_LOGIN = "/api/dispenser/login"
 PATH_HEARTBEAT = "/api/dispenser/heartbeat"
+PATH_ORDERS = "/api/dispenser/orders"
 PATH_ORDERS_STREAM = "/api/dispenser/orders/stream"
 PATH_SETTINGS_STREAM = "/api/dispenser/settings"
 PATH_COMMANDSETS = "/api/dispenser/commandsets"
+PATH_TRACE = "/api/dispenser/trace"
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,3 +177,33 @@ class ServerConfig:
     @property
     def commandsets_url(self) -> str:
         return self.url(PATH_COMMANDSETS)
+
+    @property
+    def trace_url(self) -> str:
+        return self.url(PATH_TRACE)
+
+    def order_url(self, order_id: str, mode: str | None = None) -> str:
+        """단건 주문 PATCH URL — /api/dispenser/orders/{orderId}?mode=(선택).
+
+        orderId 는 path 세그먼트 인코딩(합성키 콜론 등 안전). mode 지정 시 쿼리로 부착.
+        """
+        base = join_url(self.base_url, f"{PATH_ORDERS}/{quote(order_id, safe='')}")
+        if mode:
+            return f"{base}?{urlencode({'mode': mode})}"
+        return base
+
+    def commandset_url(self, command_set_id: str) -> str:
+        """단건 CommandSet PATCH URL — /api/dispenser/commandsets/{id}.
+
+        commandSetId 는 콜론 포함 가능(manufacture `{orderId}:{attempt}`) → path 인코딩.
+        """
+        return join_url(
+            self.base_url, f"{PATH_COMMANDSETS}/{quote(command_set_id, safe='')}"
+        )
+
+    def orders_stream_query_url(self, *, mode: str, view: str, device_id: str | None) -> str:
+        """주문 큐 SSE 구독 URL — mode/view/deviceId(CS-08 라우팅) 쿼리 부착."""
+        params: dict[str, str] = {"mode": mode, "view": view}
+        if device_id:
+            params["deviceId"] = device_id
+        return f"{self.orders_stream_url}?{urlencode(params)}"

@@ -175,12 +175,13 @@ class PumpSequencer:
 
     def _run_job(self, job: _PendingJob) -> JobReport:
         # ── IL-02: 멱등 게이트 — 이미 본 합성키(4상태 전부)면 DROP(토출 0). ──
-        verdict = self.ledger.check_and_claim(job.command_id)
+        #    claim 시 원 traceId 를 함께 영속 — 재기동 복구 보고가 원 트레이스와 상관되게.
+        verdict = self.ledger.check_and_claim(job.command_id, job.trace_id)
         if verdict is LedgerVerdict.DUPLICATE:
-            self._publish(
-                DispensePhase.FAILED, 0, 0, StatusErrorCode.DUPLICATE_DROPPED,
-                job.command_id, job.trace_id,
-            )
+            # 무해한 중복 재전달 — status 역보고도, trace span 도 발행하지 않는다
+            # (2026-07-10). 이전엔 여기서 FAILED·DUPLICATE_DROPPED 를 publish 해
+            # 완료 주문 트레이스에 dispense.failed 가짜 실패 span 과 FAILED status(→422)
+            # 를 남겼다. 재토출 0(check_and_claim)은 그대로, 관측만 조용한 no-op 으로.
             return JobReport(
                 command_id=job.command_id,
                 outcome=JobOutcome.DUPLICATE_DROPPED,

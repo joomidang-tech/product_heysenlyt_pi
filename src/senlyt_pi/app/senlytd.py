@@ -1,22 +1,166 @@
 """senlytd — hey_senlyt v1.2.0 라즈베리파이 headless 디스펜서 데몬 진입점.
 
-Dart `bin/senlytd.dart` 포팅 — 동일 단계(골격 + SoT 코어 계약 포팅).
-실 소비 루프·펌프 구동은 유보(안전상 이후 웨이브). 실행 시 명확히 미구현임을 알리고
-종료한다(오작동으로 펌프를 구동하지 않도록).
-
 실행: `senlytd` (pyproject [project.scripts]) 또는 `python -m senlyt_pi.app.senlytd`.
+
+동작(스텁 제거·사용자 원칙 2026-07-10):
+  - `SENLYT_RUN=1`(02_infra §10 E2E 컨테이너 스위치): 실 어댑터 조립(등록·SSE·역보고 실 HTTP) +
+    crash-safe 파일 멱등 ledger + RR pump_map 을 결선해 **SenlytDaemon.boot() 상시 소비 루프**를
+    실행한다(엔진=Fake 라 안전). SIGTERM/SIGINT → 우아한 종료(shutdown). 루프는 stop 까지 블록.
+  - `SENLYT_SELFTEST=1`: 실 어댑터를 조립만 하고 결선 성공을 로그로 알린 뒤 종료(0). 펌프 미구동.
+  - 기본(무설정): 상시 소비 루프는 `SENLYT_RUN=1` 에서 실행됨을 한글 로그로 알리고 안전 종료(0).
+
+⛔ 유일 mock = 물리 엔진(FakeEngineAdapter). 소비 루프 자체는 실구현(SENLYT_RUN 이 켜는 스위치).
 """
 
 from __future__ import annotations
 
+import os
 import sys
+from typing import Mapping
+
+from ..obs.log import STAGE_ERROR, STAGE_PI_RECEIVED, StructuredLogger
+from .bootstrap import (
+    BootstrapError,
+    build_components,
+    build_ledger,
+    build_resolver,
+)
+from .daemon import DaemonDeps, SenlytDaemon
+
+# self-test(실 어댑터 조립·실 HTTP 등록) 트리거 env — 조립만·펌프 미구동.
+SENLYT_SELFTEST_ENV = "SENLYT_SELFTEST"
+# 상시 소비 루프 실행 트리거 env — E2E 컨테이너가 설정(§10). boot() 상시 루프 기동.
+SENLYT_RUN_ENV = "SENLYT_RUN"
+# 폴링 간격(ms) — 기본 1000ms(1s). SenlytDaemon.poll_interval_s 로 환산.
+SENLYT_POLL_INTERVAL_MS_ENV = "SENLYT_POLL_INTERVAL_MS"
+
+_TRUTHY = ("1", "true", "TRUE")
 
 
-def main() -> int:
-    print(
-        "senlytd (senlyt-pi v1.2.0): 골격 웨이브 — 소비 루프/펌프 구동 미구현(안전상 유보).\n"
-        "코어 계약(전이표·PumpGuard·DTO·와이어)은 src/senlyt_pi 에 포팅됨. 테스트: pytest.",
-        file=sys.stderr,
+def _is_truthy(v: str | None) -> bool:
+    return (v or "").strip() in _TRUTHY
+
+
+def _resolve_poll_interval_s(environ: Mapping[str, str]) -> float:
+    """SENLYT_POLL_INTERVAL_MS(기본 1000) → 초. 파싱 실패·비양수는 1.0s 로 안전 폴백."""
+    raw = environ.get(SENLYT_POLL_INTERVAL_MS_ENV, "").strip()
+    if not raw:
+        return 1.0
+    try:
+        ms = float(raw)
+    except ValueError:
+        return 1.0
+    return ms / 1000.0 if ms > 0 else 1.0
+
+
+def _selftest(environ: Mapping[str, str], logger: StructuredLogger) -> int:
+    """실 어댑터 조립 self-test — ServerConfig 결정 + 실 등록 + 어댑터 결선(펌프 미구동)."""
+    from ..config.server_target import ServerTargetError
+
+    try:
+        components = build_components(environ, logger=logger)
+    except ServerTargetError as e:
+        logger.error(
+            "서버 타겟 미설정/미지원 — 부팅 중단(fail-fast)",
+            stage=STAGE_ERROR,
+            error=str(e),
+        )
+        return 1
+    except BootstrapError as e:
+        logger.error("실 어댑터 조립 실패 — 부팅 중단", stage=STAGE_ERROR, error=str(e))
+        return 1
+
+    logger.info(
+        "실 어댑터 결선 성공(등록·SSE 구독·역보고 실 HTTP) — 소비 루프는 SENLYT_RUN=1 에서 실행",
+        stage=STAGE_PI_RECEIVED,
+        device_id=components.device_id,
+        baseUrl=components.server_config.base_url,
+        engine=type(components.engine).__name__,
+    )
+    return 0
+
+
+def _install_signal_handlers(daemon: SenlytDaemon, logger: StructuredLogger) -> None:
+    """SIGTERM/SIGINT → 우아한 종료 요청(stop 플래그). 비메인스레드/미지원 플랫폼은 무시."""
+    import signal
+
+    def _handler(signum: int, _frame: object) -> None:
+        logger.info(
+            "종료 시그널 수신 — 우아한 종료 요청",
+            stage=STAGE_ERROR,
+            device_id=daemon.deps.device_id,
+            signal=signum,
+        )
+        daemon.request_stop()
+
+    for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            pass  # 비메인스레드/미지원 — 무시(테스트/컨테이너 재시작 정책이 보완).
+
+
+def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
+    """상시 소비 루프 실행 — 실 어댑터 + 파일 ledger + RR 결선 → SenlytDaemon.boot()."""
+    from ..config.server_target import ServerTargetError
+
+    try:
+        ledger = build_ledger(environ)
+        components = build_components(environ, ledger=ledger, logger=logger)
+    except ServerTargetError as e:
+        logger.error(
+            "서버 타겟 미설정/미지원 — 부팅 중단(fail-fast)",
+            stage=STAGE_ERROR,
+            error=str(e),
+        )
+        return 1
+    except BootstrapError as e:
+        logger.error("실 어댑터 조립 실패 — 부팅 중단", stage=STAGE_ERROR, error=str(e))
+        return 1
+
+    deps = DaemonDeps(
+        device_id=components.device_id,
+        command_source=components.command_source,
+        status_sink=components.status_sink,
+        engine=components.engine,
+        ledger=ledger,
+        resolver=build_resolver(environ),
+        commandset_source=components.command_source,  # 동일 SSE 어댑터가 두 축 제공.
+        logger=components.logger,
+        poll_interval_s=_resolve_poll_interval_s(environ),
+    )
+    daemon = SenlytDaemon(deps)
+    _install_signal_handlers(daemon, logger)
+
+    logger.info(
+        "senlytd 상시 소비 루프 실행 시작(SENLYT_RUN)",
+        stage=STAGE_PI_RECEIVED,
+        device_id=components.device_id,
+        baseUrl=components.server_config.base_url,
+        engine=type(components.engine).__name__,
+    )
+    daemon.boot()  # stop 까지 블록 — 종료 시 shutdown(우아한 종료) 수행.
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    environ = os.environ
+    logger = StructuredLogger()
+
+    if _is_truthy(environ.get(SENLYT_RUN_ENV)):
+        return _run(environ, logger)
+
+    if _is_truthy(environ.get(SENLYT_SELFTEST_ENV)):
+        return _selftest(environ, logger)
+
+    # 기본 경로 — 네트워크 없이 결선 준비 상태만 알린다(상시 루프는 SENLYT_RUN 스위치).
+    logger.info(
+        "senlytd v1.2.0 시작 — 실 어댑터(등록·SSE·역보고) 결선 준비 완료. "
+        "상시 소비 루프는 SENLYT_RUN=1 에서 실행(무설정은 안전 종료). "
+        "SENLYT_SELFTEST=1 로 조립 self-test 가능.",
+        stage=STAGE_PI_RECEIVED,
     )
     return 0
 

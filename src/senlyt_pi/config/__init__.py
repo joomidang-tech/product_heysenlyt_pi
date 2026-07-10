@@ -9,6 +9,12 @@ from __future__ import annotations
 
 from .server_target import (
     ENV_TO_BASE_URL,
+    PATH_COMMANDSETS,
+    PATH_HEARTBEAT,
+    PATH_ORDERS,
+    PATH_ORDERS_STREAM,
+    PATH_REGISTER,
+    PATH_TRACE,
     SENLYT_ENV_KEY,
     SENLYT_SERVER_BASE_URL_KEY,
     ServerConfig,
@@ -20,6 +26,12 @@ from .server_target import (
 
 __all__ = [
     "ENV_TO_BASE_URL",
+    "PATH_COMMANDSETS",
+    "PATH_HEARTBEAT",
+    "PATH_ORDERS",
+    "PATH_ORDERS_STREAM",
+    "PATH_REGISTER",
+    "PATH_TRACE",
     "SENLYT_ENV_KEY",
     "SENLYT_SERVER_BASE_URL_KEY",
     "ServerConfig",

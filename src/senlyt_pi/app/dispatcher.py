@@ -145,11 +145,24 @@ class Dispatcher:
           계약 위반 — 토출 0 으로 failed(CMD_VALIDATION_FAILED).
         - 전이 보고: delivered → running → done|failed (best-effort·단조 전진.
           중복 재전달의 늦은 보고는 서버 게이트가 noop/422 로 흡수).
-        - DUPLICATE_DROPPED(ledger 기존재 합성키)는 terminal 보고 생략 — 원판 실행이
-          이미 terminal 을 보고했(거나 곧 한)다. 잘못된 done/failed 덮어쓰기 방지.
+        - **중복 재전달 조용한 no-op**(2026-07-10): command_set_id 가 ledger 상 이미
+          terminal(DONE/FAILED)이면 **맨 앞에서 즉시 return None** — DELIVERED/RUNNING
+          전이 보고도, 제조 실행도, trace span 도 일절 없다. at-least-once 재전달로 성공
+          주문 봉투가 한 번 더 도착해도(pi 제조 중 서버가 아직 delivered 라 push 가 한 번
+          더 오는 창) 성공 트레이스를 오염(422 backward·dispense.failed 가짜 실패)시키지
+          않는다. ledger 이중토출 차단(재토출 0)은 check_and_claim 이 그대로 유지.
+        - DUPLICATE_DROPPED(선조회로 못 걸러진 잔여 케이스·비-terminal 중복)는 terminal
+          보고 생략 — 원판 실행이 이미 terminal 을 보고했(거나 곧 한)다. sequencer 도
+          이 경로에서 FAILED status/span 을 내지 않는다(무해 no-op).
         """
         # ── CS-08 동형: 자기 deviceId 봉투만 소비(다매장 라우팅). ──
         if cs.device_id != self.device_id:
+            return None
+
+        # ── 중복 재전달 선조회(2026-07-10): 이미 terminal(DONE/FAILED) 소유 봉투는
+        #    완전한 조용한 no-op — 전이 보고·실행·span 없이 즉시 반환. 순수 read 라
+        #    check_and_claim 의 원자성(재토출 0)은 훼손하지 않는다. ──
+        if self.sequencer.ledger.is_settled(cs.command_set_id):
             return None
 
         self._report_commandset(cs, CommandSetStatus.DELIVERED, None)

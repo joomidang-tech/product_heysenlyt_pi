@@ -60,9 +60,18 @@ class LedgerRecord:
     command_id: str
     state: LedgerEntryState
     ts: str  # ISO8601 (관찰/디버그용, 판정 무관)
+    trace_id: str = ""  # claim 시 기록하는 원 주문 traceId(재기동 복구 상관용·부록A P-3).
 
     def to_json(self) -> dict[str, Any]:
-        return {"commandId": self.command_id, "state": self.state.wire, "ts": self.ts}
+        m: dict[str, Any] = {
+            "commandId": self.command_id,
+            "state": self.state.wire,
+            "ts": self.ts,
+        }
+        # traceId 는 값이 있을 때만 방출 — 구엔트리(traceId 없음) 와이어 형태와 동형 유지.
+        if self.trace_id:
+            m["traceId"] = self.trace_id
+        return m
 
 
 def _default_now_iso() -> str:
@@ -77,12 +86,20 @@ class FileIdempotencyLedger:
     mark_running/mark_settled: 상태 전이 append. is_settled/state_of: replay 인덱스 조회.
     """
 
-    def __init__(self, path: Path, fh: Any, index: dict[str, LedgerEntryState]) -> None:
+    def __init__(
+        self,
+        path: Path,
+        fh: Any,
+        index: dict[str, LedgerEntryState],
+        trace_index: dict[str, str] | None = None,
+    ) -> None:
         """직접 호출 금지 — `FileIdempotencyLedger.open(path)` 사용."""
         self._path = path
         self._fh = fh  # append 바이너리 핸들
         # commandId → 현재(최신) 상태. replay 로 구성·write 마다 갱신.
         self._index = index
+        # commandId → claim 시 기록한 원 traceId. replay 로 복원(재기동 복구 상관용).
+        self._trace_index: dict[str, str] = trace_index if trace_index is not None else {}
         # 시계 주입(테스트 결정성). 기본 = UTC now ISO8601.
         self.now_iso: Callable[[], str] = _default_now_iso
 
@@ -92,6 +109,7 @@ class FileIdempotencyLedger:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         index: dict[str, LedgerEntryState] = {}
+        trace_index: dict[str, str] = {}
 
         if p.exists():
             with p.open("r", encoding="utf-8") as f:
@@ -110,10 +128,14 @@ class FileIdempotencyLedger:
                     state = LedgerEntryState.from_wire(parsed.get("state"))
                     if isinstance(cid, str) and state is not None:
                         index[cid] = state  # 마지막 승자(append 순서 = 시간 순서).
+                        # traceId 는 있는 레코드에서만 갱신(구엔트리·미보유 레코드는 clobber 금지).
+                        tid = parsed.get("traceId")
+                        if isinstance(tid, str) and tid:
+                            trace_index[cid] = tid
 
         # append 모드로 열되, replay 후 이어쓰기.
         fh = p.open("ab")
-        return FileIdempotencyLedger(p, fh, index)
+        return FileIdempotencyLedger(p, fh, index, trace_index)
 
     def _append(self, rec: LedgerRecord) -> None:
         line = json.dumps(rec.to_json(), ensure_ascii=False) + "\n"
@@ -121,13 +143,21 @@ class FileIdempotencyLedger:
         self._fh.flush()
         os.fsync(self._fh.fileno())  # fsync — 원자 영속(crash-safe).
         self._index[rec.command_id] = rec.state
+        # traceId 는 값이 있을 때만 갱신(미보유 전이 레코드가 claim 시 traceId 를 clobber 금지).
+        if rec.trace_id:
+            self._trace_index[rec.command_id] = rec.trace_id
 
-    def check_and_claim(self, command_id: str) -> LedgerVerdict:
+    def check_and_claim(self, command_id: str, trace_id: str = "") -> LedgerVerdict:
         # 4상태 전부 DROP — 한번 본 합성키면 fresh 아님(Q1·IL-02).
         if command_id in self._index:
             return LedgerVerdict.DUPLICATE
         self._append(
-            LedgerRecord(command_id=command_id, state=LedgerEntryState.RECEIVED, ts=self.now_iso())
+            LedgerRecord(
+                command_id=command_id,
+                state=LedgerEntryState.RECEIVED,
+                ts=self.now_iso(),
+                trace_id=trace_id,  # claim 시 원 traceId 영속(재기동 복구 상관·빈값=미보유).
+            )
         )
         return LedgerVerdict.FRESH
 
@@ -154,6 +184,10 @@ class FileIdempotencyLedger:
         """현재 상태 조회(on_boot recovery 판단용·§9-1). 미기록 = None."""
         return self._index.get(command_id)
 
+    def trace_id_of(self, command_id: str) -> str:
+        """claim 시 기록한 원 traceId 조회(재기동 복구 보고 상관용). 미보유 = ""(하위호환)."""
+        return self._trace_index.get(command_id, "")
+
     def commands_in_state(self, state: LedgerEntryState) -> list[str]:
         """특정 상태의 모든 commandId(재부팅 복구 스캔용)."""
         return [cid for cid, s in self._index.items() if s is state]
@@ -178,7 +212,12 @@ class FileIdempotencyLedger:
         tmp = self._path.with_suffix(self._path.suffix + ".tmp")
         with tmp.open("wb") as sink:
             for cid, state in self._index.items():
-                rec = LedgerRecord(command_id=cid, state=state, ts=self.now_iso())
+                rec = LedgerRecord(
+                    command_id=cid,
+                    state=state,
+                    ts=self.now_iso(),
+                    trace_id=self._trace_index.get(cid, ""),  # 컴팩션에도 traceId 보존.
+                )
                 sink.write((json.dumps(rec.to_json(), ensure_ascii=False) + "\n").encode("utf-8"))
             sink.flush()
             os.fsync(sink.fileno())

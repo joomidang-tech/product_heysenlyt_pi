@@ -23,6 +23,15 @@ from typing import Any, Callable, Mapping
 
 from ..core.wire_json import put_if_present
 from .device_identity_store import DeviceIdentity, DeviceIdentityStore, is_identity_expired
+from .http_client import (
+    DEFAULT_TIMEOUT_SECONDS,
+    HttpTransportError,
+    bearer_headers,
+    request_json,
+)
+
+# 프로비저닝 키 env 키 — POST /api/dispensers/register 의 Authorization: Bearer.
+DISPENSER_PROVISION_KEY_ENV = "DISPENSER_PROVISION_KEY"
 
 # 전송 seam — RegisterRequest 와이어(dict)를 보내고 (HTTP status, 응답 body json|None) 반환.
 # 네트워크 오류는 예외 raise(→ retryable). 프로비저닝 키 헤더는 transport 조립 책임.
@@ -160,6 +169,46 @@ def ensure_registered(
     identity = client.register()
     store.save(identity)
     return identity
+
+
+def make_http_register_transport(
+    register_url: str,
+    provision_key: str,
+    *,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    request: Callable[..., "tuple[int, Mapping[str, Any] | None]"] = request_json,
+) -> RegisterTransport:
+    """실 HTTP RegisterTransport 조립 — POST {register_url} (Bearer 프로비저닝 키).
+
+    스텁 제거: RegistrationClient 의 seam 에 꽂는 **실 클라이언트**(표준 urllib).
+      - 요청 body 는 이미 build_register_request 가 만든 와이어(dict) 그대로 전송.
+      - Authorization: Bearer <provision_key>(등록 라우트 계약·503 provisioning_not_configured 방지).
+      - HTTP 응답(2xx/4xx/5xx)은 (status, body) 로 반환 → RegistrationClient 가 분류.
+      - 네트워크 실패(HttpTransportError)는 그대로 raise → RegistrationClient 가 retryable 처리.
+
+    `request` 는 테스트 주입 seam(기본 = http_client.request_json).
+    """
+
+    def transport(req_body: dict[str, Any]) -> "tuple[int, Mapping[str, Any] | None]":
+        return request(
+            "POST",
+            register_url,
+            body=req_body,
+            headers=bearer_headers(provision_key),
+            timeout=timeout,
+        )
+
+    return transport
+
+
+def read_provision_key(env: Mapping[str, str] | None = None) -> str:
+    """프로비저닝 키 읽기 — DISPENSER_PROVISION_KEY(부재 시 빈 문자열).
+
+    빈 값이면 서버가 401 invalid_provision_key(또는 503)로 거부 → 부팅 로그로 표면화.
+    """
+    e = env if env is not None else os.environ
+    v = e.get(DISPENSER_PROVISION_KEY_ENV)
+    return v.strip() if isinstance(v, str) else ""
 
 
 def read_hardware_id(

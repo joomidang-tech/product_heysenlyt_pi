@@ -26,10 +26,12 @@ class IdempotencyLedger(Protocol):
     구현체는 crash-safe(전원 단절·재부팅 후에도 판정 유지)를 목표로 한다.
     """
 
-    def check_and_claim(self, command_id: str) -> LedgerVerdict:
+    def check_and_claim(self, command_id: str, trace_id: str = "") -> LedgerVerdict:
         """합성키 `{orderId}:{attempt}` 를 처음 보는가.
 
         FRESH 면 예약(claim)까지 원자적으로 수행해 동시 중복 처리를 막는 것을 권장한다.
+        claim 시점의 `trace_id`(원 주문 traceId)를 함께 영속하여, 재기동 복구 보고가
+        원 트레이스와 상관되게 한다(빈 문자열 = 미보유·하위호환).
         """
         ...
 
@@ -39,6 +41,10 @@ class IdempotencyLedger(Protocol):
 
     def is_settled(self, command_id: str) -> bool:
         """진행중 여부(재부팅 복구·recover.decision 판단용)."""
+        ...
+
+    def trace_id_of(self, command_id: str) -> str:
+        """claim 시 기록한 원 traceId 조회(재기동 복구 보고 상관용). 미보유 = ""(하위호환)."""
         ...
 
 
@@ -51,11 +57,15 @@ class InMemoryIdempotencyLedger:
     def __init__(self) -> None:
         self._claimed: set[str] = set()
         self._settled: dict[str, bool] = {}
+        # commandId → claim 시점 traceId(재기동 복구 상관용).
+        self._trace: dict[str, str] = {}
 
-    def check_and_claim(self, command_id: str) -> LedgerVerdict:
+    def check_and_claim(self, command_id: str, trace_id: str = "") -> LedgerVerdict:
         if command_id in self._claimed:
             return LedgerVerdict.DUPLICATE
         self._claimed.add(command_id)
+        if trace_id:
+            self._trace[command_id] = trace_id
         return LedgerVerdict.FRESH
 
     def mark_settled(self, command_id: str, *, success: bool) -> None:
@@ -63,3 +73,6 @@ class InMemoryIdempotencyLedger:
 
     def is_settled(self, command_id: str) -> bool:
         return command_id in self._settled
+
+    def trace_id_of(self, command_id: str) -> str:
+        return self._trace.get(command_id, "")

@@ -68,6 +68,20 @@ def test_serial_dispense_completed(ledger, fake):
     assert fake.dispense_count == 3
 
 
+def test_submit_persists_trace_id_in_ledger(ledger, fake):
+    """submit 경로가 command 의 traceId 를 원장 claim 에 태워 영속한다(복구 상관 갭 봉합).
+
+    재기동 복구 보고가 원 주문 traceId 로 상관되려면, 제조 시작(claim) 시점에 원장에
+    traceId 가 저장돼 있어야 한다. submit → check_and_claim(command_id, trace_id) 왕복 확인.
+    """
+    make_seq(ledger, fake).submit(
+        command_id="o:7",
+        trace_id="trace-order-7",
+        steps=[step(0, 1, 100)],
+    )
+    assert ledger.trace_id_of("o:7") == "trace-order-7"
+
+
 def test_il02_duplicate_command_id_drops(ledger, fake):
     """IL-02 게이트: 중복 command.id → DROP, dispense 0 (재토출 없음)."""
     s = make_seq(ledger, fake)
@@ -78,6 +92,30 @@ def test_il02_duplicate_command_id_drops(ledger, fake):
     assert dup.outcome is JobOutcome.DUPLICATE_DROPPED
     assert dup.error_code is StatusErrorCode.DUPLICATE_DROPPED
     assert fake.dispense_count == 1, "중복은 추가 토출 0(IL-02)"
+
+
+def test_il02_duplicate_publishes_nothing(ledger, fake):
+    """중복 재제출(DUPLICATE_DROPPED)은 status/span 을 일절 발행하지 않는다(조용한 no-op).
+
+    2026-07-10: 이전엔 여기서 FAILED·DUPLICATE_DROPPED 를 publish 해 완료 주문 트레이스에
+    dispense.failed 가짜 실패 span + FAILED status(→422)를 남겼다. 이제 재토출 0 은 유지하되
+    관측은 완전 무발행.
+    """
+    published: list[str] = []
+    s = make_seq(
+        ledger, fake,
+        publisher=lambda phase, k, n, ec, cid, tid: published.append(phase.wire),
+    )
+    s.submit(command_id="o:1", trace_id="t", steps=[step(0, 1, 100)])
+    # 원판 제조는 정상 phase 시퀀스 발행.
+    assert published == ["ACCEPTED", "COMPLETED"]
+    published.clear()
+
+    dup = s.submit(command_id="o:1", trace_id="t", steps=[step(0, 1, 100)])
+    assert dup.outcome is JobOutcome.DUPLICATE_DROPPED
+    assert dup.error_code is StatusErrorCode.DUPLICATE_DROPPED  # 리포트 계약 불변.
+    assert published == [], "중복은 어떤 phase 도 발행하지 않는다(FAILED span/status 0)"
+    assert fake.dispense_count == 1, "재토출 0(IL-02)"
 
 
 def test_il02_failed_command_id_also_drops(ledger, fake):
