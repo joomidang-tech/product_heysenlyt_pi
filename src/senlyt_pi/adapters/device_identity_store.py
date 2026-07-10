@@ -4,6 +4,11 @@
 file_idempotency_ledger 의 crash-safe 결(temp 파일 + os.replace atomic swap + fsync)을
 따르되, 단일 JSON 문서(정체성 1건)라 append 로그는 불필요.
 
+[2026-07-10 D-A] **deviceId = pi 수집 하드웨어 시리얼 그대로**(서버 발급/파생 없음). 구
+`hardwareId` 필드는 폐기 — 시리얼이 곧 deviceId 라 별도 자연키가 불필요(단일 정체성).
+구 정체성 파일(dsp-<hash> deviceId + hardwareId)은 읽을 때 hardwareId 를 무시하고,
+저장된 deviceId 가 현재 시리얼과 다르면 재등록으로 자연 승격된다(ensure_registered 게이트).
+
 토큰은 **opaque**(부록A P-5) — 여기서는 문자열 그대로 저장/전송만. 만료 판단은
 RegisterResponse.exp(epoch 초) 필드로 한다(payload 재파싱 불필요·서버 검증 대체 아님).
 """
@@ -19,41 +24,37 @@ from typing import Any
 
 @dataclass(frozen=True, slots=True)
 class DeviceIdentity:
-    """등록 정체성 — RegisterResponse + 등록에 쓴 hardwareId."""
+    """등록 정체성 — deviceId(=수집 HW 시리얼·D-A) + RegisterResponse(dispenserToken·exp)."""
 
-    device_id: str
+    device_id: str  # = pi 수집 하드웨어 시리얼(D-A). SSE 구독·CS-08 필터·heartbeat 라우팅 키.
     dispenser_token: str  # opaque(부록A P-5) — 저장/전송만.
     exp: int  # 만료 epoch(초) — RegisterResponse.exp
-    hardware_id: str
 
     def to_json(self) -> dict[str, Any]:
         return {
             "deviceId": self.device_id,
             "dispenserToken": self.dispenser_token,
             "exp": self.exp,
-            "hardwareId": self.hardware_id,
         }
 
     @staticmethod
     def from_json(j: Any) -> "DeviceIdentity | None":
-        """방어 파싱 — 형식이 어긋나면 None(재등록 유도·crash 금지)."""
+        """방어 파싱 — 형식이 어긋나면 None(재등록 유도·crash 금지).
+
+        구 정체성 파일의 `hardwareId` 키가 있어도 무시한다(상위호환) — deviceId 가 곧 시리얼.
+        """
         if not isinstance(j, dict):
             return None
         device_id = j.get("deviceId")
         token = j.get("dispenserToken")
         exp = j.get("exp")
-        hardware_id = j.get("hardwareId")
         if not isinstance(device_id, str) or device_id == "":
             return None
         if not isinstance(token, str) or token == "":
             return None
         if isinstance(exp, bool) or not isinstance(exp, int):
             return None
-        if not isinstance(hardware_id, str) or hardware_id == "":
-            return None
-        return DeviceIdentity(
-            device_id=device_id, dispenser_token=token, exp=exp, hardware_id=hardware_id
-        )
+        return DeviceIdentity(device_id=device_id, dispenser_token=token, exp=exp)
 
 
 def is_identity_expired(identity: DeviceIdentity, *, now_seconds: int) -> bool:

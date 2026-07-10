@@ -14,9 +14,7 @@ from senlyt_pi.app.bootstrap import BootstrapError, build_components, build_engi
 from senlyt_pi.config.server_target import SENLYT_ENV_KEY, ServerTargetError
 from support_http import FakeHttpServer
 
-IDENTITY = DeviceIdentity(
-    device_id="dev-A", dispenser_token="tok-1", exp=9_999_999_999, hardware_id="hw-1"
-)
+IDENTITY = DeviceIdentity(device_id="dev-A", dispenser_token="tok-1", exp=9_999_999_999)
 
 
 def _store(tmp_path) -> DeviceIdentityStore:
@@ -70,8 +68,11 @@ def test_engine_injection_wins() -> None:
 
 
 def test_register_path_over_socket(tmp_path) -> None:
-    """실 등록 경로 — 로컬 fake register 서버로 build_components(register=True) 왕복."""
-    ok_body = {"deviceId": "dev-X", "dispenserToken": "tok-X", "exp": 9_999_999_999}
+    """실 등록 경로 — 로컬 fake register 서버로 build_components(register=True) 왕복.
+
+    [D-A] deviceId = SENLYT_HARDWARE_ID(수집 시리얼)로 확정 — 서버 echo(다른 값)는 무시.
+    """
+    ok_body = {"deviceId": "server-echo-ignored", "dispenserToken": "tok-X", "exp": 9_999_999_999}
     with FakeHttpServer() as srv:
         srv.set_handler(lambda req: {"status": 200, "json": ok_body})
         env = {
@@ -81,11 +82,11 @@ def test_register_path_over_socket(tmp_path) -> None:
         }
         store = DeviceIdentityStore(tmp_path / "id.json")
         comp = build_components(env, identity_store=store, register=True)
-        assert comp.device_id == "dev-X"
-        # 등록 요청이 올바른 경로·Bearer 로 갔는지.
+        assert comp.device_id == "hw-e2e"  # 시리얼 = deviceId(서버 echo 아님).
+        # 등록 요청이 올바른 경로·Bearer·deviceId(시리얼)로 갔는지.
         reg = srv.requests[-1]
         assert reg.path == "/api/dispensers/register"
         assert reg.header("Authorization") == "Bearer prov"
-        assert reg.json()["hardwareId"] == "hw-e2e"
+        assert reg.json()["deviceId"] == "hw-e2e"
         # 정체성 파일 영속.
-        assert store.load().device_id == "dev-X"
+        assert store.load().device_id == "hw-e2e"

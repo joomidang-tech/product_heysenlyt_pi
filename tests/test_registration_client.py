@@ -1,7 +1,9 @@
-"""디바이스 등록 테스트 — RegisterRequest/RegisterResponse 계약 (2026-07-09).
+"""디바이스 등록 테스트 — RegisterRequest/RegisterResponse 계약 (05_api §8-1, D-A 2026-07-10).
 
-등록 성공/실패 재시도(기존 R=3 준용)·permanent(400/401) 즉시중단·정체성 파일 영속·
-만료 재등록(ensure_registered)·hardwareId seam 을 고정한다. 전송은 전부 fake(seam 주입).
+[D-A] deviceId = pi 수집 시리얼 그대로 — pi 가 시리얼을 제시하고, 서버 응답의 deviceId(echo)는
+정체성을 덮어쓰지 않는다(자기 시리얼이 권위). 등록 성공/실패 재시도(기존 R=3 준용)·permanent(400/401)
+즉시중단·정체성 파일 영속·만료 재등록(ensure_registered)·시리얼 seam 을 고정한다.
+전송은 전부 fake(seam 주입).
 """
 
 from pathlib import Path
@@ -21,7 +23,10 @@ from senlyt_pi.adapters.registration_client import (
     read_hardware_id,
 )
 
-OK_BODY = {"deviceId": "dev-A", "dispenserToken": "tok-1", "exp": 2_000_000_000}
+# 서버는 제시한 시리얼을 echo 하지만, pi 는 이를 정체성으로 쓰지 않는다(자기 시리얼이 권위).
+# echo 값을 시리얼과 **다르게** 두어 "서버발급 id 를 덮어쓰지 않음"을 강하게 고정한다.
+OK_BODY = {"deviceId": "server-echo-ignored", "dispenserToken": "tok-1", "exp": 2_000_000_000}
+SERIAL = "hw-serial-1"
 
 
 class ScriptedTransport:
@@ -40,18 +45,18 @@ class ScriptedTransport:
 
 
 def client(transport, **over) -> RegistrationClient:
-    kw = dict(hardware_id="hw-serial-1", name="매장1", sleep=lambda _s: None)
+    kw = dict(device_id=SERIAL, name="매장1", sleep=lambda _s: None)
     kw.update(over)
     return RegistrationClient(transport, **kw)
 
 
 class TestRegisterRequestWire:
     def test_wire_shape(self):
-        """hardwareId 필수 + name includeIfNull:false."""
-        assert build_register_request("hw-1", "이름") == {"hardwareId": "hw-1", "name": "이름"}
-        assert build_register_request("hw-1") == {"hardwareId": "hw-1"}
+        """deviceId(=시리얼) 필수 + name includeIfNull:false."""
+        assert build_register_request("serial-1", "이름") == {"deviceId": "serial-1", "name": "이름"}
+        assert build_register_request("serial-1") == {"deviceId": "serial-1"}
 
-    def test_empty_hardware_id_rejected(self):
+    def test_empty_device_id_rejected(self):
         with pytest.raises(ValueError):
             build_register_request("")
 
@@ -60,23 +65,36 @@ class TestRegistrationRetry:
     def test_success_first_try(self):
         t = ScriptedTransport([(200, OK_BODY)])
         identity = client(t).register()
-        assert identity.device_id == "dev-A"
+        # [D-A] deviceId = 자기 시리얼 — 서버 echo("server-echo-ignored")를 쓰지 않는다.
+        assert identity.device_id == SERIAL
         assert identity.dispenser_token == "tok-1"
         assert identity.exp == 2_000_000_000
-        assert identity.hardware_id == "hw-serial-1"
         assert len(t.calls) == 1
-        assert t.calls[0] == {"hardwareId": "hw-serial-1", "name": "매장1"}
+        assert t.calls[0] == {"deviceId": SERIAL, "name": "매장1"}
+
+    def test_server_echoed_device_id_is_ignored(self):
+        """서버가 다른 deviceId 를 echo 해도 정체성은 자기 시리얼(권위) — 덮어쓰기 없음."""
+        t = ScriptedTransport([(200, {"deviceId": "dsp-legacyhash", "dispenserToken": "tok-1", "exp": 2_000_000_000})])
+        identity = client(t, device_id="10000000abcd1234").register()
+        assert identity.device_id == "10000000abcd1234"
+
+    def test_response_without_device_id_still_ok(self):
+        """서버가 deviceId 를 아예 안 줘도(등록만) dispenserToken·exp 만으로 정체성 성립."""
+        t = ScriptedTransport([(200, {"dispenserToken": "tok-1", "exp": 2_000_000_000})])
+        identity = client(t).register()
+        assert identity.device_id == SERIAL
+        assert identity.dispenser_token == "tok-1"
 
     def test_retryable_5xx_then_success(self):
         """500 register_failed·503 provisioning_not_configured → 재시도 후 성공."""
         t = ScriptedTransport([(500, None), (503, None), (200, OK_BODY)])
         identity = client(t).register()
-        assert identity.device_id == "dev-A"
+        assert identity.device_id == SERIAL
         assert len(t.calls) == 3
 
     def test_transport_exception_is_retryable(self):
         t = ScriptedTransport([ConnectionError("down"), (200, OK_BODY)])
-        assert client(t).register().device_id == "dev-A"
+        assert client(t).register().device_id == SERIAL
         assert len(t.calls) == 2
 
     def test_retries_exhausted_r3(self):
@@ -106,9 +124,11 @@ class TestRegistrationRetry:
         assert len(t.calls) == 1
 
     def test_malformed_success_body_retried(self):
-        """2xx 인데 계약 위반 본문(deviceId 누락 등) → 방어적 재시도."""
-        t = ScriptedTransport([(200, {"deviceId": ""}), (200, {"exp": "soon"}), (200, OK_BODY)])
-        assert client(t).register().device_id == "dev-A"
+        """2xx 인데 계약 위반 본문(dispenserToken 누락·exp 형식 오류) → 방어적 재시도."""
+        t = ScriptedTransport(
+            [(200, {"dispenserToken": ""}), (200, {"dispenserToken": "t", "exp": "soon"}), (200, OK_BODY)]
+        )
+        assert client(t).register().device_id == SERIAL
         assert len(t.calls) == 3
 
     def test_retry_sleeps_between_attempts(self):
@@ -122,9 +142,7 @@ class TestRegistrationRetry:
 class TestIdentityStore:
     def test_save_load_roundtrip(self, tmp_path: Path):
         store = DeviceIdentityStore(tmp_path / "identity.json")
-        identity = DeviceIdentity(
-            device_id="dev-A", dispenser_token="tok", exp=123, hardware_id="hw-1"
-        )
+        identity = DeviceIdentity(device_id="10000000abcd1234", dispenser_token="tok", exp=123)
         store.save(identity)
         assert store.load() == identity
 
@@ -136,19 +154,26 @@ class TestIdentityStore:
         (tmp_path / "identity.json").write_text('{"deviceId": ""}', encoding="utf-8")
         assert store.load() is None  # 계약 위반.
 
+    def test_legacy_file_with_hardware_id_loads_ignoring_it(self, tmp_path: Path):
+        """구 정체성 파일(hardwareId 포함)도 로드 — hardwareId 는 무시(deviceId 가 곧 시리얼)."""
+        store = DeviceIdentityStore(tmp_path / "identity.json")
+        (tmp_path / "identity.json").write_text(
+            '{"deviceId": "dsp-oldhash", "dispenserToken": "t", "exp": 5000, "hardwareId": "hw-1"}',
+            encoding="utf-8",
+        )
+        loaded = store.load()
+        assert loaded == DeviceIdentity(device_id="dsp-oldhash", dispenser_token="t", exp=5000)
+        assert not hasattr(loaded, "hardware_id")
+
     def test_clear(self, tmp_path: Path):
         store = DeviceIdentityStore(tmp_path / "identity.json")
-        store.save(
-            DeviceIdentity(device_id="d", dispenser_token="t", exp=1, hardware_id="h")
-        )
+        store.save(DeviceIdentity(device_id="d", dispenser_token="t", exp=1))
         store.clear()
         assert store.load() is None
         store.clear()  # 이미 없어도 무해.
 
     def test_expiry_strict(self):
-        identity = DeviceIdentity(
-            device_id="d", dispenser_token="t", exp=100, hardware_id="h"
-        )
+        identity = DeviceIdentity(device_id="d", dispenser_token="t", exp=100)
         assert is_identity_expired(identity, now_seconds=100)  # exp==now → 만료(strict).
         assert is_identity_expired(identity, now_seconds=101)
         assert not is_identity_expired(identity, now_seconds=99)
@@ -159,14 +184,12 @@ class TestEnsureRegistered:
         store = DeviceIdentityStore(tmp_path / "identity.json")
         t = ScriptedTransport([(200, OK_BODY)])
         identity = ensure_registered(store, client(t), now_seconds=1_000)
-        assert identity.device_id == "dev-A"
+        assert identity.device_id == SERIAL  # 자기 시리얼 = deviceId(서버 echo 무시).
         assert store.load() == identity  # 재부팅 대비 영속.
 
     def test_valid_identity_reused_without_network(self, tmp_path: Path):
         store = DeviceIdentityStore(tmp_path / "identity.json")
-        saved = DeviceIdentity(
-            device_id="dev-A", dispenser_token="tok-old", exp=5_000, hardware_id="hw-serial-1"
-        )
+        saved = DeviceIdentity(device_id=SERIAL, dispenser_token="tok-old", exp=5_000)
         store.save(saved)
         t = ScriptedTransport([])  # 호출되면 IndexError — 네트워크 0 검증.
         assert ensure_registered(store, client(t), now_seconds=1_000) == saved
@@ -175,29 +198,21 @@ class TestEnsureRegistered:
     def test_expired_token_reregisters(self, tmp_path: Path):
         """만료(12h TTL 경과) → 재등록으로 재발급(계약 RegisterResponse)."""
         store = DeviceIdentityStore(tmp_path / "identity.json")
-        store.save(
-            DeviceIdentity(
-                device_id="dev-A", dispenser_token="tok-old", exp=999, hardware_id="hw-serial-1"
-            )
-        )
+        store.save(DeviceIdentity(device_id=SERIAL, dispenser_token="tok-old", exp=999))
         t = ScriptedTransport([(200, OK_BODY)])
         identity = ensure_registered(store, client(t), now_seconds=1_000)
         assert identity.dispenser_token == "tok-1"
         assert len(t.calls) == 1
         assert store.load() == identity
 
-    def test_hardware_id_change_reregisters(self, tmp_path: Path):
-        """저장분 hardwareId 불일치(기판 교체) → 재등록(레지스트리 자연키 = hardwareId)."""
+    def test_serial_change_reregisters(self, tmp_path: Path):
+        """저장분 deviceId 불일치(기판 교체·구 dsp-<hash> 승격) → 재등록(upsert 키=deviceId=시리얼)."""
         store = DeviceIdentityStore(tmp_path / "identity.json")
-        store.save(
-            DeviceIdentity(
-                device_id="dev-A", dispenser_token="tok-old", exp=5_000, hardware_id="hw-OLD"
-            )
-        )
+        store.save(DeviceIdentity(device_id="dsp-oldhash", dispenser_token="tok-old", exp=5_000))
         t = ScriptedTransport([(200, OK_BODY)])
         identity = ensure_registered(store, client(t), now_seconds=1_000)
         assert len(t.calls) == 1
-        assert identity.hardware_id == "hw-serial-1"
+        assert identity.device_id == SERIAL  # 현재 시리얼로 승격.
 
 
 class TestHardwareIdSeam:

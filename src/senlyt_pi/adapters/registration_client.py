@@ -1,8 +1,13 @@
-"""디바이스 등록 클라이언트 — 계약 RegisterRequest/RegisterResponse (2026-07-09).
+"""디바이스 등록 클라이언트 — 계약 RegisterRequest/RegisterResponse (05_api §8-1, D-A 2026-07-10).
 
-pi 부팅 시 POST /api/dispensers/register { hardwareId, name? }
-(Authorization: Bearer <DISPENSER_PROVISION_KEY>) → { deviceId, dispenserToken, exp }.
-멱등: 같은 hardwareId → 같은 deviceId(registeredAt 불변·name 만 갱신) — 부팅마다 호출해도 안전.
+pi 부팅 시 POST /api/dispensers/register { deviceId, name? }
+(Authorization: Bearer <DISPENSER_PROVISION_KEY>) → { deviceId(echo), dispenserToken, exp }.
+
+**[D-A] deviceId = pi 수집 하드웨어 시리얼 그대로** — pi 가 자기 시리얼(read_hardware_id 의 값)을
+`deviceId` 로 **제시**하고 서버는 **등록만** 한다(서버 발급/파생 왕복 없음·구 dsp-<hash> 폐기).
+응답의 deviceId 는 제시값 echo 확인일 뿐 — pi 는 **자기 시리얼을 권위 deviceId 로 유지**하고
+서버 echo 로 덮어쓰지 않는다(parse_register_response). 서버가 발급해 주는 것은 dispenserToken·exp 뿐.
+멱등: 같은 시리얼(deviceId) 재등록 → 같은 문서 + 새 토큰 — 부팅마다 호출해도 안전.
 
 재시도 정책 = 기존 수치 준용(EngineExecutor R=3 — 첫 시도 + 최대 3 재시도):
   - retryable: 전송 예외(네트워크) · 5xx(500 register_failed·503 provisioning_not_configured)
@@ -57,31 +62,31 @@ class RegistrationError(Exception):
         super().__init__(f"RegistrationError({code} retryable={retryable} http={http_status})")
 
 
-def build_register_request(hardware_id: str, name: str | None = None) -> dict[str, Any]:
-    """RegisterRequest 와이어 조립 — name 은 includeIfNull:false(부록A P-4)."""
-    if not isinstance(hardware_id, str) or hardware_id == "":
-        raise ValueError("hardwareId 는 비어있지 않은 문자열(계약 minLength 1)")
-    m: dict[str, Any] = {"hardwareId": hardware_id}
+def build_register_request(device_id: str, name: str | None = None) -> dict[str, Any]:
+    """RegisterRequest 와이어 조립 — deviceId(=수집 시리얼·D-A) 제시. name 은 includeIfNull:false."""
+    if not isinstance(device_id, str) or device_id == "":
+        raise ValueError("deviceId(시리얼)는 비어있지 않은 문자열(계약 minLength 1)")
+    m: dict[str, Any] = {"deviceId": device_id}
     put_if_present(m, "name", name)
     return m
 
 
-def parse_register_response(body: Mapping[str, Any] | None, hardware_id: str) -> DeviceIdentity:
-    """RegisterResponse 방어 파싱 — 계약 위반 본문은 retryable RegistrationError."""
+def parse_register_response(body: Mapping[str, Any] | None, device_id: str) -> DeviceIdentity:
+    """RegisterResponse 방어 파싱 — 서버가 발급한 dispenserToken·exp 만 취한다.
+
+    [D-A] deviceId 는 **pi 자기 시리얼(`device_id` 인자)이 권위** — 서버 응답의 deviceId(echo)로
+    덮어쓰지 않는다. 서버 발급값이 없어져도(등록만) 안전하도록 body 의 deviceId 는 읽지 않는다.
+    dispenserToken·exp 계약 위반(누락·형식)만 retryable RegistrationError(과도기 서버 방어).
+    """
     if body is None:
         raise RegistrationError("malformed_response", retryable=True)
-    device_id = body.get("deviceId")
     token = body.get("dispenserToken")
     exp = body.get("exp")
-    if not isinstance(device_id, str) or device_id == "":
-        raise RegistrationError("malformed_response", retryable=True)
     if not isinstance(token, str) or token == "":
         raise RegistrationError("malformed_response", retryable=True)
     if isinstance(exp, bool) or not isinstance(exp, int):
         raise RegistrationError("malformed_response", retryable=True)
-    return DeviceIdentity(
-        device_id=device_id, dispenser_token=token, exp=exp, hardware_id=hardware_id
-    )
+    return DeviceIdentity(device_id=device_id, dispenser_token=token, exp=exp)
 
 
 class RegistrationClient:
@@ -91,14 +96,14 @@ class RegistrationClient:
         self,
         transport: RegisterTransport,
         *,
-        hardware_id: str,
+        device_id: str,
         name: str | None = None,
         max_retries: int = DEFAULT_REGISTER_MAX_RETRIES,
         retry_delays_seconds: tuple[float, ...] = DEFAULT_RETRY_DELAYS_SECONDS,
         sleep: Callable[[float], None] | None = None,
     ) -> None:
         self.transport = transport
-        self.hardware_id = hardware_id
+        self.device_id = device_id  # = 수집 HW 시리얼(D-A). 등록 요청에 제시·정체성 권위값.
         self.name = name
         self.max_retries = max_retries
         self.retry_delays_seconds = retry_delays_seconds
@@ -106,7 +111,7 @@ class RegistrationClient:
 
     def register(self) -> DeviceIdentity:
         """등록 실행 — 첫 시도 + 최대 max_retries 재시도. 실패 시 RegistrationError."""
-        request = build_register_request(self.hardware_id, self.name)
+        request = build_register_request(self.device_id, self.name)
         last_error: RegistrationError | None = None
 
         for attempt in range(self.max_retries + 1):
@@ -126,7 +131,7 @@ class RegistrationClient:
 
             if 200 <= status < 300:
                 try:
-                    return parse_register_response(body, self.hardware_id)
+                    return parse_register_response(body, self.device_id)
                 except RegistrationError as e:
                     last_error = e  # 계약 위반 본문 — retryable(과도기 서버 방어).
                     continue
@@ -151,17 +156,17 @@ def ensure_registered(
     now_seconds: int | None = None,
     force: bool = False,
 ) -> DeviceIdentity:
-    """부팅 진입점 — 저장된 정체성이 유효(미만료·동일 hardwareId)하면 재사용, 아니면 등록.
+    """부팅 진입점 — 저장된 정체성이 유효(미만료·동일 deviceId)하면 재사용, 아니면 등록.
 
-    토큰 만료(계약 12h) 시 재등록으로 재발급. hardwareId 가 바뀌었으면(기판 교체 등)
-    저장분을 버리고 재등록(레지스트리 자연키 = hardwareId).
+    토큰 만료(계약 12h) 시 재등록으로 재발급. [D-A] 저장된 deviceId 가 현재 시리얼과 다르면
+    (기판 교체·구 dsp-<hash> 파일에서 승격 등) 저장분을 버리고 재등록(레지스트리 upsert 키 = deviceId=시리얼).
     """
     now = now_seconds if now_seconds is not None else int(time.time())
     if not force:
         existing = store.load()
         if (
             existing is not None
-            and existing.hardware_id == client.hardware_id
+            and existing.device_id == client.device_id
             and not is_identity_expired(existing, now_seconds=now)
         ):
             return existing
@@ -217,11 +222,12 @@ def read_hardware_id(
     cpuinfo_path: Path | str = "/proc/cpuinfo",
     machine_id_path: Path | str = "/etc/machine-id",
 ) -> str | None:
-    """기기 고유 HW 식별자 seam — 계약 RegisterRequest.hardwareId(레지스트리 자연키).
+    """기기 고유 HW 식별자 seam — [D-A] 이 값이 **곧 deviceId**(RegisterRequest.deviceId·레지스트리 키).
 
     우선순위: ① env SENLYT_HARDWARE_ID(테스트·개발 주입) → ② /proc/cpuinfo `Serial`
     (Pi CPU 시리얼 — 계약 예시) → ③ /etc/machine-id 폴백. 전부 실패 → None
-    (호출측이 등록 불가로 표면화 — silent 임의값 생성 금지·레지스트리 자연키 안정성).
+    (호출측이 등록 불가로 표면화 — silent 임의값 생성 금지·deviceId 안정성).
+    seam 이름(read_hardware_id)·env 키(SENLYT_HARDWARE_ID)는 유지 — 반환값의 의미만 deviceId 로 확정.
     """
     e = env if env is not None else os.environ
     override = e.get(HARDWARE_ID_ENV_KEY)

@@ -18,7 +18,8 @@ from senlyt_pi.adapters.registration_client import (
 )
 from support_http import FakeHttpServer
 
-OK_BODY = {"deviceId": "dev-1", "dispenserToken": "tok-1", "exp": 2_000_000_000}
+# deviceId 는 제시 시리얼 echo(pi 는 무시) — dispenserToken·exp 만 서버 발급.
+OK_BODY = {"deviceId": "server-echo-ignored", "dispenserToken": "tok-1", "exp": 2_000_000_000}
 
 
 def test_transport_shapes_request_and_returns_ok() -> None:
@@ -27,14 +28,14 @@ def test_transport_shapes_request_and_returns_ok() -> None:
         transport = make_http_register_transport(
             f"{srv.base_url}/api/dispensers/register", "prov-key-xyz"
         )
-        status, body = transport({"hardwareId": "hw-1", "name": "매장1"})
+        status, body = transport({"deviceId": "10000000abcd1234", "name": "매장1"})
         assert status == 200
         assert body == OK_BODY
         rec = srv.requests[-1]
         assert rec.method == "POST"
         assert rec.path == "/api/dispensers/register"
         assert rec.header("Authorization") == "Bearer prov-key-xyz"
-        assert rec.json() == {"hardwareId": "hw-1", "name": "매장1"}
+        assert rec.json() == {"deviceId": "10000000abcd1234", "name": "매장1"}
 
 
 def test_transport_returns_4xx_status_not_raise() -> None:
@@ -45,7 +46,7 @@ def test_transport_returns_4xx_status_not_raise() -> None:
         transport = make_http_register_transport(
             f"{srv.base_url}/api/dispensers/register", "bad"
         )
-        status, body = transport({"hardwareId": "hw-1"})
+        status, body = transport({"deviceId": "hw-1"})
         assert status == 401
         assert body == {"code": "invalid_provision_key"}
 
@@ -58,7 +59,7 @@ def test_transport_network_failure_raises_transport_error() -> None:
         "http://web:3000/api/dispensers/register", "k", request=raising_request
     )
     with pytest.raises(HttpTransportError):
-        transport({"hardwareId": "hw-1"})
+        transport({"deviceId": "hw-1"})
 
 
 def test_client_with_real_transport_registers() -> None:
@@ -69,11 +70,12 @@ def test_client_with_real_transport_registers() -> None:
             f"{srv.base_url}/api/dispensers/register", "k"
         )
         identity = RegistrationClient(
-            transport, hardware_id="hw-serial", name=None, sleep=lambda _s: None
+            transport, device_id="hw-serial", name=None, sleep=lambda _s: None
         ).register()
-        assert identity.device_id == "dev-1"
+        assert identity.device_id == "hw-serial"  # 자기 시리얼 = deviceId(echo 무시).
         assert identity.dispenser_token == "tok-1"
-        assert identity.hardware_id == "hw-serial"
+        # 등록 요청이 deviceId(시리얼)를 제시했는지 실 소켓 바디로 확인.
+        assert srv.requests[-1].json() == {"deviceId": "hw-serial"}
 
 
 def test_client_retries_5xx_then_succeeds_over_socket() -> None:
@@ -92,9 +94,9 @@ def test_client_retries_5xx_then_succeeds_over_socket() -> None:
             f"{srv.base_url}/api/dispensers/register", "k"
         )
         identity = RegistrationClient(
-            transport, hardware_id="hw", sleep=lambda _s: None
+            transport, device_id="hw", sleep=lambda _s: None
         ).register()
-        assert identity.device_id == "dev-1"
+        assert identity.device_id == "hw"
         assert calls["n"] == 3
 
 
@@ -107,7 +109,7 @@ def test_client_permanent_401_no_retry_over_socket() -> None:
             f"{srv.base_url}/api/dispensers/register", "bad"
         )
         with pytest.raises(RegistrationError) as ei:
-            RegistrationClient(transport, hardware_id="hw", sleep=lambda _s: None).register()
+            RegistrationClient(transport, device_id="hw", sleep=lambda _s: None).register()
         assert ei.value.retryable is False
         assert ei.value.code == "invalid_provision_key"
         assert len(srv.requests) == 1  # 재시도 없음.

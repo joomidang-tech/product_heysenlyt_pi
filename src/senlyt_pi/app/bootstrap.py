@@ -56,7 +56,7 @@ DEFAULT_LEDGER_FILENAME = "idempotency-ledger.log"
 
 
 class BootstrapError(Exception):
-    """부팅 조립 실패 — hardwareId 부재·서버 타겟 미설정·등록 실패 등(fail-fast)."""
+    """부팅 조립 실패 — deviceId(수집 시리얼) 부재·서버 타겟 미설정·등록 실패 등(fail-fast)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,7 +170,7 @@ def build_components(
 
     Raises:
       ServerTargetError: 서버 base URL 미설정/미지원(fail-fast — config.server_target).
-      BootstrapError:    hardwareId 부재 또는 등록 실패.
+      BootstrapError:    deviceId(수집 시리얼) 부재 또는 등록 실패.
     """
     log = logger if logger is not None else StructuredLogger()
     # 1) 서버 타겟(base URL) 결정 — 미설정 시 ServerTargetError(fail-fast·prod 오접속 차단).
@@ -179,17 +179,18 @@ def build_components(
     # 2) 정체성 확보 — 저장분 재사용 or 실 HTTP 등록.
     store = identity_store or DeviceIdentityStore(_identity_path(environ))
     if register:
-        hardware_id = read_hardware_id(env=environ)
-        if not hardware_id:
+        # [D-A] 수집 HW 시리얼 = deviceId(서버 발급 없음). 부재 시 fail-fast(임의값 금지).
+        device_id = read_hardware_id(env=environ)
+        if not device_id:
             raise BootstrapError(
-                "hardwareId 확보 불가 — SENLYT_HARDWARE_ID 또는 /proc/cpuinfo Serial 필요"
+                "deviceId(수집 시리얼) 확보 불가 — SENLYT_HARDWARE_ID 또는 /proc/cpuinfo Serial 필요"
             )
         transport = make_http_register_transport(
             server_config.register_url, read_provision_key(environ)
         )
         client = RegistrationClient(
             transport,
-            hardware_id=hardware_id,
+            device_id=device_id,
             name=environ.get(SENLYT_DEVICE_NAME_ENV) or None,
         )
         try:
