@@ -108,12 +108,14 @@ class TestMigrationFallback:
             "isDeleted": False,
             "isDemo": False,
             # deviceId/attempt/traceId 부재.
-            "fragrance": {"name": "Rose"},
+            "fragrance": {"fragranceResult": {"notes": [{"name": "Rose"}]}},
         })
         assert dto.device_id == DEFAULT_DEVICE_ID
         assert dto.attempt == 1
         assert dto.trace_id == ""
-        assert dto.fragrance is not None and dto.fragrance.name == "Rose"
+        assert dto.fragrance is not None and dto.fragrance.fragrance_result == {
+            "notes": [{"name": "Rose"}]
+        }
 
 
 class TestStrictBoolCoercion:

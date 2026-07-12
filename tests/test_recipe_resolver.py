@@ -1,6 +1,6 @@
 """RecipeResolver 테스트 — SoT §6-4 / §9-1 / 질의서 Q2(RR-05)·Q3(RR-07).
 
-Dart `test/recipe_resolver_test.dart` 포팅 + v1.2.0 expoRecipe/flavor_recipes 폴백 헬퍼.
+Dart `test/recipe_resolver_test.dart` 포팅 + v1.2.0 flavorRecipe/flavor_recipes 폴백 헬퍼.
 정렬(idx 오름차순)·검증 게이트(음수·0·상한초과·미매핑·빈레시피 → CMD_VALIDATION_FAILED)·
 steps 파생(하드코딩 금지·§6-4 검산).
 """
@@ -13,8 +13,8 @@ from senlyt_pi.pipeline.recipe_resolver import (
     UNMAPPED_PUMP_ADDR,
     RecipeResolver,
     RecipeValidationError,
-    expo_recipe_to_steps,
-    expo_sour_ml,
+    flavor_recipe_to_steps,
+    flavor_sour_ml,
     flavor_recipe_source_to_steps,
 )
 
@@ -92,11 +92,11 @@ def test_multiple_steps_step_n():
     assert r.steps[1].steps == 1920  # 12000 × 200 ÷ 1250.
 
 
-# ── v1.2.0 expoRecipe 소비 (ExpoRecipePayload → RecipeStep) ──────────────────
+# ── v1.2.0 flavorRecipe 소비 (ExpoRecipePayload → RecipeStep) ──────────────────
 
 
-def test_expo_recipe_items_ml_to_ul():
-    """expoRecipe items[] 시린지 도징 — amount_ml → µL ×1000 정규화(§6-6)."""
+def test_flavor_recipe_items_ml_to_ul():
+    """flavorRecipe items[] 시린지 도징 — amount_ml → µL ×1000 정규화(§6-6)."""
     payload = {
         "items": [
             {"channel_id": "grape", "amount_ml": 0.6, "role": "main"},
@@ -106,37 +106,37 @@ def test_expo_recipe_items_ml_to_ul():
         "sourMl": 0.1,
         "baseMl": 20.0,
     }
-    steps = expo_recipe_to_steps(payload, pump_addr_of={"grape": 1, "citrus": 2}.get)
+    steps = flavor_recipe_to_steps(payload, pump_addr_of={"grape": 1, "citrus": 2}.get)
     assert [(s.idx, s.pump_addr, s.volume) for s in steps] == [(0, 1, 600.0), (1, 2, 400.0)]
 
 
-def test_expo_recipe_sweet_ml_becomes_step_only_when_pump_configured():
+def test_flavor_recipe_sweet_ml_becomes_step_only_when_pump_configured():
     """sweetMl(당) — sweet_pump_addr 구성 시에만 당 스텝 추가(mL→µL)."""
     payload = {"items": [{"channel_id": "grape", "amount_ml": 1.0, "role": "main"}], "sweetMl": 1.2}
-    without = expo_recipe_to_steps(payload, pump_addr_of={"grape": 1}.get)
+    without = flavor_recipe_to_steps(payload, pump_addr_of={"grape": 1}.get)
     assert len(without) == 1  # 당 채널 미구성 → 생략.
-    with_sweet = expo_recipe_to_steps(payload, pump_addr_of={"grape": 1}.get, sweet_pump_addr=9)
+    with_sweet = flavor_recipe_to_steps(payload, pump_addr_of={"grape": 1}.get, sweet_pump_addr=9)
     assert len(with_sweet) == 2
     assert with_sweet[1].pump_addr == 9
     assert with_sweet[1].volume == 1200.0
 
 
-def test_expo_recipe_sour_ml_is_not_dosed():
+def test_flavor_recipe_sour_ml_is_not_dosed():
     """sourMl(산) — 시린지 스텝 아님(기주 밸브 threshold 판단 자리·오케스트레이션 몫)."""
     payload = {
         "items": [{"channel_id": "grape", "amount_ml": 1.0, "role": "main"}],
         "sweetMl": 0,
         "sourMl": 0.2,
     }
-    steps = expo_recipe_to_steps(payload, pump_addr_of={"grape": 1}.get, sweet_pump_addr=9)
+    steps = flavor_recipe_to_steps(payload, pump_addr_of={"grape": 1}.get, sweet_pump_addr=9)
     assert len(steps) == 1  # sour 스텝 없음.
-    assert expo_sour_ml(payload) == 0.2  # 판단값만 노출.
+    assert flavor_sour_ml(payload) == 0.2  # 판단값만 노출.
 
 
-def test_expo_recipe_unmapped_channel_falls_to_rr_gate():
+def test_flavor_recipe_unmapped_channel_falls_to_rr_gate():
     """미매핑 channel_id → UNMAPPED sentinel → RR unmapped_pump_addr 게이트로 drop(silent 금지)."""
     payload = {"items": [{"channel_id": "unknown", "amount_ml": 0.5, "role": "main"}]}
-    steps = expo_recipe_to_steps(payload, pump_addr_of=lambda _cid: None)
+    steps = flavor_recipe_to_steps(payload, pump_addr_of=lambda _cid: None)
     assert steps[0].pump_addr == UNMAPPED_PUMP_ADDR
     with pytest.raises(RecipeValidationError) as e:
         RESOLVER.resolve(steps)

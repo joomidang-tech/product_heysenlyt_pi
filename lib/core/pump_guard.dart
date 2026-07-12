@@ -64,7 +64,7 @@ const Map<String, PumpPreset> pumpPresets = {
     pumpMaxTopSpeedHz: 48000,
     pumpMaxCutoffSpeedHz: 21600,
     pumpMaxSlope: 20,
-    pumpSyringeTypeCode: 0, // SoT §6-2 스톨='—' (서버 pumpGuard.ts와 byte-parity)
+    pumpSyringeTypeCode: 200, // 서버 pumpGuard.ts U200 (v1.1.0 확정 — 구 이관본 0은 stale 버그, 2026-07-12 정정)
   ),
   'cavro_xcalibur': PumpPreset(
     pumpPresetId: 'cavro_xcalibur',
@@ -73,7 +73,7 @@ const Map<String, PumpPreset> pumpPresets = {
     pumpMaxTopSpeedHz: 6000, // * SY-01B 하한
     pumpMaxCutoffSpeedHz: 5400, // * SY-01B 하한
     pumpMaxSlope: 20,
-    pumpSyringeTypeCode: 0, // SoT §6-2 스톨='—' (서버 pumpGuard.ts와 byte-parity)
+    pumpSyringeTypeCode: 200, // 서버 pumpGuard.ts U200 (v1.1.0 확정 — 구 이관본 0은 stale 버그, 2026-07-12 정정)
   ),
 };
 
@@ -87,10 +87,21 @@ const int _customSlopeMax = 40;
 const int _customTypeMin = 0;
 const int _customTypeMax = 999;
 
-/// 유효 syringe 용량 이산값(mL) — SoT §6-1 / O-15.
+/// 유효 syringe 용량 이산값(mL) — v1.1.0 서버 pumpGuard.ts VALID_SYRINGE_ML 정본 **9종**.
+///   (구 이관본 4종은 stale — 2026-07-12 서버 SoT에 맞춰 정정. Python 배포본과 동일.)
 ///
 /// (double 은 primitive equality 가 없어 const Set 불가 — final 런타임 집합.)
-final Set<double> validSyringeCapacitiesMl = <double>{1.25, 0.5, 2.5, 5.0};
+final Set<double> validSyringeCapacitiesMl = <double>{
+  0.025,
+  0.05,
+  0.1,
+  0.25,
+  0.5,
+  1.0,
+  1.25,
+  2.5,
+  5.0,
+};
 
 /// 정수 clamp(round 후 [min,max]) — TS `clampInt`. NaN/누락 → fallback.
 ///

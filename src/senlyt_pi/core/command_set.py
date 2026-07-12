@@ -8,7 +8,7 @@
     (pi ledger 키 동일값 — ledger 무변경). sourceOrderId·attempt 필수.
   - kind=maintenance → commandSetId = `mnt-{uuid}` (admin 발행 — 세척·퍼지·프라임).
   - steps=None = 레거시 폴백 신호(manufacture 만) — pi recipe_resolver(강등·삭제 아님)가
-    recipeId/fragranceResult/expoRecipe 로 자체 해석.
+    recipeId/fragranceResult/flavorRecipe 로 자체 해석.
   - 전달 = 기존 SSE snapshot 에 commandSets 필드 추가(queued|delivered 만 push ·
     자기 deviceId 필터 CS-08 동형). 기존 orders/commands 소비자 무파괴.
 

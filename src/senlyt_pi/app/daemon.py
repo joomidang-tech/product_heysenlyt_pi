@@ -77,7 +77,7 @@ def _default_interpret(command: Command) -> list:
     """recipe==None 폴백 기본 해석기 — 명시 recipe 만 사용(recipeId/fragranceResult 해석 미주입 시).
 
     recipe 가 None 이면 빈 스텝 → RR 이 empty_recipe 로 CMD_VALIDATION_FAILED drop(토출 0·
-    silent-success 금지). 실 폴백 해석(recipeId/expoRecipe)이 필요하면 deps.interpret 주입.
+    silent-success 금지). 실 폴백 해석(recipeId/flavorRecipe)이 필요하면 deps.interpret 주입.
     """
     return list(command.recipe) if command.recipe else []
 

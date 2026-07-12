@@ -35,7 +35,6 @@ class FlavorSub:
 
     recipe_id: str  # 없으면 ""
     flavor_content: dict[str, Any] | None = None  # LocalizedContent<FlavorContent>
-    vapi_result: dict[str, Any] | None = None  # FlavorVapiResult
 
     @staticmethod
     def from_json(j: Mapping[str, Any]) -> "FlavorSub":
@@ -43,53 +42,32 @@ class FlavorSub:
         return FlavorSub(
             recipe_id=recipe_id if isinstance(recipe_id, str) else "",
             flavor_content=_as_map(j.get("flavorContent")),
-            vapi_result=_as_map(j.get("vapiResult")),
         )
 
     def to_json(self) -> dict[str, Any]:
         m: dict[str, Any] = {"recipeId": self.recipe_id}
         put_if_present(m, "flavorContent", self.flavor_content)
-        put_if_present(m, "vapiResult", self.vapi_result)
         return m
 
 
 @dataclass(frozen=True, slots=True)
 class FragranceSub:
-    """fragrance 서브객체 — SoT §5-1 (@deprecated 평탄미러 포함·Flutter 호환)."""
+    """fragrance 서브객체 — SoT §5-1."""
 
     fragrance_content: dict[str, Any] | None = None
     fragrance_result: dict[str, Any] | None = None
-    name: str | None = None
-    name_ko: str | None = None
-    story: str | None = None
-    story_ko: str | None = None
-    description: str | None = None
 
     @staticmethod
     def from_json(j: Mapping[str, Any]) -> "FragranceSub":
-        def _s(key: str) -> str | None:
-            v = j.get(key)
-            return v if isinstance(v, str) else None
-
         return FragranceSub(
             fragrance_content=_as_map(j.get("fragranceContent")),
             fragrance_result=_as_map(j.get("fragranceResult")),
-            name=_s("name"),
-            name_ko=_s("nameKo"),
-            story=_s("story"),
-            story_ko=_s("storyKo"),
-            description=_s("description"),
         )
 
     def to_json(self) -> dict[str, Any]:
         m: dict[str, Any] = {}
         put_if_present(m, "fragranceContent", self.fragrance_content)
         put_if_present(m, "fragranceResult", self.fragrance_result)
-        put_if_present(m, "name", self.name)
-        put_if_present(m, "nameKo", self.name_ko)
-        put_if_present(m, "story", self.story)
-        put_if_present(m, "storyKo", self.story_ko)
-        put_if_present(m, "description", self.description)
         return m
 
 

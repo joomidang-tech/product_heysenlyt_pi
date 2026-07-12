@@ -10,8 +10,8 @@ Dart `lib/pipeline/recipe_resolver.dart` 포팅.
   3) 각 스텝을 SyringeSpec 로 steps(수) 파생(§6-4·하드코딩 금지).
 
 recipe == None(§9-1 폴백 신호) 은 이 resolver 의 책임 밖 — 상위(dispatcher)가
-recipeId/fragranceResult/**expoRecipe** 로 해석해 RecipeStep 리스트를 만든 뒤 이
-resolver 로 넘긴다. 폴백 해석 헬퍼(expo_recipe_to_steps·flavor_recipe_source_to_steps)는
+recipeId/fragranceResult/**flavorRecipe** 로 해석해 RecipeStep 리스트를 만든 뒤 이
+resolver 로 넘긴다. 폴백 해석 헬퍼(flavor_recipe_to_steps·flavor_recipe_source_to_steps)는
 이 모듈 하단(순수 함수·검증은 여전히 RR 게이트).
 
 순수 함수(firebase/http/시리얼 무의존) — 단위테스트가 하드웨어 없이 통과.
@@ -34,7 +34,7 @@ class ResolvedStep:
     idx: int
     pump_addr: int
     flavor: str
-    # per-pump 정규화된 µL(fragrance/expo 는 상위에서 mL→µL 정규화 후 전달).
+    # per-pump 정규화된 µL(fragrance/flavor 는 상위에서 mL→µL 정규화 후 전달).
     volume_ul: float
     # SyringeSpec 파생 스텝수(§6-4).
     steps: int
@@ -100,7 +100,7 @@ class RecipeResolver:
     def resolve(self, steps: Sequence[RecipeStep]) -> ResolvedRecipe:
         """steps 를 정렬·검증·파생한다. 위반 시 [RecipeValidationError] raise(→ drop).
 
-        `steps` 는 이미 µL 정규화 완료(fragrance/expo mL→µL 는 상위·§6-6)를 전제한다.
+        `steps` 는 이미 µL 정규화 완료(fragrance/flavor mL→µL 는 상위·§6-6)를 전제한다.
         """
         # RR-07(Q3): 빈 레시피 → drop(0step COMPLETED 금지).
         if not steps:
@@ -153,7 +153,7 @@ class RecipeResolver:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# recipe==None 폴백 해석 헬퍼 (v1.2.0 expoRecipe / flavor_recipes)
+# recipe==None 폴백 해석 헬퍼 (v1.2.0 flavorRecipe / flavor_recipes)
 #
 # 검증은 여전히 RR 게이트 — 여기서는 단위 정규화(mL→µL)와 스텝 조립만 한다.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -166,13 +166,13 @@ PumpAddrOf = Callable[[str], "int | None"]
 UNMAPPED_PUMP_ADDR = -1
 
 
-def expo_recipe_to_steps(
+def flavor_recipe_to_steps(
     payload: Mapping[str, Any],
     *,
     pump_addr_of: PumpAddrOf,
     sweet_pump_addr: int | None = None,
 ) -> list[RecipeStep]:
-    """expoRecipe(ExpoRecipePayload) → RecipeStep 리스트 — v1.2.0 식향 생성형 레시피 소비.
+    """flavorRecipe(ExpoRecipePayload) → RecipeStep 리스트 — v1.2.0 식향 생성형 레시피 소비.
 
     정본 계약 = heysenlyt-web `lib/expo/types.ts` ExpoRecipePayload
     (= ai-developer `_expo/contract.py` RecipeResult.recipe).
@@ -183,7 +183,7 @@ def expo_recipe_to_steps(
         None 이면 당 도징 채널 미구성 → 스텝 생략(informational).
       - sourMl (산): **시린지 도징 아님** — 기주 밸브 온오프 threshold 판단 자리.
         threshold 비교·기주 택1 은 오케스트레이션 몫(kernel.ts 주석·2026-07-06 확정).
-        여기서는 스텝을 만들지 않는다 → `expo_sour_ml(payload)` 로 판단값만 노출(TODO: 밸브 웨이브).
+        여기서는 스텝을 만들지 않는다 → `flavor_sour_ml(payload)` 로 판단값만 노출(TODO: 밸브 웨이브).
       - baseMl (기주): 시린지 아님(밸브·앞단 20mL) — 스텝 생략.
 
     반환 리스트는 아직 검증 전(RR 이 게이트). idx 는 0부터 오름차순 직렬.
@@ -224,12 +224,12 @@ def expo_recipe_to_steps(
         )
         idx += 1
 
-    # sourMl 은 스텝화하지 않는다(기주 밸브 판단 자리) — expo_sour_ml 로 노출.
+    # sourMl 은 스텝화하지 않는다(기주 밸브 판단 자리) — flavor_sour_ml 로 노출.
     return steps
 
 
-def expo_sour_ml(payload: Mapping[str, Any]) -> float:
-    """expoRecipe.sourMl — 기주 밸브 온오프 threshold 판단용 값(mL).
+def flavor_sour_ml(payload: Mapping[str, Any]) -> float:
+    """flavorRecipe.sourMl — 기주 밸브 온오프 threshold 판단용 값(mL).
 
     TODO(밸브 웨이브): threshold 비교 → 기주(산미/일반) 택1 밸브 제어는 오케스트레이션
     (kernel.ts: "threshold 초과 여부에 따른 기주 밸브 온오프는 오케스트레이션앱이 판단").
