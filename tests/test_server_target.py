@@ -17,6 +17,7 @@ from senlyt_pi.config.server_target import (
     SENLYT_SERVER_BASE_URL_KEY,
     ServerConfig,
     ServerTargetError,
+    branch_to_env,
     join_url,
     resolve_from_environ,
     resolve_server_base_url,
@@ -30,7 +31,7 @@ from senlyt_pi.config.server_target import (
     "env,expected",
     [
         ("prod", "https://senlyt.com"),
-        ("dev", "https://dev.senlyt.com"),
+        ("dev", "https://dev-env.senlyt.com"),
         ("v1_2_0", "https://v1-2-0.env.senlyt.com"),
         ("v1_1_0", "https://v1-1-0.env.senlyt.com"),
     ],
@@ -68,8 +69,8 @@ def test_explicit_url_trailing_slash_normalized() -> None:
 
 def test_explicit_url_whitespace_treated_as_unset_falls_back_to_env() -> None:
     # 빈/공백 명시값은 미설정으로 취급 → env 폴백.
-    assert resolve_server_base_url("dev", "   ") == "https://dev.senlyt.com"
-    assert resolve_server_base_url("dev", "") == "https://dev.senlyt.com"
+    assert resolve_server_base_url("dev", "   ") == "https://dev-env.senlyt.com"
+    assert resolve_server_base_url("dev", "") == "https://dev-env.senlyt.com"
 
 
 def test_explicit_http_scheme_allowed() -> None:
@@ -112,6 +113,51 @@ def test_unknown_env_still_rejected_even_if_similar() -> None:
 def test_malformed_explicit_url_raises(bad_url: str) -> None:
     with pytest.raises(ServerTargetError):
         resolve_server_base_url(None, bad_url)
+
+
+# ── 4. branch_to_env — 브랜치명 → SENLYT_ENV 규칙(로컬 provision·CI 검증 공유 SoT) ──
+
+
+@pytest.mark.parametrize(
+    "branch,expected",
+    [
+        ("main", "prod"),
+        ("dev", "dev"),
+        ("v1.2.0", "v1_2_0"),
+        ("v1.1.0", "v1_1_0"),
+        ("v10.20.30", "v10_20_30"),
+        ("  v1.2.0  ", "v1_2_0"),  # 공백 정규화
+    ],
+)
+def test_branch_to_env_known(branch: str, expected: str) -> None:
+    assert branch_to_env(branch) == expected
+
+
+@pytest.mark.parametrize(
+    "branch",
+    ["feature/x", "v1.2", "V1.2.0", "release", "main-backup", ""],
+)
+def test_branch_to_env_unknown_returns_none(branch: str) -> None:
+    assert branch_to_env(branch) is None
+
+
+def test_branch_to_env_none_input() -> None:
+    assert branch_to_env(None) is None
+
+
+def test_branch_to_env_deployed_branches_map_to_base_url_keys() -> None:
+    # 배포 브랜치의 env 는 ENV_TO_BASE_URL 키와 일치 → 각인값이 리졸버에서 fail-fast 안 남.
+    for branch in ("main", "dev", "v1.2.0", "v1.1.0"):
+        env = branch_to_env(branch)
+        assert env is not None
+        assert env in ENV_TO_BASE_URL
+
+
+def test_branch_to_env_feeds_resolver_end_to_end() -> None:
+    # 브랜치 → env → base URL 전 구간 정합(로컬/CI 각인 시나리오·dev-env 포함).
+    assert resolve_server_base_url(branch_to_env("v1.2.0")) == "https://v1-2-0.env.senlyt.com"
+    assert resolve_server_base_url(branch_to_env("main")) == "https://senlyt.com"
+    assert resolve_server_base_url(branch_to_env("dev")) == "https://dev-env.senlyt.com"
 
 
 # ── 4. resolve_from_environ 진입점 ──

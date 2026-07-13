@@ -11,3 +11,11 @@ doc/api/
 # IDE
 .idea/
 *.iml
+
+# Python (배포 데몬 src/senlyt_pi)
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+.venv/
