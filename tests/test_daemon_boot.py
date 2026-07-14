@@ -487,6 +487,7 @@ def test_senlytd_run_mode_invokes_boot(tmp_path, monkeypatch):
         command_source=FakeCommandSource(),
         status_sink=FakeStatusSink(),
         engine=FakeEnginePort(),
+        valve=None,  # §9-1 v2 — 밸브 미결선(valve 스텝 없는 시나리오).
         server_config=types.SimpleNamespace(base_url="http://web:3000"),
         logger=None,
     )

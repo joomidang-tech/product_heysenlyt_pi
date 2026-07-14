@@ -26,31 +26,96 @@ def build_command_id(order_id: str, attempt: int) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# RecipeStep.kind 2종(§9-1 v2 — 2026-07-14 병렬 stage 계약).
+SYRINGE_STEP_KIND = "syringe"
+VALVE_STEP_KIND = "valve"
+
+# valve 스텝의 pump_addr sentinel — 시린지 버스(RS485) 주소가 아니다(GPIO). RR pump_map
+# 검증을 우회하는 게 아니라 valve 분기에서 아예 pump_addr 를 보지 않는다.
+VALVE_PUMP_ADDR = -2
+
+
 @dataclass(frozen=True, slots=True)
 class RecipeStep:
-    """recipe 스텝 — SoT §9-1. idx 0부터 오름차순 직렬."""
+    """recipe 스텝 — SoT §9-1 v2(병렬 stage 계약 · 99_daily/2026-07-14-pi데몬-병렬토출-설계).
+
+    - kind="syringe"(기본): pump_addr·volume(µL) 사용.
+    - kind="valve"(식향 기주 택1): base("normal"|"sour")·volume_ml(고정 20) 사용 —
+      openSec 계산·핀 매핑(신기주 핀11/BCM17·베이스 핀13/BCM27)·클램프는 ValveAdapter(설정값).
+    - stage: 동시 실행 그룹 — 같은 stage 병렬·오름차순 배리어. **부재(None) = idx 로 해석**
+      (하위호환: 전 스텝이 서로 다른 stage = 기존 완전 직렬과 동일 동작).
+    """
 
     idx: int
     pump_addr: int
     flavor: str
-    volume: float  # µL (int|float 그대로 보존)
+    volume: float  # µL (int|float 그대로 보존) — valve 스텝은 0.0(미사용)
+    kind: str = SYRINGE_STEP_KIND
+    stage: int | None = None  # None = idx (하위호환·§9-1 v2)
+    base: str | None = None  # valve 전용 — "normal" | "sour"
+    volume_ml: float | None = None  # valve 전용 — 기주 부피(고정 20mL)
+
+    @property
+    def effective_stage(self) -> int:
+        """stage 부재(구계약) 스텝은 idx 가 곧 stage — 기존 완전 직렬 보존."""
+        return self.stage if self.stage is not None else self.idx
+
+    @property
+    def is_valve(self) -> bool:
+        return self.kind == VALVE_STEP_KIND
 
     @staticmethod
     def from_json(j: Mapping[str, Any]) -> "RecipeStep":
+        kind = str(j.get("kind", SYRINGE_STEP_KIND))
+        raw_stage = j.get("stage")
+        stage = int(raw_stage) if raw_stage is not None else None
+        if kind == VALVE_STEP_KIND:
+            base = str(j["base"])
+            return RecipeStep(
+                idx=int(j["idx"]),
+                pump_addr=VALVE_PUMP_ADDR,
+                flavor=str(j.get("flavor", f"base:{base}")),
+                volume=0.0,
+                kind=VALVE_STEP_KIND,
+                stage=stage,
+                base=base,
+                volume_ml=float(j["volumeMl"]),
+            )
         return RecipeStep(
             idx=int(j["idx"]),
             pump_addr=int(j["pumpAddr"]),
             flavor=j["flavor"],
             volume=j["volume"],
+            kind=kind,
+            stage=stage,
         )
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        if self.kind == VALVE_STEP_KIND:
+            return {
+                "idx": self.idx,
+                "stage": self.effective_stage,
+                "kind": VALVE_STEP_KIND,
+                "base": self.base,
+                "volumeMl": self.volume_ml,
+                "flavor": self.flavor,
+                # 구데몬 호환 sentinel(리뷰 P2-4) — kind 를 모르는 구 pi 가 이 스텝을 시린지로
+                # 읽어도 pumpAddr=-2(미매핑)·volume=0 이라 RR 게이트가 CMD_VALIDATION_FAILED 로
+                # **우아하게 drop**(KeyError 크래시 아님·토출 0).
+                "pumpAddr": VALVE_PUMP_ADDR,
+                "volume": 0,
+            }
+        m: dict[str, Any] = {
             "idx": self.idx,
             "pumpAddr": self.pump_addr,
             "flavor": self.flavor,
             "volume": self.volume,
         }
+        # 하위호환 바이트 보존 — 구계약 스텝(stage 미지정)은 구형 4필드 그대로 방출.
+        if self.stage is not None:
+            m["stage"] = self.stage
+            m["kind"] = self.kind
+        return m
 
 
 @dataclass(frozen=True, slots=True)

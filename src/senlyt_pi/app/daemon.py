@@ -50,6 +50,7 @@ from ..pipeline.recipe_resolver import RecipeResolver
 from ..ports.command_source_port import CommandSourcePort
 from ..ports.commandset_source_port import CommandSetSourcePort
 from ..ports.engine_port import EnginePort
+from ..ports.valve_port import ValvePort
 from ..ports.status_sink_port import StatusSinkPort, TraceSpan
 from .dispatcher import Dispatcher, RecipeInterpreter
 
@@ -95,6 +96,8 @@ class DaemonDeps:
     status_sink: StatusSinkPort
     engine: EnginePort
     ledger: FileIdempotencyLedger
+    # 기주 밸브 포트(§9-1 v2·선택) — 미주입이면 valve 스텝 수신 시 fail-closed drop(토출 0).
+    valve: "ValvePort | None" = None
     # RR pump_map(§9-1) — 미주입이면 빈 매핑(모든 스텝 unmapped drop·안전측).
     resolver: RecipeResolver | None = None
     # CommandSet 봉투 축(선택 — 미주입 시 기존 Command 축만 소비·무파괴).
@@ -139,6 +142,7 @@ class SenlytDaemon:
             request_id_gen=self._request_id_gen,
             publisher=self._publish_progress,
             now_iso=self._now_iso,
+            valve=deps.valve,
         )
         # 봉투 전이 sink — status_sink 가 report_command_set_transition 을 제공하면 꽂는다.
         commandset_sink = getattr(deps.status_sink, "report_command_set_transition", None)
@@ -199,6 +203,10 @@ class SenlytDaemon:
     def request_stop(self) -> None:
         """상시 루프 중단 요청(SIGTERM/SIGINT 핸들러·테스트). boot 의 finally 가 shutdown 수행."""
         self._stop.set()
+        # PS-06 실동작화(리뷰 P2 봉합): 정지 신호와 함께 sequencer drain 도 세운다 —
+        # 진행 중 job 이 **현재 stage 만 완주**하고 다음 stage 를 시작하지 않게(GRACEFUL_PARTIAL).
+        # 기존엔 drain 이 shutdown(=submit 반환 후)에서만 세워져 stage 경계 조기 정지가 dead path 였다.
+        self._sequencer.request_drain()
 
     # ─────────────────────────────────────────────────────────────────────
     # BootRecovery — RUNNING→INTERRUPTED 보고(자동 재실행 금지·과토출 0·CR-01)
@@ -479,7 +487,18 @@ class SenlytDaemon:
         # 4) 마지막 trace/OQ flush — 밀린 역보고를 최대한 전송(무손실 지향).
         self._flush_traces()
         self._flush_offline_queue()
-        # 5) ledger close(파일 핸들 정리).
+        # 5) stage 태스크 풀 정리 + 밸브 강제 닫힘(§9-1 v2 — 설계 §10 "종료 시에도 전 밸브 close").
+        try:
+            self._sequencer.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        valve = self.deps.valve
+        if valve is not None:
+            try:
+                valve.close_all()
+            except Exception:  # noqa: BLE001
+                pass
+        # 6) ledger close(파일 핸들 정리).
         try:
             self.deps.ledger.close()
         except Exception:  # noqa: BLE001

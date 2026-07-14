@@ -25,6 +25,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from ..core.pump_guard import StatusErrorCode, SyringeSpec
 from ..core.wire_messages import RecipeStep
+from ..ports.valve_port import VALVE_BASES
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +40,22 @@ class ResolvedStep:
     # SyringeSpec 파생 스텝수(§6-4).
     steps: int
     spec: SyringeSpec
+    # 동시 실행 그룹(§9-1 v2) — 같은 stage 병렬·오름차순 배리어.
+    stage: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedValveStep:
+    """해석된 기주 밸브 스텝(§9-1 v2) — GPIO 시간축(시린지 버스와 독립·뮤텍스 L3).
+
+    openSec 파생(volume_ml ÷ flowRate)·클램프는 ValveAdapter(설정값) — 여기는 검증만.
+    """
+
+    idx: int
+    base: str  # "normal" | "sour"
+    volume_ml: float  # 기주 고정 20mL
+    flavor: str  # 관측 라벨 `base:{base}`
+    stage: int = 0
 
 
 class RecipeValidationError(Exception):
@@ -76,13 +93,22 @@ class RecipeValidationError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class ResolvedRecipe:
-    """성공 결과 — idx 오름차순 직렬 정렬된 실행 스텝."""
+    """성공 결과 — stage-major(stage asc·idx asc) 정렬된 실행 스텝(§9-1 v2).
 
-    steps: tuple[ResolvedStep, ...]
+    `stages` = stage 별 동시 실행 그룹(배리어 단위). 구계약(stage 부재) 스텝은
+    stage=idx 로 해석되어 그룹당 1스텝 = **기존 완전 직렬과 동일 동작**.
+    """
+
+    steps: tuple["ResolvedStep | ResolvedValveStep", ...]
+    stages: tuple[tuple["ResolvedStep | ResolvedValveStep", ...], ...] = ()
 
     @property
     def step_n(self) -> int:
         return len(self.steps)
+
+    @property
+    def has_valve(self) -> bool:
+        return any(isinstance(s, ResolvedValveStep) for s in self.steps)
 
 
 class RecipeResolver:
@@ -101,16 +127,55 @@ class RecipeResolver:
         """steps 를 정렬·검증·파생한다. 위반 시 [RecipeValidationError] raise(→ drop).
 
         `steps` 는 이미 µL 정규화 완료(fragrance/flavor mL→µL 는 상위·§6-6)를 전제한다.
+
+        §9-1 v2: stage-major(stage asc·idx asc) 정렬 + stage 게이트(서버와 **동일 규칙·
+        동일 순서** — pump_guard 바이트 동일 원칙 확장): ① stage 내 syringe pumpAddr 유일
+        ② 잔당 valve ≤ 1 ③ stage 0..N 연속. 구계약(stage 부재)은 stage=idx = 기존 직렬.
         """
         # RR-07(Q3): 빈 레시피 → drop(0step COMPLETED 금지).
         if not steps:
             raise RecipeValidationError("empty_recipe")
 
-        # idx 오름차순 직렬 정렬(§9-1). 안정 정렬 — 동일 idx 는 입력 순서 보존.
-        sorted_steps = sorted(steps, key=lambda s: s.idx)
+        # stage-major 정렬(§9-1 v2) — tie 는 idx(전역 유일)·구계약은 stage=idx 라 기존과 동일.
+        sorted_steps = sorted(steps, key=lambda s: (s.effective_stage, s.idx))
 
-        resolved: list[ResolvedStep] = []
+        resolved: list[ResolvedStep | ResolvedValveStep] = []
+        stage_pumps: dict[int, set[int]] = {}
+        valve_count = 0
         for s in sorted_steps:
+            stage = s.effective_stage
+            if stage < 0:
+                raise RecipeValidationError("negative_stage", idx=s.idx)
+
+            if s.is_valve:
+                # ── valve 게이트(§9-1 v2): base 2종 · volumeMl > 0 · 잔당 ≤ 1(상호배타 L3). ──
+                valve_count += 1
+                if valve_count > 1:
+                    raise RecipeValidationError("multiple_valve_steps", idx=s.idx)
+                if s.base not in VALVE_BASES:
+                    raise RecipeValidationError("unknown_valve_base", idx=s.idx)
+                volume_ml = float(s.volume_ml) if s.volume_ml is not None else 0.0
+                if not math.isfinite(volume_ml) or volume_ml <= 0:
+                    raise RecipeValidationError("non_positive_valve_volume", idx=s.idx)
+                resolved.append(
+                    ResolvedValveStep(
+                        idx=s.idx,
+                        base=s.base,
+                        volume_ml=volume_ml,
+                        flavor=s.flavor,
+                        stage=stage,
+                    )
+                )
+                continue
+
+            # ── stage 내 syringe pumpAddr 유일(L2 — 한 펌프 in-flight 모션 1). ──
+            pumps = stage_pumps.setdefault(stage, set())
+            if s.pump_addr in pumps:
+                raise RecipeValidationError(
+                    "duplicate_pump_in_stage", idx=s.idx, pump_addr=s.pump_addr
+                )
+            pumps.add(s.pump_addr)
+
             volume_ul = float(s.volume)
 
             # 미매핑 pumpAddr(§9-1 PUMP_MAP) → drop.
@@ -146,10 +211,23 @@ class RecipeResolver:
                     volume_ul=volume_ul,
                     steps=step_count,
                     spec=spec,
+                    stage=stage,
                 )
             )
 
-        return ResolvedRecipe(tuple(resolved))
+        # ── stage 연속성(0..N 결번 금지 — 결번 = 조립 버그·배리어 의미 모호). ──
+        seen_stages = {r.stage for r in resolved}
+        max_stage = max(seen_stages)
+        for i in range(max_stage + 1):
+            if i not in seen_stages:
+                raise RecipeValidationError(f"stage_gap_missing_{i}")
+
+        # stage 그룹핑(배리어 단위) — resolved 는 이미 stage-major 정렬.
+        stages: list[tuple[ResolvedStep | ResolvedValveStep, ...]] = []
+        for i in range(max_stage + 1):
+            stages.append(tuple(r for r in resolved if r.stage == i))
+
+        return ResolvedRecipe(tuple(resolved), tuple(stages))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,8 +260,11 @@ def flavor_recipe_to_steps(
       - sweetMl (당, 0~2mL): sweet_pump_addr 가 주어지면 당 스텝 1개 추가(µL 정규화).
         None 이면 당 도징 채널 미구성 → 스텝 생략(informational).
       - sourMl (산): **시린지 도징 아님** — 기주 밸브 온오프 threshold 판단 자리.
-        threshold 비교·기주 택1 은 오케스트레이션 몫(kernel.ts 주석·2026-07-06 확정).
-        여기서는 스텝을 만들지 않는다 → `flavor_sour_ml(payload)` 로 판단값만 노출(TODO: 밸브 웨이브).
+        threshold 비교·기주 택1 은 **서버** 몫(D18 — threshold 는 서버 설정 지식·pi 재현 불가).
+        ⚠️ §9-1 v2: 기주는 서버 조립 valve 스텝으로 실물화된다 — **이 폴백은 valve 를 재구성할
+        수 없으므로**, 생성형(flavorRecipe) 주문의 실행 경로로 이 헬퍼를 주입 결선하지 말 것
+        (기본 결선 _default_interpret = 빈 스텝 → empty drop = fail-closed 유지·리뷰 봉합).
+        여기서는 스텝을 만들지 않는다 → `flavor_sour_ml(payload)` 로 판단값만 노출.
       - baseMl (기주): 시린지 아님(밸브·앞단 20mL) — 스텝 생략.
 
     반환 리스트는 아직 검증 전(RR 이 게이트). idx 는 0부터 오름차순 직렬.

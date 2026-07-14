@@ -21,6 +21,12 @@ from typing import Mapping
 
 from ..adapters.device_identity_store import DeviceIdentity, DeviceIdentityStore
 from ..adapters.fake_engine_adapter import FakeEnginePort
+from ..adapters.valve_adapter import (
+    DEFAULT_FLOW_ML_PER_SEC,
+    DEFAULT_MAX_OPEN_SEC,
+    DEFAULT_VALVE_PINS,
+    FakeValveAdapter,
+)
 from ..adapters.http_status_sink_adapter import HttpStatusSinkAdapter
 from ..adapters.registration_client import (
     RegistrationClient,
@@ -37,6 +43,7 @@ from ..persistence.file_idempotency_ledger import FileIdempotencyLedger
 from ..persistence.idempotency_ledger import IdempotencyLedger, InMemoryIdempotencyLedger
 from ..pipeline.recipe_resolver import RecipeResolver
 from ..ports.engine_port import EnginePort
+from ..ports.valve_port import ValvePort
 
 # 엔진 선택 env — fake(기본·E2E) | sy01b(실 RS485·아직 스텁). 02_infra §10.
 SENLYT_ENGINE_ENV = "SENLYT_ENGINE"
@@ -50,6 +57,15 @@ SENLYT_DEVICE_NAME_ENV = "SENLYT_DEVICE_NAME"
 SENLYT_LEDGER_PATH_ENV = "SENLYT_LEDGER_PATH"
 # 펌프 addr 배치(모드별) — 예: "aroma:1,2,3;flavor:4" (E2E 02_infra §10 pi 서비스 env).
 SENLYT_PUMP_ADDRESSES_ENV = "PUMP_ADDRESSES"
+# 기주 밸브 선택(§9-1 v2) — fake(기본·시뮬) | gpio(실기기 라즈베리파이) | off(미결선 —
+#   valve 스텝 수신 시 fail-closed drop). 핀·유량은 설정값(하드코딩 금지·설계 §9-①).
+SENLYT_VALVE_ENV = "SENLYT_VALVE"
+# 밸브 핀 매핑(BCM) — 기본 "sour:17,normal:27" (신기주=핀11/BCM17·베이스=핀13/BCM27·7/13 확정).
+SENLYT_VALVE_PINS_ENV = "SENLYT_VALVE_PINS"
+# 밸브 유량(mL/s) — openSec = volumeMl ÷ 이 값. 벤치 캘리브레이션으로 교체(기본 10.0).
+SENLYT_VALVE_FLOW_ENV = "SENLYT_VALVE_FLOW_ML_PER_SEC"
+# 최대 개방 클램프(s) — 밸브 영구개방 차단(기본 15.0).
+SENLYT_VALVE_MAX_OPEN_ENV = "SENLYT_VALVE_MAX_OPEN_SEC"
 
 DEFAULT_IDENTITY_FILENAME = "device-identity.json"
 DEFAULT_LEDGER_FILENAME = "idempotency-ledger.log"
@@ -69,6 +85,7 @@ class DaemonComponents:
     command_source: SseCommandSourceAdapter
     status_sink: HttpStatusSinkAdapter
     engine: EnginePort
+    valve: ValvePort | None
     ledger: IdempotencyLedger
     logger: StructuredLogger
 
@@ -91,6 +108,65 @@ def build_engine(
 
         return Sy01bEngineAdapter()
     return FakeEnginePort()
+
+
+def _valve_pins_from_env(raw: str | None) -> dict[str, int]:
+    """`SENLYT_VALVE_PINS`("sour:17,normal:27") → base→BCM 핀 매핑. 파싱 불가 항목은 건너뜀."""
+    if not raw:
+        return dict(DEFAULT_VALVE_PINS)
+    pins: dict[str, int] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        base, pin = part.split(":", 1)
+        base = base.strip().lower()
+        pin = pin.strip()
+        if base and pin.isdigit():
+            pins[base] = int(pin)
+    return pins if pins else dict(DEFAULT_VALVE_PINS)
+
+
+def _float_env(environ: Mapping[str, str], key: str, default: float) -> float:
+    raw = environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        return default
+    return v if v > 0 else default
+
+
+def build_valve(
+    environ: Mapping[str, str], *, valve: "ValvePort | None" = None
+) -> ValvePort | None:
+    """기주 밸브 조립(§9-1 v2) — 주입 우선, 없으면 SENLYT_VALVE 분기(기본 fake).
+
+    - fake(기본): FakeValveAdapter — 실 GPIO 없이 개방 기록(FakeEngine 짝·E2E).
+    - gpio: GpioValveAdapter — 실기기(라즈베리파이·gpiozero lazy import). 결선 실패는
+      fail-fast(BootstrapError) — 잘못된 핀으로 조용히 뜨는 것 방지.
+    - off: None — valve 스텝 수신 시 Sequencer pre-flight 가 fail-closed drop(토출 0).
+    """
+    if valve is not None:
+        return valve
+    choice = environ.get(SENLYT_VALVE_ENV, "fake").strip().lower()
+    if choice == "off":
+        return None
+    flow = _float_env(environ, SENLYT_VALVE_FLOW_ENV, DEFAULT_FLOW_ML_PER_SEC)
+    max_open = _float_env(environ, SENLYT_VALVE_MAX_OPEN_ENV, DEFAULT_MAX_OPEN_SEC)
+    if choice == "gpio":
+        from ..adapters.valve_adapter import GpioValveAdapter
+
+        try:
+            return GpioValveAdapter(
+                pins=_valve_pins_from_env(environ.get(SENLYT_VALVE_PINS_ENV)),
+                flow_ml_per_sec=flow,
+                max_open_sec=max_open,
+            )
+        except Exception as e:  # gpiozero 부재·핀 결선 실패 — fail-fast 표면화.
+            raise BootstrapError(f"GPIO 밸브 결선 실패: {e}") from e
+    return FakeValveAdapter(flow_ml_per_sec=flow, max_open_sec=max_open)
 
 
 def _identity_path(environ: Mapping[str, str]) -> Path:
@@ -234,6 +310,7 @@ def build_components(
         command_source=command_source,
         status_sink=status_sink,
         engine=build_engine(environ, engine=engine),
+        valve=build_valve(environ),
         ledger=ledger if ledger is not None else InMemoryIdempotencyLedger(),
         logger=log,
     )

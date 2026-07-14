@@ -1,17 +1,28 @@
-"""Pump Sequencer — steps 직렬 토출 + 진행보고 + 안전정지 + 동시1제조 + graceful — SoT §4-5 / §9-2.
+"""Pump Sequencer — steps **stage 병렬** 토출 + 진행보고 + 안전정지 + 동시1제조 + graceful — SoT §4-5 / §9-2.
 
-Dart `lib/pipeline/pump_sequencer.dart` 포팅 (동기 실행 모델 — 단일 라이터 pi 데몬 전제).
+§9-1 v2(2026-07-14 병렬토출 설계 — 99_daily/2026-07-14-pi데몬-병렬토출-설계): v1.1.0 의
+"병렬 모션 + 직렬 버스" 패턴 이식. Dart Future.wait ↔ ThreadPoolExecutor 1:1 대응.
 
-책임(질의서 PS-*·SR-*·CR-*):
-  - steps **직렬** 토출(idx 오름차순) — ResolvedRecipe.steps 순서대로 EngineExecutor.run_step.
-  - 각 스텝 후 **진행보고**(PROGRESS stepK/N) via StatusReporter.
-  - 중간 **영구오류 안전정지**(PS): permanent 발생 시 즉시 중단 → PARTIAL FAILED(stepK/N·
-    ENGINE_ERROR_PERMANENT). transient 소진 실패도 중단 → PARTIAL FAILED.
-  - **동시 1제조 큐잉**: 한 번에 하나만 제조. 대기 job 은 FIFO 로 순차 실행(레이스·이중전진 방지).
-  - **graceful(SIGTERM)**: 요청 시 **현재 step 완주·다음 step 미시작**(PS-06) → 남으면 PARTIAL FAILED.
+책임(질의서 PS-*·SR-*·CR-* + 설계 §8·§10):
+  - **stage 병렬 토출**: ResolvedRecipe.stages 를 오름차순 순회(배리어) — 같은 stage 의
+    스텝들은 펌프/밸브별 태스크로 **동시 실행**(ThreadPoolExecutor). 구계약(stage 부재)은
+    stage=idx = 그룹당 1스텝 = **기존 완전 직렬과 동일 동작**(하위호환).
+  - 각 stage 후 **진행보고**(PROGRESS stepK/N) via StatusReporter — reporter 는 메인 스레드
+    에서만 호출(단조성 보장·스레드 안전은 구조로).
+  - **stage 내 partial 실패**(설계 §10): 한 태스크가 실패해도 나머지 in-flight 태스크는
+    **완주**(모션 중 강제 중단이 더 위험) → stage 실패 → 다음 stage 미진입 → PARTIAL FAILED.
+  - **동시 1제조 큐잉(L4)**: 한 번에 하나만 제조. 대기 job 은 FIFO 로 순차 실행.
+  - **graceful(SIGTERM)**: 현재 **stage 의 in-flight 태스크 완주·다음 stage 미시작**(PS-06
+    재정의·설계 §10) → 남으면 PARTIAL FAILED.
+  - **밸브(기주) 스텝**: ValvePort 로 실행(GPIO — RS485 버스와 독립·뮤텍스 L3). 밸브 미결선
+    상태로 valve 스텝 수신 = CMD_VALIDATION_FAILED drop(토출 0·fail-closed·pre-flight).
   - **무응답 silent-success 0**(EP-03): EngineExecutor 가 empty=실패로 처리하므로 0step 성공 불가.
 
 멱등 통합: run 진입 전 Ledger.check_and_claim(IL-02). RUNNING 마킹 후 토출, 종결 시 mark_settled.
+
+⚠️ 뮤텍스 계층(설계 §4): 이 모듈은 L4(잡)·L2(stage 검증=구조 보장)만 안다. L1(RS485 버스 락)은
+엔진 어댑터 몫(명령 송신+ACK 만 잡고 즉시 해제·폴링 백오프는 락 밖 — sy01b 실어댑터 구현 규약),
+L3(밸브 상호배타)는 ValveAdapter 몫. 교차 의존 금지.
 
 ⚠️ 동기 포팅 노트: Dart 의 Future 큐잉을 동기 FIFO 루프로 번역했다. 제조 콜백(publisher)
 안에서의 재진입 submit 은 미지원(RuntimeError) — request_drain 등 플래그 조작만 허용.
@@ -22,6 +33,7 @@ from __future__ import annotations
 
 import enum
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Sequence
@@ -32,8 +44,14 @@ from ..core.wire_messages import RecipeStep
 from ..persistence.file_idempotency_ledger import FileIdempotencyLedger
 from ..persistence.idempotency_ledger import LedgerVerdict
 from ..ports.engine_port import EngineDispenseCommand, EnginePort
+from ..ports.valve_port import ValvePort
 from .engine_executor import EngineExecutor
-from .recipe_resolver import RecipeResolver, RecipeValidationError
+from .recipe_resolver import (
+    RecipeResolver,
+    RecipeValidationError,
+    ResolvedStep,
+    ResolvedValveStep,
+)
 from .status_reporter import RequestIdGen, StatusReporter
 
 
@@ -101,6 +119,8 @@ class PumpSequencer:
         publisher: ProgressPublisher | None = None,
         max_retries: int = 3,
         now_iso: Callable[[], str] | None = None,
+        valve: ValvePort | None = None,
+        max_parallel: int = 8,
     ) -> None:
         self.ledger = ledger
         self.resolver = resolver
@@ -108,11 +128,20 @@ class PumpSequencer:
         self.request_id_gen = request_id_gen
         self.publisher = publisher
         self._now_iso = now_iso if now_iso is not None else _default_now_iso
+        # 기주 밸브 포트(§9-1 v2) — None 이면 valve 스텝 수신 시 fail-closed drop(토출 0).
+        self.valve = valve
+        # stage 병렬 태스크 풀(설계 §5 — threads·pyserial 친화). lazy 생성·재사용.
+        #   기본 8 = SY-01B 8채널(PUMP_MAP 0~7·리뷰 P2-1) — 이보다 작으면 큰 stage 가
+        #   조용히 파도(wave) 직렬화된다. 재시도 의미론 노트(리뷰 P2-3): 실패 job 재시도는
+        #   기존과 동일하게 **레시피 전체 재실행**(per-step resume 없음) — stage partial
+        #   성공분 이중토출 여부는 운영 재시도 정책(수동) 몫.
+        self._max_parallel = max(1, max_parallel)
+        self._pool: ThreadPoolExecutor | None = None
 
         # 동시 1제조 강제 — 진행 중이면 새 job 은 큐 대기(FIFO).
         self._busy = False
         self._pending: deque[_PendingJob] = deque()
-        # graceful 종료 플래그 — set 후 현재 step 완주·다음 step 미시작.
+        # graceful 종료 플래그 — set 후 현재 stage 완주·다음 stage 미시작.
         self._draining = False
 
     @property
@@ -206,6 +235,22 @@ class PumpSequencer:
                 error_code=e.error_code,
             )
 
+        # ── 밸브 pre-flight(fail-closed·설계 §8): valve 스텝이 있는데 밸브 미결선이면
+        #    어떤 토출도 시작하기 **전에** drop(토출 0) — 검증 실패와 동형 처리. ──
+        if resolved.has_valve and self.valve is None:
+            self.ledger.mark_settled(job.command_id, success=False)
+            self._publish(
+                DispensePhase.FAILED, 0, 0,
+                StatusErrorCode.CMD_VALIDATION_FAILED, job.command_id, job.trace_id,
+            )
+            return JobReport(
+                command_id=job.command_id,
+                outcome=JobOutcome.VALIDATION_FAILED,
+                steps_done=0,
+                step_n=0,
+                error_code=StatusErrorCode.CMD_VALIDATION_FAILED,
+            )
+
         step_n = resolved.step_n
 
         # RUNNING 마킹(재부팅 시 INTERRUPTED 판정 근거·CR-01).
@@ -221,8 +266,37 @@ class PumpSequencer:
         self._publish_via(reporter, DispensePhase.ACCEPTED, 0, step_n, None)
 
         steps_done = 0
-        for step in resolved.steps:
-            # ── graceful: 다음 step 미시작(현재까지 완주분으로 PARTIAL). ──
+        try:
+            return self._run_stages(job, reporter, resolved, step_n)
+        except Exception:
+            # 방어(리뷰 P2): 어떤 예기치 못한 예외에도 ledger 를 반드시 종결(미정착 RUNNING 금지).
+            try:
+                self.ledger.mark_settled(job.command_id, success=False)
+            except Exception:
+                pass
+            self._publish(
+                DispensePhase.FAILED, steps_done, step_n,
+                StatusErrorCode.PARTIAL_DISPENSE, job.command_id, job.trace_id,
+            )
+            return JobReport(
+                command_id=job.command_id,
+                outcome=JobOutcome.PARTIAL_FAILED,
+                steps_done=steps_done,
+                step_n=step_n,
+                error_code=StatusErrorCode.PARTIAL_DISPENSE,
+            )
+
+    def _run_stages(
+        self,
+        job: _PendingJob,
+        reporter: StatusReporter,
+        resolved,  # ResolvedRecipe
+        step_n: int,
+    ) -> JobReport:
+        """stage 배리어 루프 본체 — _run_job 의 방어 try 안에서 돈다."""
+        steps_done = 0
+        for stage_steps in resolved.stages:
+            # ── graceful: 다음 stage 미시작(현재까지 완주분으로 PARTIAL·설계 §10). ──
             if self._draining:
                 self.ledger.mark_settled(job.command_id, success=False)
                 self._publish_via(
@@ -237,21 +311,23 @@ class PumpSequencer:
                     error_code=StatusErrorCode.PARTIAL_DISPENSE,
                 )
 
-            cmd = EngineDispenseCommand(
-                pump_addr=step.pump_addr,
-                volume_ul=step.volume_ul,
-                steps=step.steps,
-                spec=step.spec,
-            )
-            res = self._executor.run_step(cmd)
+            # ── stage 동시 실행 — 전 태스크 **완주 후** 판정(취소 없음·모션 중 강제중단 금지). ──
+            results = self._run_stage(stage_steps)
+            stage_ok = sum(1 for ok, _ in results if ok)
+            steps_done += stage_ok
 
-            if not res.is_success:
-                # ── 중간 실패 안전정지(PS): permanent 즉시중단 / transient 소진 → PARTIAL FAILED. ──
+            failures = [ec for ok, ec in results if not ok]
+            if failures:
+                # ── stage 실패 안전정지(PS·설계 §10): permanent 우선 보고 → PARTIAL FAILED. ──
+                error_code = next(
+                    (ec for ec in failures if ec is StatusErrorCode.ENGINE_ERROR_PERMANENT),
+                    next((ec for ec in failures if ec is not None), None),
+                )
                 self.ledger.mark_settled(job.command_id, success=False)
                 self._publish_via(
                     reporter, DispensePhase.FAILED, steps_done, step_n,
-                    res.error_code
-                    if res.error_code is not None
+                    error_code
+                    if error_code is not None
                     else StatusErrorCode.PARTIAL_DISPENSE,
                 )
                 return JobReport(
@@ -259,11 +335,11 @@ class PumpSequencer:
                     outcome=JobOutcome.PARTIAL_FAILED,
                     steps_done=steps_done,
                     step_n=step_n,
-                    error_code=res.error_code,
+                    error_code=error_code,
                 )
 
-            steps_done += 1
-            # 진행보고(PROGRESS stepK/N). 종결 아니므로 phase=progress.
+            # 진행보고(PROGRESS stepK/N) — stage 경계에서(reporter 는 메인 스레드 전용·단조).
+            #   구계약(그룹당 1스텝)은 기존 per-step 보고와 동일 cadence(하위호환).
             if steps_done < step_n:
                 self._publish_via(reporter, DispensePhase.PROGRESS, steps_done, step_n, None)
 
@@ -276,6 +352,83 @@ class PumpSequencer:
             steps_done=steps_done,
             step_n=step_n,
         )
+
+    # ─────────────────────────────────────────────────────────────────────
+    # stage 실행 — v1.1.0 Future.wait ↔ ThreadPoolExecutor 이식(설계 §3·§5)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _ensure_pool(self) -> ThreadPoolExecutor:
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(
+                max_workers=self._max_parallel, thread_name_prefix="senlyt-stage"
+            )
+        return self._pool
+
+    def _run_stage(
+        self, stage_steps: Sequence["ResolvedStep | ResolvedValveStep"]
+    ) -> list[tuple[bool, StatusErrorCode | None]]:
+        """한 stage 의 스텝들을 동시 실행하고 (성공여부, 에러코드) 목록을 반환.
+
+        - 1스텝 stage(구계약 전체·직렬 폴백)는 스레드 없이 인라인 실행(오버헤드 0·기존 동일).
+        - 다스텝 stage 는 ThreadPoolExecutor 로 병렬 — **전 future 완주 대기**(부분 취소 없음).
+          per-step 재시도(EngineExecutor R=3)는 태스크 안에서 펌프별 **독립** 진행.
+        """
+        if len(stage_steps) == 1:
+            return [self._run_one(stage_steps[0])]
+        pool = self._ensure_pool()
+        # submit 자체의 예외(워커 스레드 생성 실패 등·리뷰 P2 봉합)도 가드 — 이미 제출된
+        # future 는 **반드시 완주 대기**(고아 in-flight 모션 금지) 후 실패 결과로 집계한다.
+        futures = []
+        submit_failures = 0
+        for s in stage_steps:
+            try:
+                futures.append(pool.submit(self._run_one, s))
+            except Exception:
+                submit_failures += 1
+        results = [f.result() for f in futures]  # _run_one 이 예외를 흡수 — result() 는 안 던진다.
+        results.extend(
+            (False, StatusErrorCode.ENGINE_ERROR_PERMANENT) for _ in range(submit_failures)
+        )
+        return results
+
+    def _run_one(
+        self, step: "ResolvedStep | ResolvedValveStep"
+    ) -> tuple[bool, StatusErrorCode | None]:
+        """스텝 1개 실행(태스크 본체 — 워커 스레드에서 돈다).
+
+        ⚠️ 여기서는 publisher/reporter 를 호출하지 않는다(단조 reporter 는 메인 스레드 전용).
+        ⚠️ **예외를 밖으로 던지지 않는다** — 실엔진(pyserial SerialException 등)/밸브 예외를
+          실패 결과로 흡수한다. future.result() 가 재-raise 하면 형제 in-flight future 를
+          대기하지 않은 채 _run_job 을 뚫고 나가 동시1제조(L4)·ledger settle 이 깨진다(리뷰 P1-1).
+        """
+        try:
+            if isinstance(step, ResolvedValveStep):
+                valve = self.valve
+                if valve is None:
+                    # pre-flight 가 걸렀어야 하는 경로 — 방어적 fail-closed.
+                    return (False, StatusErrorCode.CMD_VALIDATION_FAILED)
+                res = valve.dispense_volume(step.base, step.volume_ml)
+                # 밸브 실패 = permanent(시간축 재시도는 과토출 위험 — 재시도 없음·설계 §8).
+                return (res.ok, None if res.ok else StatusErrorCode.ENGINE_ERROR_PERMANENT)
+
+            cmd = EngineDispenseCommand(
+                pump_addr=step.pump_addr,
+                volume_ul=step.volume_ul,
+                steps=step.steps,
+                spec=step.spec,
+            )
+            res = self._executor.run_step(cmd)
+            return (res.is_success, res.error_code)
+        except Exception:
+            # 어댑터 예외 = permanent 실패로 흡수(형제 태스크 완주·settle 경로 보존).
+            return (False, StatusErrorCode.ENGINE_ERROR_PERMANENT)
+
+    def shutdown(self) -> None:
+        """stage 태스크 풀 정리(멱등) — daemon 우아한 종료 경로에서 호출."""
+        pool = self._pool
+        if pool is not None:
+            self._pool = None
+            pool.shutdown(wait=True)
 
     def _publish_via(
         self,

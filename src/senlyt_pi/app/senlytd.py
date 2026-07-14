@@ -125,6 +125,7 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         command_source=components.command_source,
         status_sink=components.status_sink,
         engine=components.engine,
+        valve=components.valve,
         ledger=ledger,
         resolver=build_resolver(environ),
         commandset_source=components.command_source,  # 동일 SSE 어댑터가 두 축 제공.
