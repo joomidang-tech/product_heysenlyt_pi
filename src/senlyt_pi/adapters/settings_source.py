@@ -5,6 +5,12 @@
 (정본 = 서버·단방향). 방어적 이중 clamp: 수신값도 core.pump_guard.clamp_pump_preset 로 한 번 더
 통과시킨다(서버 ↔ pi 바이트-parity 이므로 정상 입력에선 no-op — §11 O-17 이중방어와 같은 결).
 
+⚠️ **런타임 미배선(감사 P2·후속 웨이브)**: 이 모듈의 헬퍼는 아직 daemon 결선에 쓰이지 않는다.
+  실 진입점(senlytd._run)은 bootstrap.build_resolver 가 부팅 시점 `PUMP_ADDRESSES` env 로 만든
+  pump_map 을 고정 사용하고, RecipeResolver.pump_map 은 런타임 변이 경로가 없다. 즉 운영자의
+  admin 설정(syringeCapacityMl 등) 변경은 **가동 중 pi 에 반영되지 않으며 재기동이 필요**하다.
+  실배선(SSE settings 구독 → 진행 중 제조와 무경합 스왑)은 별도 웨이브(밸브 flowRate SoT 승격과 함께).
+
 기대 settings 형태(관련 부분만·나머지 키는 무시):
   {
     "pumps": [

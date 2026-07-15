@@ -22,6 +22,24 @@ from pathlib import Path
 from typing import Any
 
 
+def _fsync_dir(path: Path) -> None:
+    """부모 디렉터리 fsync — os.replace(rename) 자체의 내구성 보증(감사 P3 봉합·2026-07-15).
+
+    파일 fsync 만으로는 전원 단절 시 rename 이 비내구일 수 있다(POSIX) —
+    file_idempotency_ledger 와 동일 결. 일부 FS 는 디렉터리 fsync 미지원 → OSError 삼킴.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 @dataclass(frozen=True, slots=True)
 class DeviceIdentity:
     """등록 정체성 — deviceId(=수집 HW 시리얼·D-A) + RegisterResponse(dispenserToken·exp)."""
@@ -91,6 +109,8 @@ class DeviceIdentityStore:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self.path)
+        # rename 내구화 — 부모 디렉터리 fsync(전원 단절 시 정체성 유실 방지·감사 P3).
+        _fsync_dir(self.path.parent)
 
     def clear(self) -> None:
         """정체성 삭제(재등록 강제)."""

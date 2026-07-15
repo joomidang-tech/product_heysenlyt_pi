@@ -355,3 +355,74 @@ def test_valve_clamp_underdispense_fail_closed(ledger):
     assert report.outcome is JobOutcome.PARTIAL_FAILED
     assert report.error_code is StatusErrorCode.ENGINE_ERROR_PERMANENT
     assert valve.dispensed == []  # 개방 0 — 부분 토출 낭비 없음.
+
+
+# ── 감사 P1: OfflineQueue 멀티스레드 flush 안전(status 유실·이중 pop 방지). ──
+
+
+def test_offline_queue_concurrent_flush_no_loss():
+    """두 스레드가 동시에 flush 해도 각 항목이 정확히 1회 pop·유실 0(감사 P1)."""
+    import threading as _t
+
+    from senlyt_pi.core.wire_messages import StatusReport
+    from senlyt_pi.pipeline.offline_queue import OfflineQueue
+
+    oq = OfflineQueue()
+    n = 200
+    for i in range(n):
+        oq.enqueue(
+            StatusReport(
+                id=f"o:{i}", phase="PROGRESS", step_k=i, step_n=n,
+                error_code=None, request_id=f"r{i}", trace_id="t", updated_at="2026-07-15T00:00:00.000Z",
+            )
+        )
+
+    sent_ids: list[str] = []
+    sent_lock = _t.Lock()
+
+    def send(r: StatusReport) -> bool:
+        with sent_lock:
+            sent_ids.append(r.id)
+        return True
+
+    def worker() -> None:
+        oq.flush(send)
+
+    threads = [_t.Thread(target=worker) for _ in range(2)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    assert oq.is_empty
+    # 모든 id 가 최소 1회 전송(유실 0). 중복 전송은 requestId dedup 으로 서버가 흡수.
+    assert set(sent_ids) == {f"o:{i}" for i in range(n)}
+
+
+def test_offline_queue_enqueue_flush_interleave():
+    """flush 중 enqueue 가 끼어들어도 큐 무결성 유지(락 보호)."""
+    from senlyt_pi.core.wire_messages import StatusReport
+    from senlyt_pi.pipeline.offline_queue import OfflineQueue
+
+    oq = OfflineQueue()
+
+    def sr(i: int) -> StatusReport:
+        return StatusReport(
+            id=f"o:{i}", phase="PROGRESS", step_k=i, step_n=9,
+            error_code=None, request_id=f"r{i}", trace_id="t", updated_at="2026-07-15T00:00:00.000Z",
+        )
+
+    for i in range(3):
+        oq.enqueue(sr(i))
+
+    seen: list[str] = []
+
+    def send(r: StatusReport) -> bool:
+        seen.append(r.id)
+        if r.id == "o:0":
+            oq.enqueue(sr(99))
+        return True
+
+    oq.flush(send)
+    assert oq.is_empty
+    assert set(seen) == {"o:0", "o:1", "o:2", "o:99"}

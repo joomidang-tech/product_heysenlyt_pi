@@ -78,6 +78,29 @@ def _default_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# CLEARED — 로그 전용 마커(enum 4상태·SoT §4-6 와 별개): 해당 합성키를 인덱스에서 제거해
+# 이후 check_and_claim 이 fresh 로 재수용하게 한다(BootRecovery CLEAR_AND_FRESH 실동작·
+# 감사 P2 봉합·2026-07-15). replay 는 이 라인을 만나면 키를 제거하고, compact 는
+# CLEARED(=인덱스 부재) 키를 출력에서 자연 제외한다.
+_CLEARED_WIRE = "CLEARED"
+
+
+def _fsync_dir(path: Path) -> None:
+    """부모 디렉터리 fsync — rename(os.replace)/파일 생성의 디렉터리 엔트리 내구성 보증
+    (감사 P3 봉합·2026-07-15). 파일 fsync 만으로는 전원 단절 시 rename/생성 자체가 비내구일
+    수 있다(POSIX). 일부 FS 는 디렉터리 fsync 미지원 → OSError 는 삼킨다(best-effort)."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 class FileIdempotencyLedger:
     """파일 append+fsync 영속 Ledger (IdempotencyLedger 프로토콜 충족).
 
@@ -110,8 +133,9 @@ class FileIdempotencyLedger:
         p.parent.mkdir(parents=True, exist_ok=True)
         index: dict[str, LedgerEntryState] = {}
         trace_index: dict[str, str] = {}
+        existed = p.exists()
 
-        if p.exists():
+        if existed:
             with p.open("r", encoding="utf-8") as f:
                 for line in f:
                     trimmed = line.strip()
@@ -125,6 +149,12 @@ class FileIdempotencyLedger:
                     if not isinstance(parsed, dict):
                         continue
                     cid = parsed.get("commandId")
+                    # CLEARED 마커 — 인덱스에서 키 제거(clear() 의 replay 대칭·감사 P2).
+                    if parsed.get("state") == _CLEARED_WIRE:
+                        if isinstance(cid, str):
+                            index.pop(cid, None)
+                            trace_index.pop(cid, None)
+                        continue
                     state = LedgerEntryState.from_wire(parsed.get("state"))
                     if isinstance(cid, str) and state is not None:
                         index[cid] = state  # 마지막 승자(append 순서 = 시간 순서).
@@ -135,6 +165,9 @@ class FileIdempotencyLedger:
 
         # append 모드로 열되, replay 후 이어쓰기.
         fh = p.open("ab")
+        if not existed:
+            # 최초 파일 생성 — 부모 디렉터리 fsync 로 생성 자체를 내구화(감사 P3·2026-07-15).
+            _fsync_dir(p.parent)
         return FileIdempotencyLedger(p, fh, index, trace_index)
 
     def _append(self, rec: LedgerRecord) -> None:
@@ -176,6 +209,33 @@ class FileIdempotencyLedger:
             )
         )
 
+    def clear(self, command_id: str) -> None:
+        """합성키 클리어 — CLEARED 마커 append(fsync) 후 인메모리 인덱스에서 제거.
+
+        BootRecovery CLEAR_AND_FRESH 실동작(감사 P2 봉합·2026-07-15): RECEIVED 창
+        (claim 후·모션 전) 크래시 주문이 재부팅 후 재전달돼도 DUPLICATE drop 되지 않고
+        check_and_claim 이 FRESH 로 재수용한다. replay(재open)는 CLEARED 라인에서 키를
+        제거하고, compact 는 인덱스 부재 키를 출력에서 제외한다(영속 대칭).
+
+        **안전 근거(CR-01 비위반)**: RECEIVED 는 mark_running 전 = 물리 모션 0
+        (pump_sequencer 는 mark_running 후에만 토출). clear 는 pi 의 자동 재실행이 아니라
+        서버 **재전달분이 fresh 소비**되게 할 뿐 — 재전달은 서버 축의 설계 의도다.
+        """
+        # LedgerRecord 는 enum 4상태 전용 — CLEARED 는 로그 전용 마커라 원시 라인으로 기록
+        # (기존 _append 와 동일한 append+flush+fsync 결).
+        line = (
+            json.dumps(
+                {"commandId": command_id, "state": _CLEARED_WIRE, "ts": self.now_iso()},
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        self._fh.write(line.encode("utf-8"))
+        self._fh.flush()
+        os.fsync(self._fh.fileno())  # fsync — 원자 영속(crash-safe·_append 와 동일).
+        self._index.pop(command_id, None)
+        self._trace_index.pop(command_id, None)
+
     def is_settled(self, command_id: str) -> bool:
         s = self._index.get(command_id)
         return s is LedgerEntryState.DONE or s is LedgerEntryState.FAILED
@@ -211,6 +271,7 @@ class FileIdempotencyLedger:
         """
         tmp = self._path.with_suffix(self._path.suffix + ".tmp")
         with tmp.open("wb") as sink:
+            # CLEARED 키는 인덱스 부재 → 출력에서 자연 제외(clear 의 컴팩션 대칭·감사 P2).
             for cid, state in self._index.items():
                 rec = LedgerRecord(
                     command_id=cid,
@@ -223,4 +284,6 @@ class FileIdempotencyLedger:
             os.fsync(sink.fileno())
         self._fh.close()
         os.replace(tmp, self._path)  # atomic swap.
+        # rename 내구화 — 부모 디렉터리 fsync(전원 단절 시 swap 비내구 방지·감사 P3·2026-07-15).
+        _fsync_dir(self._path.parent)
         self._fh = self._path.open("ab")

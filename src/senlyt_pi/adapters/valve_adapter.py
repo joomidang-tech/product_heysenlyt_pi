@@ -1,7 +1,7 @@
 """기주 밸브 어댑터 — GPIO 실구동 + Fake(시뮬레이션) — §9-1 v2 · 병렬토출 설계 §8.
 
-HW 사실(2026-07-13 성연 확정·scripts/valve_2ch_test.py 참조 구현):
-  - 신 기주(sour) = 물리 핀11 = **BCM17** / 베이스(normal) = 물리 핀13 = **BCM27**.
+HW 사실(2026-07-15 성연 확정 — 7/13 구값 BCM17/27 대체·scripts/valve_2ch_test.py 참조 구현):
+  - 신 기주(sour) = **BCM9**(물리 핀21) / 베이스(normal) = **BCM11**(물리 핀23).
   - GPIO → Active-LOW 릴레이 → 솔레노이드(24V). 제어 = 열고 N초 뒤 닫기(시간축).
   - openSec = volume_ml ÷ flow_ml_per_sec (기주 20mL 고정 → 캘리브레이션되면 사실상 1값).
 
@@ -20,8 +20,9 @@ from typing import Callable, Mapping
 
 from ..ports.valve_port import VALVE_BASES, ValveDispenseResult
 
-# 기본 매핑(BCM) — 신기주(sour)=17(핀11) · 베이스(normal)=27(핀13). 설정으로 교체 가능.
-DEFAULT_VALVE_PINS: dict[str, int] = {"sour": 17, "normal": 27}
+# 기본 매핑(BCM) — 신기주(sour)=9(물리 핀21) · 베이스(normal)=11(물리 핀23). 성연 확정
+# 2026-07-15(구 17/27 대체). 배선 변경 시 SENLYT_VALVE_PINS 로 교체 가능.
+DEFAULT_VALVE_PINS: dict[str, int] = {"sour": 9, "normal": 11}
 # 기본 유량(mL/s) — 7/13 참조 스크립트 placeholder 와 동일. 벤치 캘리브레이션으로 교체.
 DEFAULT_FLOW_ML_PER_SEC = 10.0
 # 최대 개방 클램프(s) — 20mL ÷ 10mL/s = 2s 정상 기준의 넉넉한 상한(밸브 영구개방 차단).

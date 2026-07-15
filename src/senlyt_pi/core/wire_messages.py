@@ -41,7 +41,7 @@ class RecipeStep:
 
     - kind="syringe"(기본): pump_addr·volume(µL) 사용.
     - kind="valve"(식향 기주 택1): base("normal"|"sour")·volume_ml(고정 20) 사용 —
-      openSec 계산·핀 매핑(신기주 핀11/BCM17·베이스 핀13/BCM27)·클램프는 ValveAdapter(설정값).
+      openSec 계산·핀 매핑(신기주 BCM9/핀21·베이스 BCM11/핀23)·클램프는 ValveAdapter(설정값).
     - stage: 동시 실행 그룹 — 같은 stage 병렬·오름차순 배리어. **부재(None) = idx 로 해석**
       (하위호환: 전 스텝이 서로 다른 stage = 기존 완전 직렬과 동일 동작).
     """

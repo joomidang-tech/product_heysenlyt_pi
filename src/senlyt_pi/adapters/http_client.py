@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Iterator, Mapping
@@ -85,6 +86,10 @@ class SseStream:
 
     def __init__(self, response: Any) -> None:
         self._resp = response
+        # 트리클 워치독 관측점(감사 P3 봉합·2026-07-15) — 마지막 라인 수신 monotonic 시각.
+        # events() 가 **모든 라인**(주석 heartbeat 포함) 처리 시 갱신. 초기값 = 생성(연결) 시각
+        # → 연결 직후 무수신(트리클/행업)도 스테일 판정 가능. 어댑터 워치독이 이를 검사한다.
+        self.last_line_monotonic: float = time.monotonic()
 
     def events(self) -> Iterator[tuple[str, str]]:
         """SSE 프레임 순회 — `event:`/`data:` 누적, 빈 줄에서 1프레임 방출.
@@ -95,6 +100,8 @@ class SseStream:
         event = "message"
         data_lines: list[str] = []
         for raw in self._resp:
+            # 모든 라인(빈 줄·주석 heartbeat 포함)에서 관측점 갱신 — 트리클 워치독 근거.
+            self.last_line_monotonic = time.monotonic()
             line = raw.decode("utf-8", errors="replace").rstrip("\n").rstrip("\r")
             if line == "":
                 # 프레임 경계 — data 가 있으면 방출.
@@ -127,27 +134,65 @@ class SseStream:
         self.close()
 
 
+def _upgrade_read_timeout(resp: Any, timeout: float | None) -> bool:
+    """연결 성공 후 하부 소켓 read 타임아웃을 상향(connect/read 분리·감사 P3 봉합·2026-07-15).
+
+    ⚠️ `resp.fp.raw._sock` 류는 CPython(http.client → socket.makefile) **구현 세부**다 —
+    후보 경로를 순서대로 시도하고, 전부 실패하면 False 를 반환한다(예외는 전부 삼킴).
+    False 시 호출측(open_sse)이 **단일 타임아웃으로 재연결**해 구 의미론을 복원한다 —
+    "조용한 폴백 = read 타임아웃이 connect(20s)로 고정" 은 서버 heartbeat(15s) 대비 여유가
+    5s 뿐이라 느린 링크에서 불필요한 재연결 churn 을 만들었다(리뷰 P3 봉합·2026-07-15).
+    """
+    for getter in (
+        lambda r: r.fp.raw._sock,  # noqa: SLF001 — CPython http.client 표준 경로.
+        lambda r: r.fp._sock,  # noqa: SLF001 — 변형(버퍼 없는 makefile).
+        lambda r: r.raw._sock,  # noqa: SLF001 — 방어적 후보.
+    ):
+        try:
+            getter(resp).settimeout(timeout)
+            return True
+        except Exception:  # noqa: BLE001 — 다음 후보.
+            continue
+    return False
+
+
 def open_sse(
     url: str,
     *,
     headers: Mapping[str, str] | None = None,
     timeout: float | None = None,
+    connect_timeout: float | None = None,
 ) -> SseStream:
     """SSE 구독 시작 — 응답 스트림을 감싼 SseStream 반환(호출측이 close 책임).
 
     timeout=None 이면 소켓 무한 대기(스트리밍 특성). 연결 실패는 HttpTransportError.
+    connect_timeout 이 주어지면 **연결은 짧게**(urlopen timeout=connect_timeout) 시도하고,
+    연결 성공 후 read 타임아웃을 `timeout` 으로 올린다(connect/read 분리 가드 —
+    느린 핸드셰이크는 빨리 실패, 정상 스트림의 유휴 read 는 길게 허용·감사 P3).
     """
     req = urllib.request.Request(url, method="GET")
     req.add_header("Accept", "text/event-stream")
     for k, v in (headers or {}).items():
         req.add_header(k, v)
-    try:
-        resp = urllib.request.urlopen(req, timeout=timeout)
-    except urllib.error.HTTPError as e:
-        # 스트림 시작 자체가 4xx/5xx(401 unauthorized·403 forbidden_device 등) — 전송 오류로 표면화.
-        raise HttpTransportError(f"SSE 시작 거부(status={e.code})") from e
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        raise HttpTransportError(f"SSE 연결 실패: {e}") from e
+    def _open(t: float | None) -> Any:
+        try:
+            return urllib.request.urlopen(req, timeout=t)
+        except urllib.error.HTTPError as e:
+            # 스트림 시작 자체가 4xx/5xx(401 unauthorized·403 forbidden_device 등) — 전송 오류로 표면화.
+            raise HttpTransportError(f"SSE 시작 거부(status={e.code})") from e
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise HttpTransportError(f"SSE 연결 실패: {e}") from e
+
+    effective_timeout = connect_timeout if connect_timeout is not None else timeout
+    resp = _open(effective_timeout)
+    if connect_timeout is not None and not _upgrade_read_timeout(resp, timeout):
+        # 소켓 업그레이드 실패(비-CPython 등) — read=connect(20s)로 두면 heartbeat(15s) 여유가
+        # 5s 뿐이라 churn 위험(리뷰 P3). 구 단일 타임아웃 의미론으로 재연결(연결·read 둘 다 timeout).
+        try:
+            resp.close()
+        except Exception:  # noqa: BLE001
+            pass
+        resp = _open(timeout)
     return SseStream(resp)
 
 

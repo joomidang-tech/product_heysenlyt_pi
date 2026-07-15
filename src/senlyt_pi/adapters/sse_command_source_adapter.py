@@ -19,6 +19,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from typing import Any, Callable, Iterator, Mapping
 
 from ..config.server_target import ServerConfig
@@ -31,8 +33,24 @@ from .http_client import DEFAULT_TIMEOUT_SECONDS, SseStream, bearer_headers, ope
 # None 이면 무한 대기. 기본은 서버 15s heartbeat 의 여유 배수.
 DEFAULT_SSE_TIMEOUT_SECONDS = 60.0
 
-# open_sse seam — (url, headers, timeout) → SseStream. 테스트가 fake 스트림을 주입.
+# SSE 연결(핸드셰이크) 타임아웃(초) — read 타임아웃(60s)과 분리(감사 P3 봉합·2026-07-15).
+# 느린 링크의 연결 지연은 빨리 실패시키고, 정상 스트림의 유휴 read 는 길게 허용한다.
+DEFAULT_SSE_CONNECT_TIMEOUT_SECONDS = 20.0
+
+# 트리클 워치독(감사 P3·2026-07-15) — read 타임아웃은 "완전 무수신"만 잡는다. 바이트가
+# 찔끔찔끔 오는(트리클) 반죽은 연결은 read 를 계속 깨워 타임아웃이 영영 안 터진다 →
+# 마지막 **라인** 수신 후 STALE_LIMIT 초과면 스트림을 강제 close(블록 read 가 예외로 깨져
+# 소비 루프가 재연결). 검사 주기 = CHECK_INTERVAL. 서버 heartbeat 15s 의 여유 배수.
+WATCHDOG_CHECK_INTERVAL_S = 15.0
+WATCHDOG_STALE_LIMIT_S = 90.0
+
+# open_sse seam — (url, headers, timeout[, connect_timeout]) → SseStream. 테스트가 fake 주입.
 OpenStream = Callable[..., SseStream]
+
+
+def _is_stale(now: float, last: float, limit: float) -> bool:
+    """트리클 스테일 판정(순수 함수·단위테스트용) — 마지막 라인 후 limit 초 초과면 스테일."""
+    return (now - last) > limit
 
 
 def commands_from_snapshot(
@@ -74,6 +92,7 @@ class SseCommandSourceAdapter:
         timeout: float | None = DEFAULT_SSE_TIMEOUT_SECONDS,
         open_stream: OpenStream = open_sse,
         logger: StructuredLogger | None = None,
+        stop_event: "threading.Event | None" = None,
     ) -> None:
         # 서버 base 는 ServerConfig(환경별 결정) 우선 — 하드코딩 URL 금지.
         # base_url 인자는 하위호환(테스트·직접 주입)용. server_config 가 있으면 그 base 를 쓴다.
@@ -85,6 +104,13 @@ class SseCommandSourceAdapter:
         self.timeout = timeout
         self._open_stream = open_stream
         self._log = logger
+        # 종료 신호(감사 P3 봉합) — SSE 순회 중 set 되면 제너레이터를 즉시 종료해 boot 루프가
+        #   while 조건을 재검사(SIGTERM 우아한 종료 지연 방지). 미주입이면 종료 검사 없음(기존 동작).
+        self._stop = stop_event
+
+    def set_stop_event(self, stop_event: "threading.Event") -> None:
+        """종료 신호 주입(생성 후 결선) — daemon 이 자기 _stop 을 연결한다(bootstrap 시점엔 미존재)."""
+        self._stop = stop_event
 
     def _config(self) -> ServerConfig:
         return self.server_config or ServerConfig(base_url=self.base_url)
@@ -95,15 +121,52 @@ class SseCommandSourceAdapter:
         )
 
     def _open(self, device_id: str) -> SseStream:
+        # connect/read 타임아웃 분리(감사 P3) — 연결 20s·read 60s(기존). open_sse 는
+        # connect_timeout 미지원 하부(가드 실패)면 단일 타임아웃으로 폴백한다(무해).
         return self._open_stream(
             self._stream_url(device_id),
             headers=bearer_headers(self.bearer_token),
             timeout=self.timeout,
+            connect_timeout=DEFAULT_SSE_CONNECT_TIMEOUT_SECONDS,
         )
 
+    def _start_watchdog(self, stream: SseStream) -> threading.Event:
+        """트리클 워치독 기동(감사 P3 봉합·2026-07-15) — 정지 Event 반환(호출측 finally 가 set).
+
+        데몬 스레드가 WATCHDOG_CHECK_INTERVAL_S 간격으로 스트림의 마지막 라인 수신 시각을
+        검사, STALE_LIMIT 초과면 stream.close() — 블록된 read 가 예외로 깨져 소비 루프가
+        재연결한다. 스트림이 정상 닫히면(finally) Event 로 워치독도 정리. 관측점
+        (last_line_monotonic) 미보유 스트림(테스트 fake 등)이면 스레드를 띄우지 않는다.
+        """
+        stop = threading.Event()
+        if not hasattr(stream, "last_line_monotonic"):
+            return stop  # 관측점 없음 — 워치독 비활성(기존 동작·fake 스트림 무해).
+
+        def _watch() -> None:
+            while not stop.wait(WATCHDOG_CHECK_INTERVAL_S):
+                last = getattr(stream, "last_line_monotonic", None)
+                if not isinstance(last, float):
+                    return  # 관측점 소실 — 판정 불가·워치독 종료(안전측).
+                if _is_stale(time.monotonic(), last, WATCHDOG_STALE_LIMIT_S):
+                    try:
+                        stream.close()  # 블록 read 를 예외로 깨워 재연결 유도.
+                    except Exception:  # noqa: BLE001 — close 실패는 삼킴(best-effort).
+                        pass
+                    return
+
+        threading.Thread(target=_watch, name="senlyt-sse-watchdog", daemon=True).start()
+        return stop
+
     def _snapshots(self, stream: SseStream) -> Iterator[dict[str, Any]]:
-        """SseStream → snapshot data(dict) 순회 — event:snapshot 만·본문 JSON 파싱."""
+        """SseStream → snapshot data(dict) 순회 — event:snapshot 만·본문 JSON 파싱.
+
+        ⚠️ 종료 신호(감사 P3): 각 SSE 이벤트(서버 heartbeat 코멘트 포함·주기 ≤15s) 처리 전에
+          stop 을 검사해 SIGTERM 시 제너레이터를 즉시 종료 → boot 루프가 while 조건 재검사.
+          소켓 read 자체가 블록돼도 서버 주기 heartbeat 가 루프를 돌려 최대 그 주기 내 반응한다.
+        """
         for event, data in stream.events():
+            if self._stop is not None and self._stop.is_set():
+                return
             if event != "snapshot":
                 continue  # error/기타 이벤트는 이 축에서 무시(재연결은 daemon 책임).
             try:
@@ -116,34 +179,48 @@ class SseCommandSourceAdapter:
     def commands(self, device_id: str) -> Iterator[Command]:
         """자기 deviceId Command 스트림(CS-08). snapshot 도착분을 순차 방출."""
         with self._open(device_id) as stream:
-            for snapshot in self._snapshots(stream):
-                for cmd in commands_from_snapshot(snapshot, device_id):
-                    if self._log is not None:
-                        self._log.info(
-                            "SSE snapshot 에서 command 수신",
-                            stage=STAGE_PI_RECEIVED,
-                            trace_id=cmd.trace_id,
-                            order_id=cmd.order_id,
-                            device_id=device_id,
-                            command_id=cmd.id,
-                            attempt=cmd.attempt,
-                        )
-                    yield cmd
+            watchdog_stop = self._start_watchdog(stream)  # 트리클 워치독(감사 P3).
+            try:
+                yield from self._yield_commands(stream, device_id)
+            finally:
+                watchdog_stop.set()  # 정상 종료 시 워치독 정리.
+
+    def _yield_commands(self, stream: SseStream, device_id: str) -> Iterator[Command]:
+        for snapshot in self._snapshots(stream):
+            for cmd in commands_from_snapshot(snapshot, device_id):
+                if self._log is not None:
+                    self._log.info(
+                        "SSE snapshot 에서 command 수신",
+                        stage=STAGE_PI_RECEIVED,
+                        trace_id=cmd.trace_id,
+                        order_id=cmd.order_id,
+                        device_id=device_id,
+                        command_id=cmd.id,
+                        attempt=cmd.attempt,
+                    )
+                yield cmd
 
     def command_sets(self, device_id: str) -> Iterator[CommandSet]:
         """자기 deviceId CommandSet 봉투 스트림(queued|delivered·CS-08). snapshot 순차 방출."""
         with self._open(device_id) as stream:
-            for snapshot in self._snapshots(stream):
-                for cs in command_sets_from_snapshot(snapshot, device_id):
-                    if self._log is not None:
-                        self._log.info(
-                            "SSE snapshot 에서 CommandSet 봉투 수신",
-                            stage=STAGE_PI_RECEIVED,
-                            trace_id=cs.trace_id,
-                            order_id=cs.source_order_id,
-                            device_id=device_id,
-                            command_set_id=cs.command_set_id,
-                            kind=cs.kind,
-                            status=cs.status.wire,
-                        )
-                    yield cs
+            watchdog_stop = self._start_watchdog(stream)  # 트리클 워치독(감사 P3).
+            try:
+                yield from self._yield_command_sets(stream, device_id)
+            finally:
+                watchdog_stop.set()  # 정상 종료 시 워치독 정리.
+
+    def _yield_command_sets(self, stream: SseStream, device_id: str) -> Iterator[CommandSet]:
+        for snapshot in self._snapshots(stream):
+            for cs in command_sets_from_snapshot(snapshot, device_id):
+                if self._log is not None:
+                    self._log.info(
+                        "SSE snapshot 에서 CommandSet 봉투 수신",
+                        stage=STAGE_PI_RECEIVED,
+                        trace_id=cs.trace_id,
+                        order_id=cs.source_order_id,
+                        device_id=device_id,
+                        command_set_id=cs.command_set_id,
+                        kind=cs.kind,
+                        status=cs.status.wire,
+                    )
+                yield cs

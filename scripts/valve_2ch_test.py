@@ -3,8 +3,9 @@
 
 성연님 1밸브 스크립트를 2밸브로 확장. 나중에 pi 데몬 ValveAdapter로 이식할 참조 구현.
 
-  신 기주(sour)   = 물리 핀11 = BCM17   (산 값 >= threshold 일 때)
-  베이스 기주(normal) = 물리 핀13 = BCM27  (산 값 <  threshold 일 때)
+  신 기주(sour)   = BCM9  (물리 핀21)   (산 값 >= threshold 일 때)
+  베이스 기주(normal) = BCM11 (물리 핀23)  (산 값 <  threshold 일 때)
+  ※ 2026-07-15 성연 확정 — 구값 BCM17/27(핀11/13)에서 변경.
 
 안전 규칙:
   - 상호배타: 한 잔에 한 밸브만 연다 (기주 택1). open 시 다른 밸브는 강제로 닫는다.
@@ -23,8 +24,8 @@ ACTIVE_LOW = True  # 릴레이가 반대로 동작하면 False 로 변경
 
 # base 논리값 → BCM 핀. 배선이 바뀌면 여기만 고친다(코드 하드코딩 금지 원칙).
 VALVE_PINS = {
-    "sour": 17,  # 신 기주 · 물리 핀11
-    "normal": 27,  # 베이스 기주 · 물리 핀13
+    "sour": 9,  # 신 기주 · BCM9(물리 핀21)
+    "normal": 11,  # 베이스 기주 · BCM11(물리 핀23)
 }
 
 # 밸브별 유량(ml/s) — 20mL ↔ 초 캘리브레이션. 실측 후 채운다(잠정 placeholder).
@@ -51,7 +52,7 @@ def open_valve(base):
         raise ValueError(f"알 수 없는 기주: {base!r} (sour|normal 만)")
     _close_all()  # 택1 보장: 다른 밸브 먼저 닫고
     valves[base].on()
-    print(f"  → {base} 밸브 열림 (딸깍) · 핀{11 if base == 'sour' else 13}")
+    print(f"  → {base} 밸브 열림 (딸깍) · BCM{VALVE_PINS[base]}")
 
 
 def close_valve(base):
@@ -86,7 +87,7 @@ def cleanup():
 if __name__ == "__main__":
     try:
         print("=== 2밸브 릴레이 테스트 (24V 미연결 상태) ===")
-        print("딸깍 소리와 IN LED를 확인하세요. sour=핀11(BCM17), normal=핀13(BCM27)\n")
+        print("딸깍 소리와 IN LED를 확인하세요. sour=BCM9(핀21), normal=BCM11(핀23)\n")
 
         for base in ("normal", "sour"):
             print(f"[{base} 기주 3회]")
