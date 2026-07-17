@@ -84,6 +84,12 @@ SENLYT_RUN=1
 LOG_DIR=$LOG_DIR
 SENLYT_LEDGER_PATH=$STATE_DIR/queue/idempotency-ledger.log
 SENLYT_IDENTITY_PATH=$STATE_DIR/device-identity.json
+# 펌프 RS485 주소 → RecipeResolver pump_map(부트스트랩). 없으면 pump_map 이 비어
+# 모든 레시피 스텝이 CMD_VALIDATION_FAILED 로 drop(토출 0)되어 주문이 실패한다.
+#   flavor(식향)=addr 1,2(시린지 2펌프) · fragrance(향장향)=addr 1,2,3(3펌프).
+#   ⚠️ addr 0 은 RS485 브로드캐스트라 기기주소로 쓰지 않는다. 용량은 양 모드 공통 0.5mL.
+#   서버 settings(GET-SSE) 수신 시 이 부트스트랩 매핑을 대체할 수 있다.
+PUMP_ADDRESSES=flavor:1,2;fragrance:1,2,3;aroma:1,2,3
 EOF
 
 # ── 5. systemd 유닛 — 부팅 자동시작 + 무인 복구(Restart=always) ────────────

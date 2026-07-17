@@ -5,7 +5,7 @@ pi daemon 식향 경로의 무결성을 단위·통합으로 고정한다(Docker
   1) 식향 정본 조립 = 시린지(stage0 병렬) → 기주 밸브(stage1) 배리어 순서·완주
   2) 중복 재전달 재토출 0(IL-02) · attempt 증가 fresh
   3) 크래시 재기동 좀비 회수(CR-01) — RUNNING=INTERRUPTED·재보고 없음, RECEIVED=clear→fresh
-  4) 펌프가드 식향 용량 경계(F9) — 0.5mL 실장에서 상한 초과 drop / 1.25 폴백이면 통과(발산 고정)
+  4) 펌프가드 식향 용량 경계(F9) — 0.5mL 실장에서 상한 초과 drop / 1.25 오설정이면 통과(발산 고정)
 
 dispense_count = P0 게이트의 진실(물리 토출 시도 횟수).
 """
@@ -21,9 +21,10 @@ from senlyt_pi.pipeline.boot_recovery import BootRecovery, RecoveryAction
 from senlyt_pi.pipeline.pump_sequencer import JobOutcome, PumpSequencer
 from senlyt_pi.pipeline.recipe_resolver import RecipeResolver
 
-# 식향 시린지 스펙 — 현재 실장 0.5mL(F9: 코드 모드-폴백은 1.25mL). 둘 다 명시적으로 쓴다.
+# 식향 시린지 스펙 — 실장·코드 기본값 모두 0.5mL(2026-07-17 확정). 1.25 는 이제 폴백이 아니라
+# **오설정**(admin 에서 잘못 고른 값)을 재현하기 위한 스펙이다. 둘 다 명시적으로 쓴다.
 FLAVOR_05 = SyringeSpec(pump_full_stroke=12000, syringe_capacity_ml=0.5)  # maxVol 500µL
-FLAVOR_125 = SyringeSpec(pump_full_stroke=12000, syringe_capacity_ml=1.25)  # maxVol 1250µL
+FLAVOR_125 = SyringeSpec(pump_full_stroke=12000, syringe_capacity_ml=1.25)  # maxVol 1250µL(오설정)
 
 
 def _ledger(tmp_path: Path, name: str = "l.log") -> FileIdempotencyLedger:
@@ -150,7 +151,7 @@ def test_crash_received_zombie_clears_to_fresh(tmp_path):
     led2.close()
 
 
-# ── 4) 펌프가드 식향 용량 경계(F9) — 0.5mL 실장 vs 1.25 폴백 발산 고정 ────────────
+# ── 4) 펌프가드 식향 용량 경계(F9) — 0.5mL 실장 vs 1.25 오설정 발산 고정 ────────────
 
 def test_flavor_over_capacity_dropped_on_05ml(tmp_path):
     """0.5mL 실장(maxVol 500µL): 상한 초과 부피는 CMD_VALIDATION_FAILED drop(토출 0·과흡입 차단)."""
@@ -176,8 +177,12 @@ def test_flavor_at_capacity_boundary_passes_on_05ml(tmp_path):
 
 
 def test_f9_capacity_divergence_is_locked(tmp_path):
-    """F9 발산 고정: 501µL 는 0.5mL 스펙이면 drop, 1.25 폴백 스펙이면 통과 — 용량 오설정이
-    과흡입(Code 11 계열)을 통과시킨다는 위험을 회귀로 고정한다(설정에 0.5 명시가 유일 방어)."""
+    """F9 발산 고정: 501µL 는 0.5mL 스펙이면 drop, 1.25 스펙이면 통과 — 용량 **오설정**이
+    과흡입(Code 11 계열)을 통과시킨다는 위험을 회귀로 고정한다.
+
+    2026-07-17 확정으로 코드 기본값이 0.5 가 되어 '무설정'은 이제 안전측으로 떨어진다
+    (구 동작: flavor 폴백 1.25 = 위험측). 남은 노출면은 admin 이 1.25 를 **명시**한 경우뿐.
+    """
     # 0.5mL → drop
     led_a = _ledger(tmp_path, "a.log")
     eng_a = FakeEnginePort()
@@ -185,7 +190,7 @@ def test_f9_capacity_divergence_is_locked(tmp_path):
         command_id="o:1", trace_id="t", steps=[_syr(0, 0, 0, vol=501.0)])
     assert eng_a.dispense_count == 0
     led_a.close()
-    # 1.25mL 폴백 → 통과(발산!)
+    # 1.25mL 오설정 → 통과(발산!)
     led_b = _ledger(tmp_path, "b.log")
     eng_b = FakeEnginePort()
     _seq(led_b, eng_b, pump_map={0: FLAVOR_125}).submit(

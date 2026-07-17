@@ -252,7 +252,7 @@ def pump_map_from_addresses_env(raw: str | None) -> dict[int, SyringeSpec]:
     """`PUMP_ADDRESSES`("aroma:1,2,3;flavor:4") → pumpAddr→SyringeSpec 매핑(RR pump_map).
 
     settings-stream(O-18) 미배선 구간의 부트스트랩 pump_map — 모드 기본 용량 + sy01b 스트로크.
-      - flavor  → 1.25mL(모드 기본), 그 외(aroma/fragrance) → 0.5mL(모드 기본).
+      - 모든 모드(flavor/aroma/fragrance) → 0.5mL(양 모드 공통 기본·2026-07-17 확정).
       - 스트로크 = sy01b 프리셋(12000). 서버 settings 수신 시 이 매핑을 대체할 수 있다.
     누락/비정수 addr 는 건너뛴다(미매핑 addr 는 RR 게이트가 drop — silent 매핑 금지).
     """

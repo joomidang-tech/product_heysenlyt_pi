@@ -18,9 +18,11 @@ from senlyt_pi.pipeline.recipe_resolver import (
     flavor_recipe_source_to_steps,
 )
 
-# flavor 1.25mL(fullStroke 12000) → maxVolumeUl=1250, stepsPerMl=9600.
+# addr 별 스펙 분기를 보려고 **일부러 다른 용량**을 쓴다(기본값 검증이 아님 —
+# 기본 용량은 양 모드 공통 0.5mL·2026-07-17 확정. 아래 1.25 는 명시 선택값).
+# 1.25mL(fullStroke 12000) → maxVolumeUl=1250, stepsPerMl=9600.
 FLAVOR_SPEC = SyringeSpec(pump_full_stroke=12000, syringe_capacity_ml=1.25)
-# fragrance 0.5mL → maxVolumeUl=500, stepsPerMl=24000.
+# 0.5mL → maxVolumeUl=500, stepsPerMl=24000.
 FRAG_SPEC = SyringeSpec(pump_full_stroke=12000, syringe_capacity_ml=0.5)
 
 RESOLVER = RecipeResolver({1: FLAVOR_SPEC, 2: FLAVOR_SPEC, 5: FRAG_SPEC})

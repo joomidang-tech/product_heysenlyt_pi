@@ -207,7 +207,10 @@ class Heartbeat:
 
     device_id: str
     queue_depth: int  # int·유휴=0
-    engine: str | None = None  # "sy01b" | None
+    # "sy01b"(실 RS485) | "fake"(자동감지 폴백·비-Pi·어댑터 미장착) | 미지 어댑터 클래스명 | None.
+    #   ⚠️ 데몬은 fake 도 **항상** 실어 보낸다(daemon.engine_wire_name) — 키 부재 = 보고 누락이지
+    #   "엔진 없음"이 아니다. admin 이 online 인데 "엔진 —"으로 뜨던 원인(2026-07-17 봉합).
+    engine: str | None = None
     last_error: StatusErrorCode | None = None  # 7종 | None
     # (선택·세척 계약 기존 설계 유지) — HeartbeatRequest.needsCleaning (2026-07-09 레지스트리 연동 확장).
     needs_cleaning: bool | None = None

@@ -162,9 +162,11 @@ def clamp_pump_preset(cfg: Mapping[str, Any] | None) -> PumpPreset:
 def resolve_syringe_capacity_ml(raw: Any, *, is_flavor: bool) -> float:
     """syringeCapacityMl 이산값 검증 — SoT §6-1 / O-15 (TS coerceSyringeCapacityMl 등가).
 
-    유효집합(9종) 밖이면 **모드 기본값 폴백**(스냅 아님). flavor 1.25 / fragrance 0.5.
+    유효집합(9종) 밖이면 **모드 기본값 폴백**(스냅 아님). 기본 용량 = 양 모드 공통 0.5mL
+    (2026-07-17 확정: flavor 2펌프·fragrance 3펌프 모두 시린지 0.5mL). is_flavor 는
+    시그니처 호환을 위해 유지하되 현재 폴백값은 동일하다.
     """
-    fallback = 1.25 if is_flavor else 0.5
+    fallback = 0.5
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return fallback
     d = float(raw)
@@ -179,8 +181,9 @@ class SyringeSpec:
       stepsPerMl    = pumpFullStroke ÷ syringeCapacityMl
       maxVolumeUl   = syringeCapacityMl × 1000   (per-pump 안전 게이트 상한)
 
-    검산(§6-4): 12000 × 100 ÷ 1250 = 960 steps / 식향 1.25mL stepsPerMl=9600 /
-               향장향 0.5mL stepsPerMl=24000.
+    검산(§6-4): 12000 × 100 ÷ 500 = 2400 steps / 시린지 0.5mL stepsPerMl=24000, maxVol 500µL
+               (양 모드 공통 0.5mL — 2026-07-17 확정: 식향 2펌프·향장향 3펌프). 참고: 1.25mL
+               선택 시 12000 × 100 ÷ 1250 = 960 steps / stepsPerMl=9600.
     """
 
     pump_full_stroke: int
@@ -201,6 +204,39 @@ class SyringeSpec:
         return _round_half_up(
             self.pump_full_stroke * volume_ul / (self.syringe_capacity_ml * 1000)
         )
+
+    # ── 초기화 파라미터 (용량 파생) — v1.1.0 `syringe_spec.dart` 포팅 ──────────────
+    #
+    # ⚠️ **모드가 아니라 용량이 결정한다.** v1.1.0 실기기 리포트에서 드러난 사고 경로가
+    #    "설정 용량을 무시하고 모드 기본으로 초기화힘을 유도 → Z1R(Half)이어야 할 500µL
+    #    시린지에 ZR(Full)이 나가는 매뉴얼 위반"이었다. 그래서 파생을 이 한 곳에 응집한다.
+    #    v1.2.0 은 양 모드 공통 0.5mL 이므로 **둘 다 Z1R**(구 식향 1.25mL = ZR 이었다).
+
+    @property
+    def stall_current(self) -> int:
+        """스톨 전류 단계 n (`U<code>,<n>R`) — 용량 파생 (Manual V1.2 §1.2 Table).
+
+        ≤25µL → 4 · 50µL~1.25mL → 5 · 2.5~5mL → 6.
+        """
+        ul = self.max_volume_ul
+        if ul <= 25:
+            return 4
+        if ul <= 1250:
+            return 5
+        return 6
+
+    @property
+    def init_command(self) -> str:
+        """초기화 실행 명령 — 용량 파생 (Manual V1.2 §4.4.1). `Z<n1>R`: n1=0 Full·1 Half·2 Third.
+
+        ≥1.0mL → `ZR`(Full) · 250·500µL → `Z1R`(Half) · 50·100µL → `Z2R`(Third).
+        시린지 씰 보호가 목적이라 **작은 시린지에 Full 을 걸면 안 된다**.
+        """
+        if self.syringe_capacity_ml >= 1.0:
+            return "ZR"
+        if self.max_volume_ul >= 250:
+            return "Z1R"
+        return "Z2R"
 
 
 def fragrance_ml_to_ul(amount_ml: float) -> float:

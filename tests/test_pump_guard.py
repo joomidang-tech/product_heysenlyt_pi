@@ -115,14 +115,14 @@ class TestSyringeSpec:
         spec = SyringeSpec(pump_full_stroke=12000, syringe_capacity_ml=1.25)
         assert spec.steps_for_volume_ul(100) == 960
 
-    def test_flavor_steps_per_ml_9600(self):
-        """식향 1.25mL stepsPerMl = 9600."""
+    def test_steps_per_ml_9600_at_1_25ml(self):
+        """1.25mL 명시 선택 시 stepsPerMl = 9600 (모드 기본값 아님 — 2026-07-17 확정)."""
         spec = SyringeSpec(pump_full_stroke=12000, syringe_capacity_ml=1.25)
         assert spec.steps_per_ml == 9600
         assert spec.max_volume_ul == 1250
 
-    def test_fragrance_steps_per_ml_24000(self):
-        """향장향 0.5mL stepsPerMl = 24000 (Code 11 방지 검산값)."""
+    def test_default_steps_per_ml_24000_at_05ml(self):
+        """양 모드 공통 기본 0.5mL stepsPerMl = 24000 (Code 11 방지 검산값)."""
         spec = SyringeSpec(pump_full_stroke=12000, syringe_capacity_ml=0.5)
         assert spec.steps_per_ml == 24000
         assert spec.max_volume_ul == 500
@@ -134,6 +134,59 @@ class TestSyringeSpec:
         # 6.510416...µL → steps 이론상 62.5 → half-up 63.
         v = 62.5 * 1250 / 12000
         assert spec.steps_for_volume_ul(v) == 63
+
+
+class TestSyringeInitDerivation:
+    """초기화 파라미터 파생 — Manual V1.2 §1.2(스톨전류)·§4.4.1(초기화힘).
+
+    v1.1.0 `syringe_spec.dart` 와 **같은 표**여야 한다(자매 파리티). 이 표가 틀리면 물리
+    피해가 난다 — 작은 시린지에 Full force 를 걸면 씰이 상한다(v1.1.0 실기기 리포트 사고 경로).
+    """
+
+    def spec(self, capacity_ml: float) -> SyringeSpec:
+        return SyringeSpec(pump_full_stroke=12000, syringe_capacity_ml=capacity_ml)
+
+    def test_init_force_half_at_05ml_v120_default(self):
+        """★ v1.2.0 기본 0.5mL → Z1R(Half). 양 모드 공통이므로 **식향도 Z1R** 이다.
+
+        구 v1.1.0 식향은 1.25mL 라 ZR(Full) 이었다 — 용량이 0.5 로 바뀌었는데 ZR 를 그대로
+        들고 오면 500µL 시린지에 Full force 가 걸린다(매뉴얼 위반). 이 테스트가 그 회귀를 막는다.
+        """
+        assert self.spec(0.5).init_command == "Z1R"
+        assert self.spec(0.5).stall_current == 5
+
+    def test_init_force_full_at_and_above_1ml(self):
+        """≥1.0mL → ZR(Full). 경계 1.0 포함."""
+        assert self.spec(1.0).init_command == "ZR"
+        assert self.spec(1.25).init_command == "ZR"
+        assert self.spec(2.5).init_command == "ZR"
+        assert self.spec(5.0).init_command == "ZR"
+
+    def test_init_force_half_at_250ul_boundary(self):
+        """250·500µL → Z1R(Half). 250 은 Half 하한 경계(포함)."""
+        assert self.spec(0.25).init_command == "Z1R"
+        assert self.spec(0.5).init_command == "Z1R"
+
+    def test_init_force_third_below_250ul(self):
+        """50·100µL → Z2R(Third). 25µL 이하도 Third."""
+        assert self.spec(0.05).init_command == "Z2R"
+        assert self.spec(0.1).init_command == "Z2R"
+        assert self.spec(0.025).init_command == "Z2R"
+
+    def test_stall_current_table(self):
+        """≤25µL → 4 · 50µL~1.25mL → 5 · 2.5~5mL → 6 (§1.2 Table). 경계 포함 확인."""
+        assert self.spec(0.025).stall_current == 4  # 25µL — 4 상한 경계
+        assert self.spec(0.05).stall_current == 5  # 50µL — 5 하한 경계
+        assert self.spec(1.25).stall_current == 5  # 1250µL — 5 상한 경계
+        assert self.spec(2.5).stall_current == 6  # 2500µL — 6 하한 경계
+        assert self.spec(5.0).stall_current == 6
+
+    def test_derivation_is_capacity_not_mode(self):
+        """파생 축은 **용량 하나** — 같은 용량이면 어느 모드에서 왔든 같은 명령이 나온다."""
+        flavor_spec = self.spec(resolve_syringe_capacity_ml(None, is_flavor=True))
+        fragrance_spec = self.spec(resolve_syringe_capacity_ml(None, is_flavor=False))
+        assert flavor_spec.syringe_capacity_ml == fragrance_spec.syringe_capacity_ml == 0.5
+        assert flavor_spec.init_command == fragrance_spec.init_command == "Z1R"
 
 
 class TestFragranceNormalization:
@@ -149,12 +202,24 @@ class TestResolveSyringeCapacityMl:
     """resolveSyringeCapacityMl — 이산값 폴백(§6-1/O-15)."""
 
     def test_fallback_outside_valid_set(self):
-        """유효집합 밖 → 모드 기본."""
+        """유효집합 밖 → 기본값(양 모드 공통 0.5mL)."""
+        # 유효집합 안 값은 그대로 통과(스냅 아님).
         assert resolve_syringe_capacity_ml(1.25, is_flavor=True) == 1.25
         assert resolve_syringe_capacity_ml(0.5, is_flavor=False) == 0.5
-        assert resolve_syringe_capacity_ml(0.99, is_flavor=True) == 1.25  # 폴백
-        assert resolve_syringe_capacity_ml(0.99, is_flavor=False) == 0.5  # 폴백
-        assert resolve_syringe_capacity_ml(None, is_flavor=True) == 1.25
+        # 유효집합 밖 → 폴백.
+        assert resolve_syringe_capacity_ml(0.99, is_flavor=True) == 0.5
+        assert resolve_syringe_capacity_ml(0.99, is_flavor=False) == 0.5
+        assert resolve_syringe_capacity_ml(None, is_flavor=True) == 0.5
+
+    def test_default_capacity_is_05ml_for_both_modes(self):
+        """기본 용량 = 양 모드 공통 0.5mL — 2026-07-17 확정(식향 2펌프·향장향 3펌프).
+
+        회귀 고정: 식향 기본이 1.25mL 로 되돌아가면 maxVolumeUl 이 1250 으로 벌어져
+        과흡입(Code 11 계열)이 게이트를 통과한다(F9 발산).
+        """
+        for bad in (None, 0.99, 3.3, -1, "x", True):
+            assert resolve_syringe_capacity_ml(bad, is_flavor=True) == 0.5
+            assert resolve_syringe_capacity_ml(bad, is_flavor=False) == 0.5
 
     def test_v110_allowlist_9_values(self):
         """v1.1.0 확정 9종 allowlist — 서버 pumpGuard.ts VALID_SYRINGE_ML 정본 (Dart 구값 4종은 버그)."""

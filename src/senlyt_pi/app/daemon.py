@@ -63,6 +63,25 @@ def _now_iso_ms() -> str:
     return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 
 
+# 엔진 어댑터 클래스 → heartbeat `engine` 표기(§9-3).
+#   ⚠️ **fake 도 반드시 보고한다**(2026-07-17 봉합) — 종전엔 Sy01bEngineAdapter 외 전부 None 이라
+#   `includeIfNull:false` 로 키 자체가 빠졌고, admin 기기 카드가 online 인데 "엔진 —"으로 떴다.
+#   실 Pi 라도 USB-RS485 어댑터 미장착이면 자동감지(bootstrap.build_engine)가 fake 로 떨어지는데,
+#   그게 **정상적인 fake 구동**인지 **보고 누락**인지 운영자가 화면에서 구분할 수 없었다.
+_ENGINE_WIRE_NAMES: dict[str, str] = {
+    "Sy01bEngineAdapter": "sy01b",
+    "FakeEnginePort": "fake",
+}
+
+
+def engine_wire_name(engine: EnginePort) -> str:
+    """엔진 어댑터 → heartbeat engine 표기. 미지 어댑터(테스트 더블 등)는 클래스명 그대로.
+
+    관측 필드라 **침묵(None)보다 이름**이 낫다 — 모르는 어댑터도 무엇이 붙었는지 보이게 한다.
+    """
+    return _ENGINE_WIRE_NAMES.get(type(engine).__name__, type(engine).__name__)
+
+
 def _order_id_of(command_id: str) -> str:
     """합성키 `{orderId}:{attempt}` → orderId. 콜론 없으면(maintenance mnt-uuid) 그대로."""
     return command_id.rsplit(":", 1)[0]
@@ -554,13 +573,8 @@ class SenlytDaemon:
         self._flush_offline_queue()
 
     def _build_heartbeat(self) -> Heartbeat:
-        engine_name = (
-            "sy01b"
-            if type(self.deps.engine).__name__ == "Sy01bEngineAdapter"
-            else None
-        )
         return self._dispatcher.build_heartbeat(
-            engine=engine_name, last_error=self._last_error
+            engine=engine_wire_name(self.deps.engine), last_error=self._last_error
         )
 
     def _flush_traces(self) -> None:

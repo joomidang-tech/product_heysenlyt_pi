@@ -13,7 +13,13 @@ from senlyt_pi.adapters.fake_engine_adapter import FakeEnginePort
 from senlyt_pi.adapters.serial_port_discovery import SerialPortInfo
 from senlyt_pi.adapters.sy01b_engine_adapter import Sy01bEngineAdapter
 from senlyt_pi.adapters.valve_adapter import FakeValveAdapter
-from senlyt_pi.app.bootstrap import BootstrapError, build_components, build_engine, build_valve
+from senlyt_pi.app.bootstrap import (
+    BootstrapError,
+    build_components,
+    build_engine,
+    build_valve,
+    pump_map_from_addresses_env,
+)
 from senlyt_pi.config.server_target import SENLYT_ENV_KEY, ServerTargetError
 from support_http import FakeHttpServer
 
@@ -131,3 +137,42 @@ def test_register_path_over_socket(tmp_path) -> None:
         assert reg.json()["deviceId"] == "hw-e2e"
         # 정체성 파일 영속.
         assert store.load().device_id == "hw-e2e"
+
+
+# ── PUMP_ADDRESSES 부트스트랩 pump_map (install.sh 각인값과 계약) ──────────────
+#
+# install.sh 가 device.env 에 각인하는 값이 이 파서로 들어온다. 비면 pump_map 이 비어
+# 모든 레시피 스텝이 CMD_VALIDATION_FAILED 로 drop(토출 0) → 주문 실패. 그 계약을 고정한다.
+
+_INSTALL_SH_PUMP_ADDRESSES = "flavor:1,2;fragrance:1,2,3;aroma:1,2,3"
+
+
+def test_pump_map_from_install_sh_value() -> None:
+    """install.sh 각인값 그대로 → 유효 addr 전부 매핑(빈 pump_map = 토출 0 회귀 방지).
+
+    식향 2펌프(addr 1,2)·향장향 3펌프(addr 1,2,3) — 2026-07-17 확정.
+    """
+    m = pump_map_from_addresses_env(_INSTALL_SH_PUMP_ADDRESSES)
+    assert set(m.keys()) == {1, 2, 3}, "서버가 쓰는 pumpAddr ⊆ pi pump_map 이어야 drop 없음"
+    for addr, spec in m.items():
+        assert spec.pump_full_stroke == 12000, "sy01b 프리셋 스트로크"
+        assert spec.syringe_capacity_ml == 0.5, "양 모드 공통 기본 용량(2026-07-17 확정)"
+        assert spec.max_volume_ul == 500
+
+
+def test_pump_map_never_maps_broadcast_addr_0() -> None:
+    """⚠️ addr 0 = RS485 브로드캐스트 — install.sh 각인값이 0 을 기기주소로 쓰지 않는다."""
+    assert 0 not in pump_map_from_addresses_env(_INSTALL_SH_PUMP_ADDRESSES)
+
+
+def test_pump_map_flavor_default_capacity_is_05ml() -> None:
+    """식향 기본 용량 회귀 고정 — 1.25mL 로 되돌아가면 과흡입이 게이트를 통과한다(F9)."""
+    m = pump_map_from_addresses_env("flavor:1,2")
+    assert set(m.keys()) == {1, 2}
+    assert all(s.syringe_capacity_ml == 0.5 for s in m.values())
+
+
+def test_pump_map_empty_env_is_empty_map() -> None:
+    """미설정 → 빈 매핑(= 전 스텝 drop). install.sh 가 이 값을 반드시 각인해야 하는 이유."""
+    assert pump_map_from_addresses_env(None) == {}
+    assert pump_map_from_addresses_env("") == {}

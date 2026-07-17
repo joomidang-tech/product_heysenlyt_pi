@@ -15,7 +15,7 @@
   {
     "pumps": [
       {"pumpAddr": 1, "mode": "flavor",            # "flavor" | "fragrance"
-       "syringeCapacityMl": 1.25,                   # 9종 allowlist 밖 → 모드 기본값 폴백
+       "syringeCapacityMl": 0.5,                    # 9종 allowlist 밖 → 기본 0.5mL 폴백(양 모드 공통)
        "pumpPresetId": "sy01b", ...프리셋 필드},     # clamp_pump_preset 입력 그대로
       ...
     ]
@@ -33,7 +33,7 @@ def syringe_spec_from_pump_settings(pump: Mapping[str, Any]) -> SyringeSpec:
     """펌프 1개 settings → SyringeSpec (read-only 파생·방어적 재clamp)."""
     preset = clamp_pump_preset(pump)
     mode = pump.get("mode")
-    is_flavor = mode != "fragrance"  # 미지정/오타는 flavor 기본(폴백 1.25mL — O-15 모드 기본값)
+    is_flavor = mode != "fragrance"  # 미지정/오타는 flavor 취급(폴백 용량은 양 모드 공통 0.5mL — O-15)
     capacity = resolve_syringe_capacity_ml(pump.get("syringeCapacityMl"), is_flavor=is_flavor)
     return SyringeSpec(pump_full_stroke=preset.pump_full_stroke, syringe_capacity_ml=capacity)
 
