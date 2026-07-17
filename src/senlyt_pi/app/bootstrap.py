@@ -97,12 +97,16 @@ def _resolve_mode(environ: Mapping[str, str]) -> str:
 
 
 def _gpio_available() -> bool:
-    """실 라즈베리파이 GPIO 존재 여부 — `/dev/gpiomem` 존재로 판정(비-Pi=부재).
+    """실 라즈베리파이 GPIO 존재 여부 — **Pi4(`/dev/gpiomem`)·Pi5(`/dev/gpiomem0`·RP1) 모두 커버**.
 
-    **자동감지 게이트** — 비-Pi(CI·dev·docker 컨테이너)는 이 값이 False 라 engine/valve 가 항상
-    fake 로 떨어진다(결정적). 실 Pi 에서만 실 하드웨어 자동 선택이 활성화된다.
+    **자동감지 게이트** — 비-Pi(CI·dev·docker 컨테이너)는 gpiomem 계열이 없어 False → engine/valve 가
+    항상 fake 로 떨어진다(결정적). 실 Pi 에서만 실 하드웨어 자동 선택이 활성화된다.
+    ⚠️ Pi5 는 RP1 칩이라 `/dev/gpiomem` 이 아니라 `/dev/gpiomem0`(뱅크별 gpiomem0..4) — glob 로 둘 다 잡는다
+    (`/dev/gpiomem` 단일 경로만 보면 Pi5 에서 gpio 자동감지가 fake 로 오판·2026-07-17 실기기 발견).
     """
-    return Path("/dev/gpiomem").exists()
+    from glob import glob
+
+    return bool(glob("/dev/gpiomem*"))
 
 
 def build_engine(

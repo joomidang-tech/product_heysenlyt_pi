@@ -40,9 +40,16 @@ fi
 echo "▶ hey senlyt pi 설치 — server=$SERVER_URL  (branch=$BRANCH)"
 
 # ── 1. 시스템 의존성 (Raspberry Pi OS Bookworm 기준 · Python 3.11+) ─────────
+#   하드웨어 라이브러리는 **apt 프리빌트**로 설치한다(pip 소스컴파일 = swig/컴파일러 필요 → 실패).
+#   lgpio = Pi4·Pi5 **공통 현대 표준**(Pi5 는 RP1 칩이라 옛 RPi.GPIO 불가 — lgpio 라야 GPIO 동작).
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq git python3 python3-venv python3-pip
+# 하드웨어 라이브러리(밸브 gpiozero+lgpio · 펌프 시리얼 pyserial) — 프리빌트 deb, 컴파일 없음.
+#   없는 패키지는 건너뛴다(구 OS 폴백 — 각각 개별 설치라 하나 없어도 나머지는 깔림).
+for pkg in python3-gpiozero python3-lgpio python3-serial; do
+	apt-get install -y -qq "$pkg" 2>/dev/null && echo "  ✓ $pkg" || echo "  (skip $pkg — 이 OS엔 미제공)"
+done
 
 # ── 2. 코드 다운로드(clone) 또는 갱신(pull) — 멱등 ─────────────────────────
 mkdir -p "$(dirname "$APP_DIR")"
@@ -56,14 +63,15 @@ else
 	git clone -q --depth 1 --branch "$BRANCH" "$REPO" "$APP_DIR"
 fi
 
-# ── 3. venv + 설치 (+ 실기기 하드웨어 라이브러리) ──────────────────────────
-#   런타임 의존성 0(stdlib) — 데몬 자체는 venv만으로 동작. gpiozero/pyserial 은 실 밸브·
-#   펌프 자동감지에만 필요(없으면 자동으로 fake 로 안전 폴백 — 등록·모니터링엔 무영향).
-python3 -m venv "$APP_DIR/.venv"
-"$APP_DIR/.venv/bin/pip" install -q --upgrade pip
+# ── 3. venv(--system-site-packages) + 데몬 설치 ────────────────────────────
+#   데몬은 런타임 의존성 0(stdlib) — pip 은 데몬 패키지 등록만. --system-site-packages 로 위에서 apt
+#   설치한 하드웨어 라이브러리(gpiozero/lgpio/serial)를 venv 가 그대로 본다(pip 컴파일 없음).
+#   재실행 시 실행 중 데몬이 옛 venv 를 물고 있으면 재생성이 위험 → 먼저 멈추고, --system-site-packages
+#   flag 반영을 위해 venv 를 새로 만든다(마지막에 restart 로 새 코드 기동).
+systemctl stop senlytd 2>/dev/null || true
+rm -rf "$APP_DIR/.venv"
+python3 -m venv --system-site-packages "$APP_DIR/.venv"
 "$APP_DIR/.venv/bin/pip" install -q -e "$APP_DIR"
-"$APP_DIR/.venv/bin/pip" install -q gpiozero lgpio pyserial \
-	|| echo "  ⚠️ gpiozero/pyserial 설치 실패 — 밸브·실토출은 fake 로 동작(등록·모니터링엔 무영향)"
 
 # ── 4. 환경파일 — 넣는 값은 서버 URL 하나뿐 ────────────────────────────────
 mkdir -p "$ENV_DIR" "$LOG_DIR" "$STATE_DIR/queue"
@@ -98,8 +106,11 @@ WantedBy=multi-user.target
 EOF
 
 # ── 6. 기동 ────────────────────────────────────────────────────────────────
+#   restart 사용(enable --now 아님) — 재실행 시 **이미 켜진 서비스는 --now 로 재시작되지 않아** 옛 코드가
+#   계속 돈다. restart 는 꺼져 있으면 시작·켜져 있으면 새 코드로 재시작(멱등 재실행 정확성).
 systemctl daemon-reload
-systemctl enable -q --now senlytd
+systemctl enable -q senlytd
+systemctl restart senlytd
 
 ADMIN_URL="${SERVER_URL%/}/admin"
 echo ""
