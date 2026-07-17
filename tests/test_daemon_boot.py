@@ -155,6 +155,7 @@ def _daemon(
     pump_map: dict | None = None,
     heartbeat_interval_s: float = 0.0,
     poll_interval_s: float = 0.01,
+    estop_source=None,
 ) -> SenlytDaemon:
     eng = engine if engine is not None else FakeEnginePort()
     if engine is None:
@@ -172,6 +173,7 @@ def _daemon(
             now_iso=lambda: "2026-07-10T00:00:00.000Z",
             heartbeat_interval_s=heartbeat_interval_s,
             poll_interval_s=poll_interval_s,
+            estop_source=estop_source,
         )
     )
 
@@ -506,3 +508,55 @@ def test_senlytd_run_mode_invokes_boot(tmp_path, monkeypatch):
     # 엔진 = Fake(유일 mock).
     assert isinstance(captured["deps"].engine, FakeEnginePort)
     lg.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 긴급정지 감시(§9-4·2026-07-18) — estop 신호 fast-poll → 전 펌프 즉시 정지 + 하드 중단
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_estop_watcher_triggers_emergency_stop_on_rising_edge(ledger):
+    """active 상승엣지 → 데몬 _estop set + engine.emergency_stop_all(pump_map addrs)."""
+    fake = FakeEnginePort()
+    fake.script_all(FakeEngineOutcome.ACK)
+    signal = {"v": (True, "2026-07-18T00:00:00.000Z")}
+    d = _daemon(ledger, engine=fake, estop_source=lambda: signal["v"],
+                pump_map={1: SPEC, 2: SPEC, 3: SPEC})
+    d.poll_estop_once()
+    assert d._estop.is_set()
+    assert fake.estop_all_calls == [[1, 2, 3]]  # 전 펌프 TR
+
+
+def test_estop_watcher_same_signal_not_retriggered(ledger):
+    """같은 requestedAt 은 재처리하지 않는다(반복 TR 회피)."""
+    fake = FakeEnginePort()
+    fake.script_all(FakeEngineOutcome.ACK)
+    signal = {"v": (True, "2026-07-18T00:00:00.000Z")}
+    d = _daemon(ledger, engine=fake, estop_source=lambda: signal["v"])
+    d.poll_estop_once()
+    d.poll_estop_once()  # 같은 신호 재폴
+    assert len(fake.estop_all_calls) == 1
+
+
+def test_estop_watcher_clear_releases_latch(ledger):
+    """신호 해제(active False) → 데몬 _estop clear + engine.clear_estop."""
+    fake = FakeEnginePort()
+    fake.script_all(FakeEngineOutcome.ACK)
+    signal = {"v": (True, "2026-07-18T00:00:00.000Z")}
+    d = _daemon(ledger, engine=fake, estop_source=lambda: signal["v"])
+    d.poll_estop_once()
+    assert d._estop.is_set() and fake._estop.is_set()
+    signal["v"] = (False, None)
+    d.poll_estop_once()
+    assert not d._estop.is_set()
+    assert not fake._estop.is_set()  # engine.clear_estop 호출됨
+
+
+def test_estop_watcher_poll_error_is_swallowed(ledger):
+    """estop 폴 소스 예외 → 삼킴(다음 폴 재시도·데몬 죽지 않음)."""
+    def boom():
+        raise RuntimeError("network down")
+
+    d = _daemon(ledger, estop_source=boom)
+    d.poll_estop_once()  # 예외 안 나야 함
+    assert not d._estop.is_set()

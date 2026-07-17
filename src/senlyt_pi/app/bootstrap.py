@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 
 from ..adapters.device_identity_store import DeviceIdentity, DeviceIdentityStore
 from ..adapters.fake_engine_adapter import FakeEnginePort
@@ -34,12 +34,18 @@ from ..adapters.registration_client import (
     make_http_register_transport,
     read_hardware_id,
 )
+from ..adapters.settings_source import (
+    fetch_settings_once,
+    full_stroke_from_settings,
+    syringe_capacity_from_settings,
+)
 from ..adapters.sse_command_source_adapter import SseCommandSourceAdapter
 from ..config.server_target import ServerConfig
 from ..core.pump_guard import PUMP_PRESETS, SyringeSpec, resolve_syringe_capacity_ml
 from ..obs.log import STAGE_ERROR, STAGE_PI_RECEIVED, StructuredLogger
 from ..persistence.file_idempotency_ledger import FileIdempotencyLedger
 from ..persistence.idempotency_ledger import IdempotencyLedger, InMemoryIdempotencyLedger
+from ..pipeline.pump_health import auto_pump_map, discover_pumps
 from ..pipeline.recipe_resolver import RecipeResolver
 from ..ports.engine_port import EnginePort
 from ..ports.valve_port import ValvePort
@@ -76,6 +82,11 @@ class BootstrapError(Exception):
     """부팅 조립 실패 — deviceId(수집 시리얼) 부재·서버 타겟 미설정·등록 실패 등(fail-fast)."""
 
 
+# 부팅 1회 settings fetch seam(주입 가능·테스트가 네트워크 없이 검증) —
+#   (server_config, dispenser_token, mode) → MachineSettings|None. 기본 = 실 SSE 1회 읽기.
+SettingsFetcher = Callable[[ServerConfig, str, str], "Mapping[str, Any] | None"]
+
+
 @dataclass(frozen=True, slots=True)
 class DaemonComponents:
     """조립된 실 어댑터 묶음 — daemon 이 소비."""
@@ -89,6 +100,11 @@ class DaemonComponents:
     valve: ValvePort | None
     ledger: IdempotencyLedger
     logger: StructuredLogger
+    # 서버 배정/env 로 확정된 실행 모드(flavor|fragrance) — 구독·역보고 축 + settings mode 쿼리.
+    mode: str
+    # 부팅 1회 서버 settings 스냅샷(시린지 용량 SoT) — fetch_settings=True 일 때만 채워짐(없으면 None).
+    #   RecipeResolver pump_map 의 용량/스트로크를 서버값으로 얹는다(build_resolver 소비).
+    server_settings: "Mapping[str, Any] | None" = None
 
 
 def _resolve_mode(environ: Mapping[str, str]) -> str:
@@ -248,36 +264,111 @@ def build_ledger(environ: Mapping[str, str]) -> FileIdempotencyLedger:
     return FileIdempotencyLedger.open(_ledger_path(environ))
 
 
-def pump_map_from_addresses_env(raw: str | None) -> dict[int, SyringeSpec]:
+def pump_map_from_addresses_env(
+    raw: str | None,
+    *,
+    capacity_override: float | None = None,
+    full_stroke_override: int | None = None,
+) -> dict[int, SyringeSpec]:
     """`PUMP_ADDRESSES`("aroma:1,2,3;flavor:4") → pumpAddr→SyringeSpec 매핑(RR pump_map).
 
-    settings-stream(O-18) 미배선 구간의 부트스트랩 pump_map — 모드 기본 용량 + sy01b 스트로크.
-      - 모든 모드(flavor/aroma/fragrance) → 0.5mL(양 모드 공통 기본·2026-07-17 확정).
-      - 스트로크 = sy01b 프리셋(12000). 서버 settings 수신 시 이 매핑을 대체할 수 있다.
+    명시 env 로 주소를 고정하는 경로 — 용량/스트로크는 **서버 settings 오버라이드 우선**(O-18):
+      - `capacity_override`(서버 settings 프리셋 용량)가 있으면 그 값, 없으면 모드 기본 0.5mL
+        (양 모드 공통·2026-07-17 확정). ⚠️ 용량 오류 = Code 11 과다흡입이라 서버값이 안전 SoT.
+      - `full_stroke_override`(서버 프리셋 스트로크)가 있으면 그 값, 없으면 sy01b(12000).
     누락/비정수 addr 는 건너뛴다(미매핑 addr 는 RR 게이트가 drop — silent 매핑 금지).
     """
     pump_map: dict[int, SyringeSpec] = {}
     if not raw:
         return pump_map
-    stroke = PUMP_PRESETS["sy01b"].pump_full_stroke
+    stroke = (
+        full_stroke_override
+        if full_stroke_override is not None
+        else PUMP_PRESETS["sy01b"].pump_full_stroke
+    )
     for group in raw.split(";"):
         group = group.strip()
         if not group or ":" not in group:
             continue
         mode, addrs = group.split(":", 1)
         is_flavor = mode.strip().lower() == "flavor"
-        capacity = resolve_syringe_capacity_ml(None, is_flavor=is_flavor)  # 모드 기본값 폴백.
+        capacity = (
+            capacity_override
+            if capacity_override is not None
+            else resolve_syringe_capacity_ml(None, is_flavor=is_flavor)  # 모드 기본값 폴백.
+        )
         spec = SyringeSpec(pump_full_stroke=stroke, syringe_capacity_ml=capacity)
         for a in addrs.split(","):
             a = a.strip()
-            if a.isdigit():
+            # ⛔ addr 0 = RS485 브로드캐스트 — pump_map 에 넣으면 어댑터가 `/0…`(전 펌프 동시
+            #   응답·충돌)을 쏜다. 서버 게이트와 대칭으로 0 을 배제(실 주소는 1.. 뿐).
+            if a.isdigit() and int(a) >= 1:
                 pump_map[int(a)] = spec
     return pump_map
 
 
-def build_resolver(environ: Mapping[str, str]) -> RecipeResolver:
-    """RecipeResolver 조립 — PUMP_ADDRESSES env 기반 pump_map(§9-1)."""
-    return RecipeResolver(pump_map_from_addresses_env(environ.get(SENLYT_PUMP_ADDRESSES_ENV)))
+def build_resolver(
+    environ: Mapping[str, str],
+    *,
+    engine: EnginePort | None = None,
+    server_settings: "Mapping[str, Any] | None" = None,
+) -> RecipeResolver:
+    """RecipeResolver 조립 — pump_map 을 **자동인식**하고, env 가 있으면 그게 이긴다.
+
+    우선순위(주소):
+      ① `PUMP_ADDRESSES` env 명시 → 그대로(고정 구성·기존 설치 호환).
+      ② 미지정 → **버스 스캔 자동인식** — 단 **모드가 알려주는 예상 주소만** 프로브한다.
+      ③ 둘 다 실패 → 빈 매핑(모든 스텝 unmapped drop = 토출 0·안전측).
+
+    ⚠️ **시린지 용량/스트로크 = 서버 settings 우선(O-18·안전 급소)**. `server_settings`(부팅 1회
+       GET-SSE 스냅샷)의 pumpPreset.syringeCapacityMl/pumpFullStroke 이 있으면 그 값을 pump_map
+       SyringeSpec 에 얹고, 없으면 모드 기본(0.5mL/sy01b 12000)으로 폴백한다. 용량이 실 시린지와
+       어긋나면 stepsPerMl 오산 → 과다흡입 → Code 11(펌프 파손)이라, 서버 SoT 값을 우선한다.
+       주소 자체는 위 우선순위(명시 env > 물리 프로브)가 정한다 — settings 는 '용량'만 얹는다
+       (설정상 있어야 할 펌프를 config 만 보고 매핑하지 않는다·물리 프로브가 존재 SoT).
+
+    ⚠️ ②가 없으면 **`PUMP_ADDRESSES` 없는 기기는 전 스텝이 CMD_VALIDATION_FAILED 로 죽는다**
+    — "URL만" 설치 목표(설치 시 env 안 넣어도 됨)와 정면 충돌한다. `pump_health` 는 이 스캔
+    로직을 갖고 있었지만 **부팅에 배선돼 있지 않았다**(비-테스트 호출자 0건·2026-07-17 발견).
+
+    ⚠️ **스캔 범위 = 소프트웨어 포트 매핑(모드)이 정한다**(2026-07-18). 무작정 1..10 을 훑으면
+    식향(펌프 2대)에서 없는 3..10 각각에 프로브 상한(~6s)만큼 낭비해 부팅이 ~48s 늘어진다.
+    모드가 펌프 수를 알려주므로(식향 2 → 주소 1,2 · 향장향 3 → 1,2,3) 그 예상 주소만 프로브한다
+    — 부재 주소 낭비 0. (더 넓은 구성이 필요하면 `PUMP_ADDRESSES` 로 명시 = ①이 이긴다.)
+
+    자동인식의 근거는 **실제 펌프 응답**이지 VID/PID 가 아니다 — 엔진 어댑터가 `probe(addr)`
+    를 제공하면 그걸 쓰고(sy01b=RS485 상태쿼리), 없으면(Fake 등) 건너뛴다.
+    """
+    # 서버 settings 프리셋(부팅 스냅샷) → 용량/스트로크 오버라이드(없으면 None → 모드 기본 폴백).
+    capacity_override = syringe_capacity_from_settings(server_settings)
+    stroke_override = full_stroke_from_settings(server_settings)
+
+    raw = environ.get(SENLYT_PUMP_ADDRESSES_ENV)
+    if raw and raw.strip():
+        return RecipeResolver(
+            pump_map_from_addresses_env(
+                raw,
+                capacity_override=capacity_override,
+                full_stroke_override=stroke_override,
+            )
+        )
+
+    probe = getattr(engine, "probe", None) if engine is not None else None
+    if callable(probe):
+        is_flavor = (environ.get(SENLYT_MODE_ENV, "") or "").strip().lower() == "flavor"
+        # 모드 → 예상 펌프 주소(소프트웨어 매핑). 식향 2대(1,2) / 향장향 3대(1,2,3). 2026-07-17 확정.
+        expected = [1, 2] if is_flavor else [1, 2, 3]
+        found = discover_pumps(probe, expected)
+        if found:
+            capacity = (
+                capacity_override
+                if capacity_override is not None
+                else resolve_syringe_capacity_ml(None, is_flavor=is_flavor)
+            )
+            return RecipeResolver(
+                auto_pump_map(found, capacity_ml=capacity, full_stroke=stroke_override)
+            )
+    return RecipeResolver({})
 
 
 def build_components(
@@ -288,6 +379,8 @@ def build_components(
     logger: StructuredLogger | None = None,
     identity_store: DeviceIdentityStore | None = None,
     register: bool = True,
+    fetch_settings: bool = False,
+    settings_fetcher: SettingsFetcher | None = None,
 ) -> DaemonComponents:
     """환경변수에서 실 어댑터 전체를 조립 — 서버 타겟 결정 + 등록 + 어댑터 결선.
 
@@ -295,6 +388,10 @@ def build_components(
       register: True(기본)면 실 HTTP 등록을 수행. 테스트는 register=False + identity_store
                 (선주입 정체성)로 네트워크 없이 조립 검증.
       engine:   주입 시 그대로(유일 mock=Fake). 미주입이면 SENLYT_ENGINE 분기.
+      fetch_settings: True 면 부팅 1회 서버 settings 스냅샷을 읽어 server_settings 에 싣는다
+                (시린지 용량 SoT·O-18). 실 데몬(senlytd._run)만 켠다 — 기본 False(조립 테스트는
+                네트워크 없이). best-effort: 실패 시 server_settings=None(모드 기본 용량 폴백).
+      settings_fetcher: 부팅 settings fetch seam 주입(테스트). 미주입이면 실 SSE 1회 읽기.
 
     Raises:
       ServerTargetError: 서버 base URL 미설정/미지원(fail-fast — config.server_target).
@@ -343,6 +440,22 @@ def build_components(
     # mode 는 서버 배정(identity.mode·TOFU 승인 시 하달)이 **우선** — 없으면 env(SENLYT_MODE)→flavor 폴백.
     #   서버가 SoT(운영자가 /admin 에서 기기 모드 배정) → SENLYT_MODE env 는 더 이상 필수가 아니다.
     mode = identity.mode or _resolve_mode(environ)
+
+    # 부팅 1회 서버 settings 스냅샷(시린지 용량 SoT·O-18) — fetch_settings=True(실 데몬)일 때만.
+    #   best-effort: 실패는 삼켜 None(모드 기본 용량 폴백). seam(settings_fetcher) 로 테스트 주입 가능.
+    server_settings: "Mapping[str, Any] | None" = None
+    if fetch_settings:
+        fetcher = settings_fetcher if settings_fetcher is not None else fetch_settings_once
+        try:
+            server_settings = fetcher(server_config, identity.dispenser_token, mode)
+        except Exception as e:  # noqa: BLE001 — settings fetch 실패는 부팅을 막지 않는다(폴백).
+            log.warn(
+                "부팅 settings fetch 실패 — 모드 기본 용량으로 폴백(best-effort)",
+                stage=STAGE_ERROR,
+                error=str(e),
+            )
+            server_settings = None
+
     command_source = SseCommandSourceAdapter(
         server_config=server_config,
         bearer_token=identity.dispenser_token,
@@ -367,6 +480,8 @@ def build_components(
         engine=type(engine_adapter).__name__,
         valve=type(valve_adapter).__name__ if valve_adapter is not None else "off",
         mode=mode,
+        # 서버 settings 시린지 용량 반영 여부(None=서버 미제공→모드 기본 0.5mL 폴백·안전 급소 관측).
+        syringeCapacityMl=syringe_capacity_from_settings(server_settings),
     )
 
     return DaemonComponents(
@@ -379,4 +494,6 @@ def build_components(
         valve=valve_adapter,
         ledger=ledger if ledger is not None else InMemoryIdempotencyLedger(),
         logger=log,
+        mode=mode,
+        server_settings=server_settings,
     )

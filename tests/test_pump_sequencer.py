@@ -270,3 +270,64 @@ def test_volume_over_max_validation_failed(ledger, fake):
     )
     assert r.outcome is JobOutcome.VALIDATION_FAILED
     assert fake.dispense_count == 0
+
+
+# ── 긴급정지 선점(§9-4·2026-07-18) ────────────────────────────────────────────
+
+
+def test_estop_before_submit_aborts_without_dispense(ledger, fake):
+    """estop 래치가 이미 서 있으면 첫 stage 도 시작하지 않는다 → ESTOP_ABORTED·토출 0."""
+    import threading
+
+    ev = threading.Event()
+    ev.set()
+    seq_counter = iter(range(10_000))
+    seq = PumpSequencer(
+        ledger=ledger,
+        engine=fake,
+        resolver=RecipeResolver({1: SPEC, 2: SPEC, 3: SPEC}),
+        request_id_gen=lambda: f"req-{next(seq_counter)}",
+        now_iso=lambda: "2026-07-03T00:00:00.000Z",
+        estop_event=ev,
+    )
+    r = seq.submit(
+        command_id="o:1", trace_id="t",
+        steps=[step(0, 1, 100), step(1, 2, 100), step(2, 3, 100)],
+    )
+    assert r.outcome is JobOutcome.ESTOP_ABORTED
+    assert r.error_code is StatusErrorCode.INTERRUPTED
+    assert fake.dispense_count == 0, "estop 래치 시 토출 0(선점)"
+
+
+def test_estop_during_manufacture_preempts_in_flight(ledger):
+    """제조 중 estop 발동 → 진행 중 스텝 즉시 실패 + 다음 stage 미시작(ESTOP_ABORTED).
+
+    fake·시퀀서가 estop 이벤트를 공유한다. 배경 스레드가 제조 도중 이벤트를 세우면(감시 스레드
+    모사), fake 의 _delay 가 즉시 빠져나와 스텝이 실패하고 시퀀서가 하드 중단한다.
+    """
+    import threading
+
+    ev = threading.Event()
+    slow = FakeEnginePort(step_delay_ms=400, estop_event=ev)
+    slow.script_all(FakeEngineOutcome.ACK)
+    seq_counter = iter(range(10_000))
+    seq = PumpSequencer(
+        ledger=ledger,
+        engine=slow,
+        resolver=RecipeResolver({1: SPEC, 2: SPEC, 3: SPEC}),
+        request_id_gen=lambda: f"req-{next(seq_counter)}",
+        now_iso=lambda: "2026-07-03T00:00:00.000Z",
+        estop_event=ev,
+    )
+    # 제조 시작 후 곧바로 estop(감시 스레드 모사) — 첫 stage 진행 중에 발동.
+    timer = threading.Timer(0.05, ev.set)
+    timer.start()
+    try:
+        r = seq.submit(
+            command_id="o:1", trace_id="t",
+            steps=[step(0, 1, 100), step(1, 2, 100), step(2, 3, 100)],
+        )
+    finally:
+        timer.cancel()
+    assert r.outcome is JobOutcome.ESTOP_ABORTED
+    assert r.steps_done < 3, "in-flight 선점 — 전 stage 완주 못 함"

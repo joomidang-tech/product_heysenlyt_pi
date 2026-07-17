@@ -78,6 +78,30 @@ def test_unmapped_pump_addr_drops():
     assert e.value.reason == "unmapped_pump_addr"
 
 
+def _estop(idx: int, addr: int) -> RecipeStep:
+    return RecipeStep.from_json(
+        {"idx": idx, "stage": 0, "kind": "engineOp", "pumpAddr": addr, "op": "estop"}
+    )
+
+
+def test_estop_skips_unmapped_addr_keeps_mapped():
+    """긴급정지 배치에 미매핑 addr(3)이 섞여도 매핑된 펌프(1,2)는 정지한다(리뷰 P1·2026-07-18).
+
+    dispense 는 미매핑=fail-closed(위 test)지만 engineOp 은 닿는 펌프에 반드시 실행돼야 안전하다.
+    옛 코드는 addr 3 하나 때문에 전 배치를 unmapped_pump_addr 로 drop → 아무 펌프도 안 멈췄다.
+    """
+    out = RESOLVER.resolve([_estop(0, 1), _estop(1, 2), _estop(2, 3)])  # 3 은 미매핑
+    addrs = sorted(s.pump_addr for s in out.steps)
+    assert addrs == [1, 2]  # 3 은 건너뛰고 1,2 만 해석
+
+
+def test_estop_all_unmapped_fails_not_silent_complete():
+    """engineOp 전부 미매핑 → empty_recipe(실패). 0스텝 COMPLETE(거짓 성공) 금지."""
+    with pytest.raises(RecipeValidationError) as e:
+        RESOLVER.resolve([_estop(0, 98), _estop(1, 99)])
+    assert e.value.reason == "empty_recipe"
+
+
 def test_fragrance_half_ml_pump_boundary():
     """fragrance 0.5mL 펌프 — maxVolumeUl=500, 500µL 경계 통과."""
     r = RESOLVER.resolve([step(0, 5, 500)])

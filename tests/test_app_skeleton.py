@@ -36,14 +36,33 @@ def test_sse_and_status_adapters_are_real_not_stubs():
     status.ship_trace([])
 
 
-def test_sy01b_engine_adapter_remains_stub():
-    """실 RS485 엔진 어댑터만 여전히 TODO 스텁 — 유일 mock=Fake 원칙상 실토출 유보."""
-    spec = SyringeSpec(pump_full_stroke=12000, syringe_capacity_ml=1.25)
-    cmd = EngineDispenseCommand(pump_addr=1, volume_ul=100, steps=960, spec=spec)
-    engine = Sy01bEngineAdapter()
-    with pytest.raises(NotImplementedError):
-        engine.dispense(cmd)
-    with pytest.raises(NotImplementedError):
-        engine.aspirate(cmd)
-    with pytest.raises(NotImplementedError):
-        engine.initialize()
+def test_sy01b_engine_adapter_is_implemented():
+    """실 RS485 엔진 어댑터가 **구현됐다**(2026-07-17) — 구 스텁 단언의 역전.
+
+    이전엔 `NotImplementedError` 를 던지는 게 계약이었다(실토출 유보). 이제 어댑터는 시리얼
+    seam 을 받아 I→P→O→D 를 실제로 조립한다 — 시리얼이 없는 이 환경에선 **예외를 던지지 않고
+    실패 결과로 흡수**하는 것이 계약이다(상위 stage 태스크가 형제를 완주시켜야 하므로).
+    상세 계약 검증은 tests/test_sy01b_engine_adapter.py.
+    """
+    spec = SyringeSpec(pump_full_stroke=12000, syringe_capacity_ml=0.5)
+    cmd = EngineDispenseCommand(pump_addr=1, volume_ul=100, steps=2400, spec=spec)
+
+    class DeadSerial:
+        def write(self, data):
+            raise OSError("no device")
+
+        def read(self, size=1):
+            return b""
+
+        @property
+        def in_waiting(self):
+            return 0
+
+        def close(self):
+            pass
+
+    engine = Sy01bEngineAdapter(serial_factory=lambda *_a: DeadSerial())
+    # 예외가 아니라 **실패 결과**로 나온다(silent-success 도 아니고 raise 도 아니다).
+    assert engine.dispense(cmd).raw_error_code != 0
+    assert engine.aspirate(cmd).raw_error_code != 0
+    assert engine.initialize().raw_error_code == 0  # 캐시 무효화 — 시리얼 불필요

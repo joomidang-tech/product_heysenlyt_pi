@@ -28,6 +28,27 @@ from ..core.wire_messages import RecipeStep
 from ..ports.valve_port import VALVE_BASES
 
 
+# 회전 밸브 헤드의 물리 구멍 범위 — SY-01B 12포트(서버 portLayout.MIN_PORT/MAX_PORT 와 동일).
+MIN_PORT = 1
+MAX_PORT = 12
+
+
+# wire `op`(camelCase·서버 계약) → pi op(snake_case). 여기 없는 op 는 거부(fail-closed).
+#   새 정비 동작은 **양쪽 계약에 명시적으로** 추가해야 한다 — 조용히 통과시키면 미지의 물리
+#   동작이 실기기에서 실행된다.
+WIRE_OP_TO_PI: dict[str, str] = {
+    "estop": "estop",
+    "initialize": "initialize",
+    "plungerFull": "plunger_full",
+    "plungerHome": "plunger_home",
+}
+
+
+def _is_port_valid(port: int | None) -> bool:
+    """구멍 번호가 물리적으로 실재하는가(1~12). 서버 `isPortValid` 와 동일 규칙."""
+    return isinstance(port, int) and not isinstance(port, bool) and MIN_PORT <= port <= MAX_PORT
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedStep:
     """해석된 실행 스텝(정렬·검증·파생 완료)."""
@@ -41,6 +62,29 @@ class ResolvedStep:
     steps: int
     spec: SyringeSpec
     # 동시 실행 그룹(§9-1 v2) — 같은 stage 병렬·오름차순 배리어.
+    stage: int = 0
+    # ── 회전 밸브 구멍 + 속도 — **서버가 배치·정책을 해석해 실어 보낸 값**(pi 는 배치를 모른다). ──
+    #   None = 구계약 스텝(포트·속도 미보유) → 어댑터가 안전 기본으로 폴백(하위호환).
+    in_port: int | None = None
+    out_port: int | None = None
+    aspirate_speed_hz: int | None = None
+    dispense_speed_hz: int | None = None
+    slope: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedOpStep:
+    """해석된 엔진 조작 스텝 — 토출 아님(정비 버튼).
+
+    부피가 없으므로 부피 게이트를 타지 않는다. 대신 **op 화이트리스트**가 게이트다 —
+    모르는 op 는 거부(fail-closed). 문법 번역은 어댑터 몫이라 여기선 의도만 나른다.
+    """
+
+    idx: int
+    pump_addr: int
+    op: str
+    flavor: str
+    spec: SyringeSpec
     stage: int = 0
 
 
@@ -99,8 +143,8 @@ class ResolvedRecipe:
     stage=idx 로 해석되어 그룹당 1스텝 = **기존 완전 직렬과 동일 동작**.
     """
 
-    steps: tuple["ResolvedStep | ResolvedValveStep", ...]
-    stages: tuple[tuple["ResolvedStep | ResolvedValveStep", ...], ...] = ()
+    steps: tuple["ResolvedStep | ResolvedValveStep | ResolvedOpStep", ...]
+    stages: tuple[tuple["ResolvedStep | ResolvedValveStep | ResolvedOpStep", ...], ...] = ()
 
     @property
     def step_n(self) -> int:
@@ -139,13 +183,45 @@ class RecipeResolver:
         # stage-major 정렬(§9-1 v2) — tie 는 idx(전역 유일)·구계약은 stage=idx 라 기존과 동일.
         sorted_steps = sorted(steps, key=lambda s: (s.effective_stage, s.idx))
 
-        resolved: list[ResolvedStep | ResolvedValveStep] = []
+        resolved: list[ResolvedStep | ResolvedValveStep | ResolvedOpStep] = []
         stage_pumps: dict[int, set[int]] = {}
         valve_count = 0
         for s in sorted_steps:
             stage = s.effective_stage
             if stage < 0:
                 raise RecipeValidationError("negative_stage", idx=s.idx)
+
+            if s.is_engine_op:
+                # ── 엔진 조작 게이트 — op 화이트리스트 + 실주소. ───────────────────
+                pi_op = WIRE_OP_TO_PI.get(s.op or "")
+                if pi_op is None:
+                    raise RecipeValidationError("unknown_engine_op", idx=s.idx)
+                op_spec = self.pump_map.get(s.pump_addr)
+                if op_spec is None:
+                    # ⚠️ **미매핑 addr 은 그 스텝만 건너뛴다(배치 전체를 죽이지 않는다·리뷰 P1·2026-07-18).**
+                    #   dispense 는 미매핑=재료 누락=엉뚱 제품이라 fail-closed(아래 syringe 분기 raise)지만,
+                    #   engineOp(특히 긴급정지)은 **닿는 펌프엔 반드시 실행돼야** 안전하다. 예: 2펌프 기기에
+                    #   관제가 addr 1,2,3 estop 을 쏘면(mode 파생 초과분) 옛 코드는 addr 3 하나 때문에 **전
+                    #   펌프 정지가 통째로 drop**됐다(정지가 가장 필요할 때 아무 것도 안 멈춤). 건너뛰면
+                    #   1,2 는 정지한다. 전부 미매핑이면 아래 empty 가드가 실패로 잡는다(silent COMPLETE 금지).
+                    continue
+                resolved.append(
+                    ResolvedOpStep(
+                        idx=s.idx,
+                        pump_addr=s.pump_addr,
+                        op=pi_op,
+                        flavor=s.flavor,
+                        spec=op_spec,
+                        stage=stage,
+                    )
+                )
+                pumps = stage_pumps.setdefault(stage, set())
+                if s.pump_addr in pumps:
+                    raise RecipeValidationError(
+                        "duplicate_pump_in_stage", idx=s.idx, pump_addr=s.pump_addr
+                    )
+                pumps.add(s.pump_addr)
+                continue
 
             if s.is_valve:
                 # ── valve 게이트(§9-1 v2): base 2종 · volumeMl > 0 · 잔당 ≤ 1(상호배타 L3). ──
@@ -203,6 +279,26 @@ class RecipeResolver:
                     "derived_zero_steps", idx=s.idx, pump_addr=s.pump_addr, volume_ul=volume_ul
                 )
 
+            # ── 회전 밸브 구멍 게이트(2차 자물쇠 — 서버가 1차). ──────────────────────
+            #   pi 는 **배치를 모른다**("3번 구멍에 진짜 유자가 있나"는 알 수 없다) — 그건 설정
+            #   정확성 문제이고 서버 몫이다. pi 가 지킬 수 있는 건 **물리 불변식**뿐:
+            #     ① 구멍이 실재하는 범위(1~12)인가  ② 흡입≠배출(같으면 밸브를 안 돌리고 빨았다
+            #     그대로 뱉는 꼴 = 조립 버그).
+            #   부피 게이트(위)는 **물리 안전**(과흡입 → Code 11 펌프 파손)이라 pi 가 끝까지 쥔다.
+            if s.in_port is not None or s.out_port is not None:
+                if not _is_port_valid(s.in_port):
+                    raise RecipeValidationError(
+                        "in_port_out_of_range", idx=s.idx, pump_addr=s.pump_addr
+                    )
+                if not _is_port_valid(s.out_port):
+                    raise RecipeValidationError(
+                        "out_port_out_of_range", idx=s.idx, pump_addr=s.pump_addr
+                    )
+                if s.in_port == s.out_port:
+                    raise RecipeValidationError(
+                        "in_port_equals_out_port", idx=s.idx, pump_addr=s.pump_addr
+                    )
+
             resolved.append(
                 ResolvedStep(
                     idx=s.idx,
@@ -212,8 +308,19 @@ class RecipeResolver:
                     steps=step_count,
                     spec=spec,
                     stage=stage,
+                    in_port=s.in_port,
+                    out_port=s.out_port,
+                    aspirate_speed_hz=s.aspirate_speed_hz,
+                    dispense_speed_hz=s.dispense_speed_hz,
+                    slope=s.slope,
                 )
             )
+
+        # 전부 skip(예: 모든 engineOp addr 미매핑) → resolved 빈 채로 max() 가 터진다. 명시 실패로 잡아
+        #   silent COMPLETE(0스텝 성공) 를 막는다 — 정지를 눌렀는데 아무 펌프도 안 멈춘 걸 성공으로 보고하면
+        #   안 된다(리뷰 P1). 입력 자체가 빈 경우는 위(:180)에서 이미 empty_recipe 로 잡힌다.
+        if not resolved:
+            raise RecipeValidationError("empty_recipe")
 
         # ── stage 연속성(0..N 결번 금지 — 결번 = 조립 버그·배리어 의미 모호). ──
         seen_stages = {r.stage for r in resolved}
@@ -223,7 +330,7 @@ class RecipeResolver:
                 raise RecipeValidationError(f"stage_gap_missing_{i}")
 
         # stage 그룹핑(배리어 단위) — resolved 는 이미 stage-major 정렬.
-        stages: list[tuple[ResolvedStep | ResolvedValveStep, ...]] = []
+        stages: list[tuple[ResolvedStep | ResolvedValveStep | ResolvedOpStep, ...]] = []
         for i in range(max_stage + 1):
             stages.append(tuple(r for r in resolved if r.stage == i))
 
@@ -234,6 +341,14 @@ class RecipeResolver:
 # recipe==None 폴백 해석 헬퍼 (v1.2.0 flavorRecipe / flavor_recipes)
 #
 # 검증은 여전히 RR 게이트 — 여기서는 단위 정규화(mL→µL)와 스텝 조립만 한다.
+#
+# ⚠️ **미배선(legacy·테스트 전용)**: 이 헬퍼들(flavor_recipe_to_steps·flavor_sour_ml·
+#   flavor_recipe_source_to_steps)은 **데몬 실행 경로에 결선돼 있지 않다**(비-테스트 호출 0).
+#   현 기본 결선 dispatcher interpret = daemon._default_interpret(명시 recipe 만·recipe==None →
+#   빈 스텝 → RR empty drop = fail-closed). 특히 생성형 flavorRecipe 는 **기주 valve 스텝을
+#   재구성할 수 없어**(서버 조립 축) 이 폴백을 실행 경로에 주입하면 안 된다(위 flavor_recipe_to_steps
+#   docstring 리뷰 봉합). 서버 계약(§9-1 v2)이 valve 를 실물화하므로 pi 는 서버 조립 스텝만
+#   소비한다 — 이 헬퍼는 계약 파싱 단위테스트 + 미래 recipeId 폴백 승격용으로 남긴다.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # 향(채널 id / 향 이름) → pumpAddr 매핑. 미매핑이면 None 반환 → 해당 스텝 pumpAddr 에

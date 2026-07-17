@@ -29,6 +29,8 @@ def build_command_id(order_id: str, attempt: int) -> str:
 # RecipeStep.kind 2종(§9-1 v2 — 2026-07-14 병렬 stage 계약).
 SYRINGE_STEP_KIND = "syringe"
 VALVE_STEP_KIND = "valve"
+# 엔진 조작(정비 버튼) — 토출 아님. 서버가 **의도**(op)만 싣고 문법 번역은 어댑터가 한다.
+ENGINE_OP_STEP_KIND = "engineOp"
 
 # valve 스텝의 pump_addr sentinel — 시린지 버스(RS485) 주소가 아니다(GPIO). RR pump_map
 # 검증을 우회하는 게 아니라 valve 분기에서 아예 pump_addr 를 보지 않는다.
@@ -54,6 +56,24 @@ class RecipeStep:
     stage: int | None = None  # None = idx (하위호환·§9-1 v2)
     base: str | None = None  # valve 전용 — "normal" | "sour"
     volume_ml: float | None = None  # valve 전용 — 기주 부피(고정 20mL)
+    # engineOp 전용 — "estop" | "initialize" | "plungerFull" | "plungerHome"(wire camelCase 그대로).
+    op: str | None = None
+    # ── 회전 밸브 구멍 + 속도 (2026-07-17 · 서버가 배치·정책을 해석해 실어 보낸다) ──────
+    #
+    # `in_port` = 이 액체가 꽂힌 구멍(`I{n}`) · `out_port` = 배출 구멍(`O{n}`). **pi 는 배치를
+    # 모른다** — 어느 펌프 몇 번 구멍에 뭐가 꽂혔는지는 기기설정(서버 `pumpPorts`)이 정본이고,
+    # pi 는 받은 번호로 밸브를 돌릴 뿐이다. pump_addr 만으로는 한 펌프 다포트 헤드의 여러 액체를
+    # 구분할 수 없어(향료 16종 vs 펌프 2대) 이 필드 없이는 실토출 자체가 불가능하다.
+    #
+    # 속도도 서버가 전역설정 × 포트 오버라이드를 해석해 확정한 값이다(더 느린 쪽 = 고점도 보호).
+    # pi 는 프리셋 상한으로 클램프만 하고 그대로 쓴다 — 속도 *정책*을 알 필요가 없다.
+    #
+    # None = 구계약(포트·속도 미보유) — 어댑터가 안전 기본으로 폴백한다(하위호환).
+    in_port: int | None = None
+    out_port: int | None = None
+    aspirate_speed_hz: int | None = None
+    dispense_speed_hz: int | None = None
+    slope: int | None = None
 
     @property
     def effective_stage(self) -> int:
@@ -64,11 +84,25 @@ class RecipeStep:
     def is_valve(self) -> bool:
         return self.kind == VALVE_STEP_KIND
 
+    @property
+    def is_engine_op(self) -> bool:
+        return self.kind == ENGINE_OP_STEP_KIND
+
     @staticmethod
     def from_json(j: Mapping[str, Any]) -> "RecipeStep":
         kind = str(j.get("kind", SYRINGE_STEP_KIND))
         raw_stage = j.get("stage")
         stage = int(raw_stage) if raw_stage is not None else None
+        if kind == ENGINE_OP_STEP_KIND:
+            return RecipeStep(
+                idx=int(j["idx"]),
+                pump_addr=int(j["pumpAddr"]),
+                flavor=str(j.get("flavor", f"op:{j.get('op')}")),
+                volume=0.0,
+                kind=ENGINE_OP_STEP_KIND,
+                stage=stage,
+                op=str(j["op"]),
+            )
         if kind == VALVE_STEP_KIND:
             base = str(j["base"])
             return RecipeStep(
@@ -81,6 +115,10 @@ class RecipeStep:
                 base=base,
                 volume_ml=float(j["volumeMl"]),
             )
+        def _opt_int(key: str) -> int | None:
+            v = j.get(key)
+            return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
         return RecipeStep(
             idx=int(j["idx"]),
             pump_addr=int(j["pumpAddr"]),
@@ -88,9 +126,24 @@ class RecipeStep:
             volume=j["volume"],
             kind=kind,
             stage=stage,
+            in_port=_opt_int("inPort"),
+            out_port=_opt_int("outPort"),
+            aspirate_speed_hz=_opt_int("aspirateSpeedHz"),
+            dispense_speed_hz=_opt_int("dispenseSpeedHz"),
+            slope=_opt_int("slope"),
         )
 
     def to_json(self) -> dict[str, Any]:
+        if self.kind == ENGINE_OP_STEP_KIND:
+            return {
+                "idx": self.idx,
+                "stage": self.effective_stage,
+                "kind": ENGINE_OP_STEP_KIND,
+                "pumpAddr": self.pump_addr,
+                "op": self.op,
+                "flavor": self.flavor,
+                "volume": 0,
+            }
         if self.kind == VALVE_STEP_KIND:
             return {
                 "idx": self.idx,
@@ -115,6 +168,16 @@ class RecipeStep:
         if self.stage is not None:
             m["stage"] = self.stage
             m["kind"] = self.kind
+        # 포트·속도는 **보유할 때만** 방출 — 구계약 스텝의 바이트를 늘리지 않는다(왕복 보존).
+        for key, val in (
+            ("inPort", self.in_port),
+            ("outPort", self.out_port),
+            ("aspirateSpeedHz", self.aspirate_speed_hz),
+            ("dispenseSpeedHz", self.dispense_speed_hz),
+            ("slope", self.slope),
+        ):
+            if val is not None:
+                m[key] = val
         return m
 
 

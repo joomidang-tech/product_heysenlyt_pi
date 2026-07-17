@@ -22,10 +22,11 @@ import enum
 import os
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Mapping
 
-from ..ports.engine_port import EngineDispenseCommand, EngineResult
+from ..ports.engine_port import EngineDispenseCommand, EngineOpCommand, EngineResult
 from ..test_seam.fake_engine_sentinels import FAKE_EMPTY_RAW_CODE, FAKE_TIMEOUT_RAW_CODE
 
 # 각 물리 동작(aspirate/dispense/initialize)의 지연(ms) 주입 env — 기본 0(무지연).
@@ -100,6 +101,7 @@ class FakeEnginePort:
         *,
         step_delay_ms: int | None = None,
         stop_event: threading.Event | None = None,
+        estop_event: threading.Event | None = None,
     ) -> None:
         # pumpAddr 별 결과 스크립트(FIFO 큐). 비면 default_outcome 사용.
         self._script_by_addr: dict[int, list[FakeEngineOutcome]] = {}
@@ -111,6 +113,10 @@ class FakeEnginePort:
         self.aspirate_calls: list[DispenseCall] = []
         # initialize 호출 횟수.
         self.initialize_count = 0
+        # 엔진 조작(정비) 호출 이력 — (pump_addr, op).
+        self.op_calls: list[tuple[int, str]] = []
+        # 긴급정지 호출 이력 — emergency_stop_all 이 받은 addr 목록(관찰 렌즈).
+        self.estop_all_calls: list[list[int]] = []
         # 각 물리 동작 지연(ms) — 명시 주입 우선, 미주입 시 env(기본 0·무지연).
         self.step_delay_ms = (
             step_delay_ms if step_delay_ms is not None
@@ -118,10 +124,21 @@ class FakeEnginePort:
         )
         # stop 신호(취소/우아한 종료) — set 되면 진행 중 지연 슬립이 즉시 반환.
         self._stop = stop_event if stop_event is not None else threading.Event()
+        # 긴급정지 래치 — 실어댑터와 동일 계약(제조 중 지연이 즉시 abort). 공유 이벤트 주입 가능.
+        self._estop = estop_event if estop_event is not None else threading.Event()
 
     def signal_stop(self) -> None:
         """진행 중 지연 슬립을 즉시 깨운다(취소/중단·SIGTERM 우아한 종료 시)."""
         self._stop.set()
+
+    def emergency_stop_all(self, addrs: "Iterable[int]") -> None:
+        """긴급정지 — 실어댑터 계약 미러. addr 기록 + `_estop` set(진행 중 _delay 즉시 abort)."""
+        self.estop_all_calls.append([a for a in addrs if a >= 1])
+        self._estop.set()
+
+    def clear_estop(self) -> None:
+        """긴급정지 래치 해제 — 복구(초기화) 경로가 부른다."""
+        self._estop.clear()
 
     def _delay(self) -> None:
         """물리 동작 시간 근사 — step_delay_ms 만큼 sleep(짧은 조각·stop 즉응).
@@ -132,7 +149,7 @@ class FakeEnginePort:
         if self.step_delay_ms <= 0:
             return
         remaining = self.step_delay_ms / 1000.0
-        while remaining > 0 and not self._stop.is_set():
+        while remaining > 0 and not self._stop.is_set() and not self._estop.is_set():
             slice_s = _DELAY_SLICE_S if remaining > _DELAY_SLICE_S else remaining
             time.sleep(slice_s)
             remaining -= slice_s
@@ -167,6 +184,9 @@ class FakeEnginePort:
         )
         # 물리 흡입 시간 근사(기본 0·무지연). 시도는 위에서 기록 후 지연.
         self._delay()
+        if self._estop.is_set():
+            # 긴급정지 abort — 실어댑터 _poll_until_ready 가 _NO_RESPONSE 로 빠지는 것과 동일 계약.
+            return EngineResult(raw_error_code=FAKE_TIMEOUT_RAW_CODE, detail="estop")
         # aspirate 도 동일 스크립트 소비 — 실 하드웨어는 흡입/배출이 하나의 물리 사이클.
         return _outcome_to_result(self._next_outcome(cmd.pump_addr))
 
@@ -176,6 +196,8 @@ class FakeEnginePort:
         )
         # 물리 배출 시간 근사(기본 0·무지연) — 이 구간이 "제조 중" 크래시 주입 창.
         self._delay()
+        if self._estop.is_set():
+            return EngineResult(raw_error_code=FAKE_TIMEOUT_RAW_CODE, detail="estop")
         return _outcome_to_result(self._next_outcome(cmd.pump_addr))
 
     def initialize(self) -> EngineResult:
@@ -184,12 +206,21 @@ class FakeEnginePort:
         self._delay()
         return EngineResult(raw_error_code=0)
 
+    def run_op(self, cmd: EngineOpCommand) -> EngineResult:
+        """엔진 조작(정비) — 호출 기록만. 스크립트된 결과를 따른다(실패 주입 가능)."""
+        self.op_calls.append((cmd.pump_addr, cmd.op))
+        self._delay()
+        return _outcome_to_result(self._next_outcome(cmd.pump_addr))
+
     def reset(self) -> None:
         """관찰 상태 초기화(재기동 시나리오 사이 카운터 리셋)."""
         self.dispense_calls.clear()
         self.aspirate_calls.clear()
+        self.op_calls.clear()
+        self.estop_all_calls.clear()
         self.initialize_count = 0
         self._script_by_addr.clear()
         self.default_outcome = FakeEngineOutcome.ACK
-        # stop 신호도 해제 — 시나리오 재사용 시 지연이 다시 정상 동작(step_delay_ms 는 유지).
+        # stop·estop 신호도 해제 — 시나리오 재사용 시 지연이 다시 정상 동작(step_delay_ms 는 유지).
         self._stop.clear()
+        self._estop.clear()

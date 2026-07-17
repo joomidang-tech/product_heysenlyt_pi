@@ -13,7 +13,12 @@ name = "senlyt-pi"
 version = "1.2.0"
 description = "hey senlyt pi daemon (hexagonal, Python port of the Dart implementation)"
 requires-python = ">=3.11"
-dependencies = []
+# 실기기(RPi) 배포 의존성. sy01b 어댑터가 RS485 시린지 펌프와 말하는 유일한 통로다.
+#   ⚠️ 어댑터는 **lazy import** 라 미설치 환경에서도 모듈 import·단위테스트는 통과한다
+#   (시리얼 seam 에 가짜를 꽂아 계약을 검증) — 실제 연결 시점에만 실패한다.
+dependencies = [
+    "pyserial>=3.5",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

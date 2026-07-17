@@ -215,6 +215,29 @@ class HttpStatusSinkAdapter:
             )
 
     # ─────────────────────────────────────────────────────────────────────
+    # §9-4  긴급정지 신호 fast-poll — GET estop
+    # ─────────────────────────────────────────────────────────────────────
+
+    def poll_estop(self, device_id: str) -> "tuple[bool, str | None]":
+        """긴급정지 신호 조회 — `(active, requestedAt)`. 실패/거부는 `(False, None)` 안전 폴백.
+
+        ⚠️ **fast-poll**(데몬 estop 감시 스레드가 ~1s 주기 호출). best-effort — 네트워크 오류/비-2xx
+           는 (False, None)로 흡수해 다음 폴에서 재시도한다(서버 불통이면 관제도 신호를 못 넣는다).
+           서버 200 응답 body = { active: bool, requestedAt: string|null }.
+        """
+        url = self._config().estop_url(device_id)
+        headers = bearer_headers(self.bearer_token)
+        try:
+            status, data = self._request("GET", url, headers=headers, timeout=self.timeout)
+        except HttpTransportError:
+            return (False, None)
+        if not (200 <= status < 300) or not isinstance(data, dict):
+            return (False, None)
+        active = bool(data.get("active"))
+        requested_at = data.get("requestedAt")
+        return (active, requested_at if isinstance(requested_at, str) else None)
+
+    # ─────────────────────────────────────────────────────────────────────
     # §10-4  trace ship — POST trace (best-effort 배치 ≤100)
     # ─────────────────────────────────────────────────────────────────────
 

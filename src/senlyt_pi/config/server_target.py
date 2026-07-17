@@ -158,6 +158,7 @@ PATH_ORDERS_STREAM = "/api/dispenser/orders/stream"
 PATH_SETTINGS_STREAM = "/api/dispenser/settings"
 PATH_COMMANDSETS = "/api/dispenser/commandsets"
 PATH_TRACE = "/api/dispenser/trace"
+PATH_ESTOP = "/api/dispenser/estop"  # §9-4 긴급정지 신호 fast-poll(GET)
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +207,10 @@ class ServerConfig:
     @property
     def trace_url(self) -> str:
         return self.url(PATH_TRACE)
+
+    def estop_url(self, device_id: str) -> str:
+        """긴급정지 신호 조회 URL — /api/dispenser/estop?deviceId=… (§9-4 fast-poll·GET)."""
+        return f"{self.url(PATH_ESTOP)}?{urlencode({'deviceId': device_id})}"
 
     def order_url(self, order_id: str, mode: str | None = None) -> str:
         """단건 주문 PATCH URL — /api/dispenser/orders/{orderId}?mode=(선택).

@@ -142,6 +142,13 @@ class DaemonDeps:
     poll_interval_s: float = 1.0
     # heartbeat 주기(초·§9-3). 0 이하면 heartbeat 스레드 비활성(테스트가 수동 구동).
     heartbeat_interval_s: float = 30.0
+    # 긴급정지 신호 폴 소스(§9-4·GET /api/dispenser/estop) — `() -> (active, requestedAt)`.
+    #   ⚠️ **명령 폴과 무관한 전용 스레드**가 이걸 fast-poll 한다. 제조 중엔 메인 폴이 블록되므로,
+    #   estop 을 큐가 아니라 이 별도 축으로 받아야 제조 중에도 즉시 전 펌프를 멈춘다. None = 비활성
+    #   (watcher 미기동 — 테스트/구성 미주입 시 안전 폴백).
+    estop_source: Callable[[], "tuple[bool, str | None]"] | None = None
+    # estop fast-poll 주기(초). estop 은 반응성이 생명이라 heartbeat(30s)보다 훨씬 짧게.
+    estop_poll_interval_s: float = 1.0
 
 
 class SenlytDaemon:
@@ -155,6 +162,12 @@ class SenlytDaemon:
 
         # stop 플래그(시그널/테스트가 set) — 루프·heartbeat 스레드 공통 종료 신호.
         self._stop = threading.Event()
+        # 긴급정지 래치(§9-4) — 감시 스레드가 서버 estop 신호를 보고 set, 복구가 clear. 시퀀서에
+        #   주입해 "다음 stage 미시작"을 강제하고, 어댑터는 emergency_stop_all/clear_estop 로 구동한다.
+        #   shutdown(_stop)과 분리(estop 후엔 복구가 이어지지만 shutdown 은 종료).
+        self._estop = threading.Event()
+        # estop 상승엣지 판정용 마지막 처리 시각(같은 신호 재처리 방지).
+        self._last_estop_at: str | None = None
         # SSE 어댑터에 종료 신호 결선(감사 P3) — 순회 중 SIGTERM 시 제너레이터 즉시 종료(우아한
         #   종료 지연 방지). bootstrap 시점엔 _stop 이 없어 여기서 결선한다(setter 지원 시).
         for src in (deps.command_source, deps.commandset_source):
@@ -167,6 +180,8 @@ class SenlytDaemon:
         self._trace_lock = threading.Lock()
         self._trace_buffer: list[TraceSpan] = []
         self._hb_thread: threading.Thread | None = None
+        # 긴급정지 감시 스레드(§9-4) — estop 신호를 fast-poll(별도 축). boot() 에서만 기동.
+        self._estop_thread: threading.Thread | None = None
         # 역보고 송신 전용 워커(감사 P2 봉합·2026-07-15) — 제조 임계경로(메인 소비 스레드)에서
         # 네트워크 I/O(report_status·trace flush)를 분리한다. boot() 에서만 기동(heartbeat 결).
         # FIFO 큐(단일 소비 스레드) → 보고 순서(ACCEPTED→PROGRESS→COMPLETED) 보존.
@@ -187,6 +202,7 @@ class SenlytDaemon:
             publisher=self._publish_progress,
             now_iso=self._now_iso,
             valve=deps.valve,
+            estop_event=self._estop,  # §9-4 — 감시 스레드 set 시 다음 stage 미시작(하드 중단).
         )
         # 봉투 전이 sink — status_sink 가 report_command_set_transition 을 제공하면 꽂는다.
         commandset_sink = getattr(deps.status_sink, "report_command_set_transition", None)
@@ -214,6 +230,8 @@ class SenlytDaemon:
             heartbeatIntervalS=self.deps.heartbeat_interval_s,
         )
         self._recover()
+        # 부팅 자가진단(fail-closed 관측·EP-08) — 매핑 펌프 0 이면 제조 보류(heartbeat 만)를 표면화.
+        self._boot_self_test()
         # 부팅 시 원장 압축 — append-only 무한 성장·부팅 replay O(N) 완화(감사 P2 봉합·
         # 2026-07-15). 멱등 보증 훼손 없음(최신 상태만 보존). compact 없는 ledger 주입도 무해.
         compact = getattr(self.deps.ledger, "compact", None)
@@ -224,6 +242,7 @@ class SenlytDaemon:
                 pass
         self._start_sender()
         self._start_heartbeat()
+        self._start_estop_watcher()
         # 폴 오류 연속 횟수 — 오류에만 지수 백오프(감사 P3). 성공/정상유휴 시 0 리셋.
         consecutive_errors = 0
         try:
@@ -246,6 +265,34 @@ class SenlytDaemon:
                 self._stop.wait(wait_s)
         finally:
             self.shutdown()
+
+    def _boot_self_test(self) -> bool:
+        """부팅 자가진단(EP-08 결·fail-closed **관측**) — 매핑된 펌프가 없으면 제조 보류.
+
+        **실 게이트는 RecipeResolver** 다 — 미매핑 pumpAddr 스텝을 CMD_VALIDATION_FAILED 로
+        drop(토출 0)하므로, pump_map 이 비면 어떤 제조도 물리 토출 없이 실패보고된다(fail-closed).
+        여기서는 그 상태를 **부팅 시점에 눈에 띄게 표면화**만 한다 — heartbeat 는 계속 나가니
+        운영자가 admin 에서 "online 인데 제조 보류(펌프 미인식)"를 구분할 수 있다. 소비 루프는
+        멈추지 않는다(정비 명령·heartbeat 는 유효하고, 제조만 RR 이 안전측 drop). 반환 = 제조
+        준비(매핑 펌프 ≥1). (펌프 자동인식·용량 결정은 bootstrap.build_resolver 가 이미 수행.)
+        """
+        pump_map = self._sequencer.resolver.pump_map
+        pumps = sorted(pump_map)
+        if pumps:
+            self._log.info(
+                "부팅 자가진단 통과 — 매핑 펌프 확인(제조 수용)",
+                stage=STAGE_PI_RECEIVED,
+                device_id=self.deps.device_id,
+                pumps=pumps,
+                valve=self.deps.valve is not None,
+            )
+            return True
+        self._log.warn(
+            "부팅 자가진단 — 매핑 펌프 0(제조 보류·수신 주문 CMD_VALIDATION_FAILED drop·토출0·heartbeat 지속)",
+            stage=STAGE_ERROR,
+            device_id=self.deps.device_id,
+        )
+        return False
 
     def poll_once(self) -> int:
         """도착분 1회 소비 — CommandSet 봉투 + Command 축. 오류는 삼켜 루프 지속(§10-6).
@@ -551,6 +598,88 @@ class SenlytDaemon:
         self._hb_thread = t
         t.start()
 
+    # ─────────────────────────────────────────────────────────────────────
+    # 긴급정지 감시(§9-4) — estop 신호 fast-poll(별도 축·제조 중에도 즉시 선점)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _start_estop_watcher(self) -> None:
+        """estop 감시 스레드 기동 — estop_source 미주입 시 비활성(watcher 없음)."""
+        if self.deps.estop_source is None or self.deps.estop_poll_interval_s <= 0:
+            return
+        t = threading.Thread(target=self._estop_watch_loop, name="senlyt-estop", daemon=True)
+        self._estop_thread = t
+        t.start()
+
+    def _estop_watch_loop(self) -> None:
+        """estop 신호를 짧은 주기로 폴한다 — 제조 중 메인 폴이 블록돼도 이 스레드는 계속 돈다."""
+        interval = self.deps.estop_poll_interval_s
+        while not self._stop.wait(interval):
+            self.poll_estop_once()
+
+    def poll_estop_once(self) -> None:
+        """estop 신호 1회 폴 — active 상승엣지면 전 펌프 즉시 정지, 해제면 래치 풀기.
+
+        네트워크 오류는 삼켜 다음 폴에서 재시도(estop 미검출은 안전측 아님이지만, 대안이 없다 —
+        서버 불통이면 관제도 신호를 못 넣는다). 반환값 없음(관측 로그만).
+        """
+        source = self.deps.estop_source
+        if source is None:
+            return
+        try:
+            active, requested_at = source()
+        except Exception as e:  # noqa: BLE001 — 폴 오류 삼킴(다음 폴 재시도).
+            self._log.warn(
+                "estop 폴 오류(삼킴·다음 폴 재시도)",
+                stage=STAGE_ERROR,
+                device_id=self.deps.device_id,
+                error=str(e),
+            )
+            return
+        if active:
+            # 상승엣지(새 requestedAt)만 처리 — 같은 신호 반복 TR 회피(TR 자체는 멱등이라 무해하나 로그 노이즈).
+            if requested_at is not None and requested_at == self._last_estop_at:
+                return
+            self._last_estop_at = requested_at
+            self._trigger_estop()
+        elif self._estop.is_set():
+            # 신호 해제(복구) → 래치 풀기. 실제 재홈은 초기화 명령이 별도로 수행한다.
+            self._estop.clear()
+            engine_clear = getattr(self.deps.engine, "clear_estop", None)
+            if callable(engine_clear):
+                try:
+                    engine_clear()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._last_estop_at = None
+            self._log.info(
+                "긴급정지 해제(신호 clear) — 래치 풀림·복구 대기",
+                stage=STAGE_PI_RECEIVED,
+                device_id=self.deps.device_id,
+            )
+
+    def _trigger_estop(self) -> None:
+        """긴급정지 발동 — `_estop` set(시퀀서 다음 stage 미시작) + 전 펌프 즉시 TR(어댑터)."""
+        self._estop.set()
+        addrs = sorted(self._sequencer.resolver.pump_map)
+        engine_estop = getattr(self.deps.engine, "emergency_stop_all", None)
+        if callable(engine_estop):
+            try:
+                engine_estop(addrs)
+            except Exception as e:  # noqa: BLE001 — TR 실패해도 래치는 유지(제조 재개 금지).
+                self._log.warn(
+                    "긴급정지 TR 발송 오류(래치 유지)",
+                    stage=STAGE_ERROR,
+                    device_id=self.deps.device_id,
+                    error=str(e),
+                )
+        self._last_error = StatusErrorCode.INTERRUPTED
+        self._log.warn(
+            "긴급정지 발동 — 전 펌프 TR + 진행 제조 하드 중단(§9-4)",
+            stage=STAGE_ERROR,
+            device_id=self.deps.device_id,
+            pumps=addrs,
+        )
+
     def _heartbeat_loop(self) -> None:
         interval = self.deps.heartbeat_interval_s
         # Event.wait(interval): stop 시 즉시 True 반환(빠른 종료) / 타임아웃 시 False → 1회 emit.
@@ -615,10 +744,13 @@ class SenlytDaemon:
             self._sequencer.request_drain()
         except Exception:  # noqa: BLE001
             pass
-        # 3) heartbeat 스레드 정지 대기(자기 자신이면 skip).
+        # 3) heartbeat + estop 감시 스레드 정지 대기(자기 자신이면 skip·_stop.wait 로 즉시 깨어남).
         t = self._hb_thread
         if t is not None and t is not threading.current_thread():
             t.join(timeout=5.0)
+        et = self._estop_thread
+        if et is not None and et is not threading.current_thread():
+            et.join(timeout=5.0)
         # 3.5) sender 워커 정지 대기 + 큐 잔여분 동기 drain(감사 P2 + 리뷰 #5·2026-07-15) —
         #   워커는 stop 후 **큐를 순서대로 끝까지 비운 뒤** 종료한다(위 _sender_loop). join(30s)
         #   이 정상적으로 반환하면 큐는 이미 비어 아래 drain 은 no-op = **FIFO 완전 보존**.

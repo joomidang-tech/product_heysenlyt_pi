@@ -32,6 +32,7 @@ L3(밸브 상호배타)는 ValveAdapter 몫. 교차 의존 금지.
 from __future__ import annotations
 
 import enum
+import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -50,6 +51,7 @@ from .recipe_resolver import (
     RecipeResolver,
     RecipeValidationError,
     ResolvedStep,
+    ResolvedOpStep,
     ResolvedValveStep,
 )
 from .status_reporter import RequestIdGen, StatusReporter
@@ -68,6 +70,8 @@ class JobOutcome(enum.Enum):
     DUPLICATE_DROPPED = "duplicate_dropped"
     # graceful 종료로 남은 스텝 미시작 → PARTIAL FAILED(INTERRUPTED 아님·정상 정지).
     GRACEFUL_PARTIAL = "graceful_partial"
+    # 긴급정지(§9-4)로 진행 중 제조를 하드 중단 → FAILED(INTERRUPTED). 물리 TR 은 어댑터가 이미 걸었다.
+    ESTOP_ABORTED = "estop_aborted"
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +125,7 @@ class PumpSequencer:
         now_iso: Callable[[], str] | None = None,
         valve: ValvePort | None = None,
         max_parallel: int = 8,
+        estop_event: "threading.Event | None" = None,
     ) -> None:
         self.ledger = ledger
         self.resolver = resolver
@@ -131,8 +136,9 @@ class PumpSequencer:
         # 기주 밸브 포트(§9-1 v2) — None 이면 valve 스텝 수신 시 fail-closed drop(토출 0).
         self.valve = valve
         # stage 병렬 태스크 풀(설계 §5 — threads·pyserial 친화). lazy 생성·재사용.
-        #   기본 8 = SY-01B 8채널(PUMP_MAP 0~7·리뷰 P2-1) — 이보다 작으면 큰 stage 가
-        #   조용히 파도(wave) 직렬화된다. 재시도 의미론 노트(리뷰 P2-3): 실패 job 재시도는
+        #   기본 8 = 한 stage 동시 실행 상한(넉넉한 여유값) — 실제 동시 스텝은 stage 내
+        #   pumpAddr 유일 제약(RR L2)이라 장착 펌프 수(식향 2·향장향 3)를 넘지 않는다. 이보다
+        #   작으면 큰 stage 가 조용히 파도(wave) 직렬화된다. 재시도 의미론 노트(리뷰 P2-3): 실패 job 재시도는
         #   기존과 동일하게 **레시피 전체 재실행**(per-step resume 없음) — stage partial
         #   성공분 이중토출 여부는 운영 재시도 정책(수동) 몫.
         self._max_parallel = max(1, max_parallel)
@@ -143,6 +149,10 @@ class PumpSequencer:
         self._pending: deque[_PendingJob] = deque()
         # graceful 종료 플래그 — set 후 현재 stage 완주·다음 stage 미시작.
         self._draining = False
+        # 긴급정지 래치(§9-4) — 데몬 감시 스레드와 어댑터가 공유. set 되면 진행 중 제조를 **하드 중단**
+        #   (in-flight 스텝은 어댑터가 _estop 로 즉시 실패시키고, 시퀀서는 다음 stage 를 시작하지 않는다).
+        #   drain(우아한 종료·현재 step 완주)과 달리 estop 은 "지금 당장 멈춤"이라 별도 축이다.
+        self._estop = estop_event if estop_event is not None else threading.Event()
 
     @property
     def is_busy(self) -> bool:
@@ -296,6 +306,23 @@ class PumpSequencer:
         """stage 배리어 루프 본체 — _run_job 의 방어 try 안에서 돈다."""
         steps_done = 0
         for stage_steps in resolved.stages:
+            # ── 긴급정지(§9-4): 다음 stage 미시작 + FAILED(INTERRUPTED). 물리 TR 은 어댑터가 이미
+            #    걸었고(emergency_stop_all), in-flight 스텝은 어댑터 _estop 로 즉시 실패했다. 여기선
+            #    "다음 stage 를 시작하지 않음"을 보장한다(drain 보다 우선 — 즉시 하드 중단). ──
+            if self._estop.is_set():
+                self.ledger.mark_settled(job.command_id, success=False)
+                self._publish_via(
+                    reporter, DispensePhase.FAILED, steps_done, step_n,
+                    StatusErrorCode.INTERRUPTED,
+                )
+                return JobReport(
+                    command_id=job.command_id,
+                    outcome=JobOutcome.ESTOP_ABORTED,
+                    steps_done=steps_done,
+                    step_n=step_n,
+                    error_code=StatusErrorCode.INTERRUPTED,
+                )
+
             # ── graceful: 다음 stage 미시작(현재까지 완주분으로 PARTIAL·설계 §10). ──
             if self._draining:
                 self.ledger.mark_settled(job.command_id, success=False)
@@ -318,6 +345,21 @@ class PumpSequencer:
 
             failures = [ec for ok, ec in results if not ok]
             if failures:
+                # ── 긴급정지로 in-flight 스텝이 실패했으면 ESTOP_ABORTED(INTERRUPTED)로 분류한다
+                #    (어댑터 _estop 로 즉시 실패한 케이스 — 일반 하드웨어 실패와 구분). ──
+                if self._estop.is_set():
+                    self.ledger.mark_settled(job.command_id, success=False)
+                    self._publish_via(
+                        reporter, DispensePhase.FAILED, steps_done, step_n,
+                        StatusErrorCode.INTERRUPTED,
+                    )
+                    return JobReport(
+                        command_id=job.command_id,
+                        outcome=JobOutcome.ESTOP_ABORTED,
+                        steps_done=steps_done,
+                        step_n=step_n,
+                        error_code=StatusErrorCode.INTERRUPTED,
+                    )
                 # ── stage 실패 안전정지(PS·설계 §10): permanent 우선 보고 → PARTIAL FAILED. ──
                 error_code = next(
                     (ec for ec in failures if ec is StatusErrorCode.ENGINE_ERROR_PERMANENT),
@@ -365,7 +407,7 @@ class PumpSequencer:
         return self._pool
 
     def _run_stage(
-        self, stage_steps: Sequence["ResolvedStep | ResolvedValveStep"]
+        self, stage_steps: Sequence["ResolvedStep | ResolvedValveStep | ResolvedOpStep"]
     ) -> list[tuple[bool, StatusErrorCode | None]]:
         """한 stage 의 스텝들을 동시 실행하고 (성공여부, 에러코드) 목록을 반환.
 
@@ -392,7 +434,7 @@ class PumpSequencer:
         return results
 
     def _run_one(
-        self, step: "ResolvedStep | ResolvedValveStep"
+        self, step: "ResolvedStep | ResolvedValveStep | ResolvedOpStep"
     ) -> tuple[bool, StatusErrorCode | None]:
         """스텝 1개 실행(태스크 본체 — 워커 스레드에서 돈다).
 
@@ -402,6 +444,14 @@ class PumpSequencer:
           대기하지 않은 채 _run_job 을 뚫고 나가 동시1제조(L4)·ledger settle 이 깨진다(리뷰 P1-1).
         """
         try:
+            if isinstance(step, ResolvedOpStep):
+                # 엔진 조작(정비 버튼) — 토출이 아니라 EngineExecutor 재시도층을 타지 않는다.
+                #   정비는 운영자가 누른 **1회 동작**이고, 실패하면 그대로 보고해 다시 누르게
+                #   한다(자동 재시도 = 의도치 않은 반복 물리 동작).
+                res = self._engine_op(step)
+                ok = res.raw_error_code == 0
+                return (ok, None if ok else StatusErrorCode.ENGINE_ERROR_PERMANENT)
+
             if isinstance(step, ResolvedValveStep):
                 valve = self.valve
                 if valve is None:
@@ -416,12 +466,26 @@ class PumpSequencer:
                 volume_ul=step.volume_ul,
                 steps=step.steps,
                 spec=step.spec,
+                in_port=step.in_port,
+                out_port=step.out_port,
+                aspirate_speed_hz=step.aspirate_speed_hz,
+                dispense_speed_hz=step.dispense_speed_hz,
+                slope=step.slope,
             )
             res = self._executor.run_step(cmd)
             return (res.is_success, res.error_code)
         except Exception:
             # 어댑터 예외 = permanent 실패로 흡수(형제 태스크 완주·settle 경로 보존).
             return (False, StatusErrorCode.ENGINE_ERROR_PERMANENT)
+
+    def _engine_op(self, step: "ResolvedOpStep"):
+        """엔진 조작 위임 — `run_op` 미보유 엔진(구 어댑터)은 미지원 실패로 떨어뜨린다(fail-closed)."""
+        from ..ports.engine_port import EngineOpCommand, EngineResult
+
+        run_op = getattr(self._executor.engine, "run_op", None)
+        if not callable(run_op):
+            return EngineResult(raw_error_code=-1, detail="engine has no run_op")
+        return run_op(EngineOpCommand(pump_addr=step.pump_addr, op=step.op, spec=step.spec))
 
     def shutdown(self) -> None:
         """stage 태스크 풀 정리(멱등) — daemon 우아한 종료 경로에서 호출."""

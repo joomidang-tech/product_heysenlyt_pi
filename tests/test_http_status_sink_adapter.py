@@ -228,3 +228,40 @@ class TestCommandSetTransition:
         sink = HttpStatusSinkAdapter(base_url="http://web:3000", request=_raising_request)
         # best-effort — 관측이 제조를 막지 않는다.
         sink.report_command_set_transition(self._cs(), CommandSetStatus.DELIVERED, None)
+
+
+class TestPollEstop:
+    """긴급정지 신호 fast-poll(§9-4) — GET estop → (active, requestedAt)."""
+
+    def test_active_signal(self) -> None:
+        with FakeHttpServer() as srv:
+            srv.set_handler(
+                lambda req: {
+                    "status": 200,
+                    "json": {"active": True, "requestedAt": "2026-07-18T00:00:00.000Z"},
+                }
+            )
+            sink = HttpStatusSinkAdapter(base_url=srv.base_url, bearer_token="t")
+            active, at = sink.poll_estop("dev-A")
+            assert active is True
+            assert at == "2026-07-18T00:00:00.000Z"
+            rec = srv.requests[-1]
+            assert rec.method == "GET"
+            assert rec.path == "/api/dispenser/estop"
+            assert "deviceId=dev-A" in rec.query
+
+    def test_inactive_signal(self) -> None:
+        with FakeHttpServer() as srv:
+            srv.set_handler(lambda req: {"status": 200, "json": {"active": False, "requestedAt": None}})
+            sink = HttpStatusSinkAdapter(base_url=srv.base_url, bearer_token="t")
+            assert sink.poll_estop("dev-A") == (False, None)
+
+    def test_server_error_safe_fallback(self) -> None:
+        with FakeHttpServer() as srv:
+            srv.set_handler(lambda req: {"status": 500, "json": {"code": "estop_query_failed"}})
+            sink = HttpStatusSinkAdapter(base_url=srv.base_url, bearer_token="t")
+            assert sink.poll_estop("dev-A") == (False, None)
+
+    def test_network_failure_safe_fallback(self) -> None:
+        sink = HttpStatusSinkAdapter(base_url="http://web:3000", request=_raising_request)
+        assert sink.poll_estop("dev-A") == (False, None)

@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import os
-import sys
 from typing import Mapping
 
 from ..obs.log import STAGE_ERROR, STAGE_PI_RECEIVED, StructuredLogger
@@ -108,7 +107,11 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
 
     try:
         ledger = build_ledger(environ)
-        components = build_components(environ, ledger=ledger, logger=logger)
+        # fetch_settings=True — 부팅 1회 서버 settings 스냅샷으로 시린지 용량 SoT 반영(O-18·안전 급소).
+        #   best-effort(실패=모드 기본 폴백). 조립 self-test(_selftest)는 fetch 안 함(펌프 미구동).
+        components = build_components(
+            environ, ledger=ledger, logger=logger, fetch_settings=True
+        )
     except ServerTargetError as e:
         logger.error(
             "서버 타겟 미설정/미지원 — 부팅 중단(fail-fast)",
@@ -127,10 +130,20 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         engine=components.engine,
         valve=components.valve,
         ledger=ledger,
-        resolver=build_resolver(environ),
+        # 엔진을 넘겨 pump_map **자동인식**을 가능하게 한다(PUMP_ADDRESSES 미설정 = "URL만" 설치).
+        #   env 가 있으면 그게 이기고, 없으면 어댑터의 probe 로 버스를 스캔한다.
+        #   server_settings(부팅 스냅샷)로 시린지 용량/스트로크를 서버 SoT 값으로 얹는다(O-18).
+        resolver=build_resolver(
+            environ,
+            engine=components.engine,
+            server_settings=getattr(components, "server_settings", None),
+        ),
         commandset_source=components.command_source,  # 동일 SSE 어댑터가 두 축 제공.
         logger=components.logger,
         poll_interval_s=_resolve_poll_interval_s(environ),
+        # 긴급정지 fast-poll 소스(§9-4) — HTTP status_sink 의 estop GET 을 device_id 로 바인딩한다.
+        #   제조 중에도 즉시 선점하려면 명령 폴과 무관한 이 별도 축이 필요하다.
+        estop_source=lambda: components.status_sink.poll_estop(components.device_id),
     )
     daemon = SenlytDaemon(deps)
     _install_signal_handlers(daemon, logger)
