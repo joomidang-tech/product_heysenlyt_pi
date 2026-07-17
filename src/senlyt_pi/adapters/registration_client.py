@@ -220,13 +220,20 @@ def read_hardware_id(
     *,
     env: Mapping[str, str] | None = None,
     cpuinfo_path: Path | str = "/proc/cpuinfo",
+    devicetree_serial_path: Path | str = "/proc/device-tree/serial-number",
     machine_id_path: Path | str = "/etc/machine-id",
 ) -> str | None:
     """기기 고유 HW 식별자 seam — [D-A] 이 값이 **곧 deviceId**(RegisterRequest.deviceId·레지스트리 키).
 
     우선순위: ① env SENLYT_HARDWARE_ID(테스트·개발 주입) → ② /proc/cpuinfo `Serial`
-    (Pi CPU 시리얼 — 계약 예시) → ③ /etc/machine-id 폴백. 전부 실패 → None
+    (Pi 1~4 CPU 시리얼) → ③ **/proc/device-tree/serial-number**(RPi 2~5 공통 HW 시리얼 —
+    RPi 5 는 cpuinfo 에 `Serial` 이 없을 수 있어 이 소스로 크로스모델 안정화) → ④ /etc/machine-id
+    폴백(⚠️ HW 시리얼 아님 = OS 설치 UUID·재플래시 시 변동). 전부 실패 → None
     (호출측이 등록 불가로 표면화 — silent 임의값 생성 금지·deviceId 안정성).
+
+    ⚠️ **RPi 4·5 호환(2026-07-17)**: RPi 4 는 ②(cpuinfo Serial)로, RPi 5 는 ③(devicetree
+    serial-number)로 **동일한 HW 시리얼**을 얻는다. ④(machine-id)는 최후 폴백일 뿐 —
+    HW 키가 아니므로 재플래시 시 deviceId 가 바뀌어 재등록·구 등록 고아화 위험(경고 로그 대상).
     seam 이름(read_hardware_id)·env 키(SENLYT_HARDWARE_ID)는 유지 — 반환값의 의미만 deviceId 로 확정.
     """
     e = env if env is not None else os.environ
@@ -234,6 +241,7 @@ def read_hardware_id(
     if isinstance(override, str) and override.strip() != "":
         return override.strip()
 
+    # ② /proc/cpuinfo `Serial` (RPi 1~4).
     try:
         text = Path(cpuinfo_path).read_text(encoding="utf-8")
         for line in text.splitlines():
@@ -245,6 +253,17 @@ def read_hardware_id(
     except (FileNotFoundError, OSError, UnicodeDecodeError):
         pass
 
+    # ③ /proc/device-tree/serial-number (RPi 2~5 공통 — RPi 5 대응). 값은 NUL 종단 문자열.
+    try:
+        raw = Path(devicetree_serial_path).read_bytes()
+        serial = raw.split(b"\x00", 1)[0].decode("ascii", "ignore").strip()
+        # 선행 0 만으로 이뤄진 16-hex(전부 0)나 빈값은 무효(미프로비저닝 EEPROM) → 다음 폴백.
+        if serial and set(serial) != {"0"}:
+            return serial
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+
+    # ④ /etc/machine-id (⚠️ HW 시리얼 아님 — 최후 폴백).
     try:
         machine_id = Path(machine_id_path).read_text(encoding="utf-8").strip()
         if machine_id:

@@ -60,7 +60,7 @@ SENLYT_PUMP_ADDRESSES_ENV = "PUMP_ADDRESSES"
 # 기주 밸브 선택(§9-1 v2) — fake(기본·시뮬) | gpio(실기기 라즈베리파이) | off(미결선 —
 #   valve 스텝 수신 시 fail-closed drop). 핀·유량은 설정값(하드코딩 금지·설계 §9-①).
 SENLYT_VALVE_ENV = "SENLYT_VALVE"
-# 밸브 핀 매핑(BCM) — 기본 "sour:9,normal:11" (신기주=BCM9/핀21·베이스=BCM11/핀23·7/15 성연 확정).
+# 밸브 핀 매핑(BCM) — 기본 "sour:17,normal:27" (신기주=BCM17/물리핀11·베이스=BCM27/물리핀13·2026-07-17 실배선 정정).
 SENLYT_VALVE_PINS_ENV = "SENLYT_VALVE_PINS"
 # 밸브 유량(mL/s) — openSec = volumeMl ÷ 이 값. 벤치 캘리브레이션으로 교체(기본 10.0).
 SENLYT_VALVE_FLOW_ENV = "SENLYT_VALVE_FLOW_ML_PER_SEC"
@@ -104,14 +104,18 @@ def build_engine(
     choice = environ.get(SENLYT_ENGINE_ENV, "fake").strip().lower()
     if choice == "sy01b":
         # 실 RS485 어댑터는 아직 TODO 스텁 — 명시 선택 시에만 조립(실토출 불가·부팅 자체는 허용).
+        from ..adapters.serial_port_discovery import discover_serial_port
         from ..adapters.sy01b_engine_adapter import Sy01bEngineAdapter
 
-        return Sy01bEngineAdapter()
+        # USB-RS485 포트 자동 발견(by-id·포트 흔들림/펌프 교체 재인식 견고). 미발견이면
+        # 기본 경로로 조립하되 부팅 self-test(pump_health.run_self_test)가 미준비를 표면화한다.
+        port = discover_serial_port(environ)
+        return Sy01bEngineAdapter(port=port) if port else Sy01bEngineAdapter()
     return FakeEnginePort()
 
 
 def _valve_pins_from_env(raw: str | None) -> dict[str, int]:
-    """`SENLYT_VALVE_PINS`("sour:9,normal:11") → base→BCM 핀 매핑. 파싱 불가 항목은 건너뜀."""
+    """`SENLYT_VALVE_PINS`("sour:17,normal:27") → base→BCM 핀 매핑. 파싱 불가 항목은 건너뜀."""
     if not raw:
         return dict(DEFAULT_VALVE_PINS)
     pins: dict[str, int] = {}
