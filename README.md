@@ -3,6 +3,21 @@
 hey_senlyt **v1.2.0** 라즈베리파이4 headless 디스펜서 데몬 (Firebase 무의존).
 3-서비스(**order-web** 주문 / **admin-web** 관제[heysenlyt-web 내 `/admin` 라우트·same-origin] / **pi 디스펜서**) 중 pi 트랙.
 
+## 🚀 빠른 설치 (라즈베리파이 · 1줄)
+
+라즈베리파이에서 **한 줄**이면 다운로드부터 systemd 등록·기동까지 됩니다. 넣는 값은 **서버 URL 하나**뿐:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/joomidang-tech/product_heysenlyt_pi/v1.2.0/install.sh \
+  | sudo bash -s -- https://v1-2-0.env.senlyt.com
+```
+
+그 뒤 흐름 = **admin에 "승인 대기"로 뜸 → `https://v1-2-0.env.senlyt.com/admin` 에서 "승인 + 모드 배정" → online**.
+
+- 나머지(deviceId·mode·engine·valve)는 **런타임 자동** — deviceId=HW시리얼 자동수집 · mode=승인 시 배정 · engine/valve=부팅 자동감지(실 Pi+시리얼→sy01b·GPIO→gpio·아니면 fake).
+- 등록에 **비밀키 없음(TOFU)** — 키 없이 신청하고 **운영자 승인**이 관문. 승인 전엔 "승인 대기"로 폴링만(정상).
+- 재실행 안전(멱등) · 부팅 자동시작 · `Restart=always` 무인 복구. 상세 수동 설치는 아래 "실행" 절 참조.
+
 > **배포 산출물 = Python 데몬** (`src/senlyt_pi/` · 콘솔 스크립트 `senlytd` · `python:3.12-slim` + systemd).
 > **Dart 구현(`lib/`·`test/`)은 포팅 오라클** — 동결 계약 SoT를 바이트 동일 포팅해 Python의 parity 기준으로만 쓴다(배포 아님).
 > pyproject 헤더 정본: "Dart → Python 재작성 · 포팅 오라클 = 이 레포의 Dart 구현 · 수치 정본 = heysenlyt-web `lib/server/pumpGuard.ts`+`settingsClamp.ts`".
