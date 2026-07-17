@@ -42,24 +42,31 @@ def _fsync_dir(path: Path) -> None:
 
 @dataclass(frozen=True, slots=True)
 class DeviceIdentity:
-    """등록 정체성 — deviceId(=수집 HW 시리얼·D-A) + RegisterResponse(dispenserToken·exp)."""
+    """등록 정체성 — deviceId(=수집 HW 시리얼·D-A) + RegisterResponse(dispenserToken·exp·mode)."""
 
     device_id: str  # = pi 수집 하드웨어 시리얼(D-A). SSE 구독·CS-08 필터·heartbeat 라우팅 키.
     dispenser_token: str  # opaque(부록A P-5) — 저장/전송만.
     exp: int  # 만료 epoch(초) — RegisterResponse.exp
+    # 서버 배정 모드(TOFU 승인 시 하달·flavor|fragrance) — pi 의 SSE 구독/역보고 큐를 결정한다.
+    #   부재(None)면 pi 는 env(SENLYT_MODE) 또는 flavor 폴백. SENLYT_MODE env 대체(서버가 SoT).
+    mode: str | None = None
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "deviceId": self.device_id,
             "dispenserToken": self.dispenser_token,
             "exp": self.exp,
         }
+        if self.mode is not None:
+            d["mode"] = self.mode
+        return d
 
     @staticmethod
     def from_json(j: Any) -> "DeviceIdentity | None":
         """방어 파싱 — 형식이 어긋나면 None(재등록 유도·crash 금지).
 
         구 정체성 파일의 `hardwareId` 키가 있어도 무시한다(상위호환) — deviceId 가 곧 시리얼.
+        구 파일(mode 부재)도 유효 — mode=None(폴백). 승인 재등록 시 mode 가 채워진다.
         """
         if not isinstance(j, dict):
             return None
@@ -72,7 +79,9 @@ class DeviceIdentity:
             return None
         if isinstance(exp, bool) or not isinstance(exp, int):
             return None
-        return DeviceIdentity(device_id=device_id, dispenser_token=token, exp=exp)
+        raw_mode = j.get("mode")
+        mode = raw_mode if isinstance(raw_mode, str) and raw_mode else None
+        return DeviceIdentity(device_id=device_id, dispenser_token=token, exp=exp, mode=mode)
 
 
 def is_identity_expired(identity: DeviceIdentity, *, now_seconds: int) -> bool:

@@ -1,22 +1,23 @@
-"""디바이스 등록 클라이언트 — 계약 RegisterRequest/RegisterResponse (05_api §8-1, D-A 2026-07-10).
+"""디바이스 등록 클라이언트 — 계약 RegisterRequest/RegisterResponse (05_api §8-1 · TOFU 2026-07-17).
 
-pi 부팅 시 POST /api/dispensers/register { deviceId, name? }
-(Authorization: Bearer <DISPENSER_PROVISION_KEY>) → { deviceId(echo), dispenserToken, exp }.
+pi 부팅 시 POST /api/dispensers/register { deviceId, name? } (**인증 헤더 없음** · TOFU 공유키 제거)
+  → 200 { dispenserToken, exp, mode }(승인) 또는 202 { status:"pending" }(운영자 승인 대기).
 
 **[D-A] deviceId = pi 수집 하드웨어 시리얼 그대로** — pi 가 자기 시리얼(read_hardware_id 의 값)을
 `deviceId` 로 **제시**하고 서버는 **등록만** 한다(서버 발급/파생 왕복 없음·구 dsp-<hash> 폐기).
 응답의 deviceId 는 제시값 echo 확인일 뿐 — pi 는 **자기 시리얼을 권위 deviceId 로 유지**하고
-서버 echo 로 덮어쓰지 않는다(parse_register_response). 서버가 발급해 주는 것은 dispenserToken·exp 뿐.
+서버 echo 로 덮어쓰지 않는다(parse_register_response). 서버가 발급하는 것은 dispenserToken·exp·mode.
 멱등: 같은 시리얼(deviceId) 재등록 → 같은 문서 + 새 토큰 — 부팅마다 호출해도 안전.
 
-재시도 정책 = 기존 수치 준용(EngineExecutor R=3 — 첫 시도 + 최대 3 재시도):
-  - retryable: 전송 예외(네트워크) · 5xx(500 register_failed·503 provisioning_not_configured)
-    · 성공(2xx)인데 본문이 계약 위반(과도기 서버 방어).
-  - permanent(즉시 중단·재시도 없음): 4xx(400 invalid_request·401 invalid_provision_key) —
-    재시도로 해소되지 않는 구성 오류. 사용자 개입 필요.
+**TOFU 승인 게이트**: 최초 등록은 202 pending(토큰 미발급) — 운영자가 device-centric /admin 에서
+  승인(status→approved·mode 배정)해야 200 으로 전환된다. ensure_registered 가 승인까지 폴링한다.
+재시도 정책:
+  - retryable: 전송 예외(네트워크) · 5xx(register_failed) · 성공(2xx)인데 본문 계약 위반(과도기 방어).
+  - pending(202): 오류 아님 — 승인 폴링(ensure_registered).
+  - permanent(즉시 중단·재시도 없음): 4xx invalid_request — 구성 오류. (공유키 제거로 401 경로 없음.)
 
-실 HTTP 전송은 seam(`RegisterTransport`)으로 주입 — 테스트 결정성 + 이후 웨이브에서
-urllib/실클라이언트로 교체. hardwareId 도 seam(`read_hardware_id` 파라미터 주입 가능).
+실 HTTP 전송은 seam(`RegisterTransport`)으로 주입 — 테스트 결정성 + 실 urllib 클라이언트.
+hardwareId 도 seam(`read_hardware_id` 파라미터 주입 가능).
 """
 
 from __future__ import annotations
@@ -28,18 +29,10 @@ from typing import Any, Callable, Mapping
 
 from ..core.wire_json import put_if_present
 from .device_identity_store import DeviceIdentity, DeviceIdentityStore, is_identity_expired
-from .http_client import (
-    DEFAULT_TIMEOUT_SECONDS,
-    HttpTransportError,
-    bearer_headers,
-    request_json,
-)
-
-# 프로비저닝 키 env 키 — POST /api/dispensers/register 의 Authorization: Bearer.
-DISPENSER_PROVISION_KEY_ENV = "DISPENSER_PROVISION_KEY"
+from .http_client import DEFAULT_TIMEOUT_SECONDS, request_json
 
 # 전송 seam — RegisterRequest 와이어(dict)를 보내고 (HTTP status, 응답 body json|None) 반환.
-# 네트워크 오류는 예외 raise(→ retryable). 프로비저닝 키 헤더는 transport 조립 책임.
+# 네트워크 오류는 예외 raise(→ retryable). TOFU: 인증 헤더 없음(transport 는 body 만 전송).
 RegisterTransport = Callable[[dict[str, Any]], "tuple[int, Mapping[str, Any] | None]"]
 
 # 재시도 횟수 — 기존 수치 준용(EngineExecutor.max_retries = SoT §6-7 R=3).
@@ -47,6 +40,11 @@ DEFAULT_REGISTER_MAX_RETRIES = 3
 
 # 재시도 간격(초) — attempt 별 소진 시퀀스(마지막 값 유지). 테스트는 sleep 주입으로 무력화.
 DEFAULT_RETRY_DELAYS_SECONDS: tuple[float, ...] = (1.0, 2.0, 4.0)
+
+# TOFU 승인 대기 폴링(202 pending) — 운영자가 /admin 에서 승인할 때까지 재등록을 반복한다.
+#   전송오류 재시도(max_retries=3)와 **별개** — 승인은 사람 게이트라 훨씬 오래 걸릴 수 있다.
+DEFAULT_PENDING_POLL_INTERVAL_SECONDS = 3.0
+DEFAULT_PENDING_MAX_POLLS = 200  # ≈10분(3s×200) 후 포기 → 컨테이너 restart 가 재시도(멱등).
 
 # hardwareId env 오버라이드 키(테스트·개발 기기).
 HARDWARE_ID_ENV_KEY = "SENLYT_HARDWARE_ID"
@@ -72,11 +70,12 @@ def build_register_request(device_id: str, name: str | None = None) -> dict[str,
 
 
 def parse_register_response(body: Mapping[str, Any] | None, device_id: str) -> DeviceIdentity:
-    """RegisterResponse 방어 파싱 — 서버가 발급한 dispenserToken·exp 만 취한다.
+    """RegisterResponse 방어 파싱 — 서버가 발급한 dispenserToken·exp·mode 를 취한다(승인·200).
 
     [D-A] deviceId 는 **pi 자기 시리얼(`device_id` 인자)이 권위** — 서버 응답의 deviceId(echo)로
     덮어쓰지 않는다. 서버 발급값이 없어져도(등록만) 안전하도록 body 의 deviceId 는 읽지 않는다.
     dispenserToken·exp 계약 위반(누락·형식)만 retryable RegistrationError(과도기 서버 방어).
+    mode(선택·flavor|fragrance) = 승인 시 서버가 배정한 기기 모드(부재/null 이면 None → env 폴백).
     """
     if body is None:
         raise RegistrationError("malformed_response", retryable=True)
@@ -86,7 +85,11 @@ def parse_register_response(body: Mapping[str, Any] | None, device_id: str) -> D
         raise RegistrationError("malformed_response", retryable=True)
     if isinstance(exp, bool) or not isinstance(exp, int):
         raise RegistrationError("malformed_response", retryable=True)
-    return DeviceIdentity(device_id=device_id, dispenser_token=token, exp=exp)
+    # mode 화이트리스트 — 서버(신뢰경계)가 준 값도 flavor|fragrance 만 수용(그 외=None→env/flavor 폴백).
+    #   손상 서버/MITM 의 비정상 mode 로 SSE 구독 경로가 오염되는 것 방지(평가자 P2 봉합).
+    raw_mode = body.get("mode")
+    mode = raw_mode if raw_mode in ("flavor", "fragrance") else None
+    return DeviceIdentity(device_id=device_id, dispenser_token=token, exp=exp, mode=mode)
 
 
 class RegistrationClient:
@@ -109,8 +112,16 @@ class RegistrationClient:
         self.retry_delays_seconds = retry_delays_seconds
         self._sleep = sleep if sleep is not None else time.sleep
 
-    def register(self) -> DeviceIdentity:
-        """등록 실행 — 첫 시도 + 최대 max_retries 재시도. 실패 시 RegistrationError."""
+    def register(self) -> DeviceIdentity | None:
+        """등록 1회 실행(전송오류·5xx 는 bounded 재시도).
+
+        반환:
+          - DeviceIdentity: 승인됨(200 — dispenserToken·mode 발급).
+          - None: **TOFU pending**(202 — 운영자 승인 대기). 승인 폴링은 ensure_registered 가 담당.
+        예외:
+          - RegistrationError(retryable=False): 4xx invalid_request(구성 오류·재시도 무의미).
+          - RegistrationError(retryable=True): 전송/5xx/계약위반 재시도 소진.
+        """
         request = build_register_request(self.device_id, self.name)
         last_error: RegistrationError | None = None
 
@@ -129,6 +140,10 @@ class RegistrationClient:
                 last_error = RegistrationError("transport_error", retryable=True)
                 continue
 
+            if status == 202:
+                # TOFU pending — 운영자 승인 대기(토큰 미발급). 오류 아님 → None 반환(폴링은 상위).
+                return None
+
             if 200 <= status < 300:
                 try:
                     return parse_register_response(body, self.device_id)
@@ -137,12 +152,11 @@ class RegistrationClient:
                     continue
 
             if 400 <= status < 500:
-                # 400 invalid_request · 401 invalid_provision_key — 재시도 무의미(구성 오류).
-                code = "invalid_provision_key" if status == 401 else "invalid_request"
-                raise RegistrationError(code, retryable=False, http_status=status)
+                # 400 invalid_request — 재시도 무의미(구성 오류). (공유키 제거로 401 경로 없음·TOFU.)
+                raise RegistrationError("invalid_request", retryable=False, http_status=status)
 
-            # 5xx — 500 register_failed · 503 provisioning_not_configured → 재시도.
-            code = "provisioning_not_configured" if status == 503 else "register_failed"
+            # 5xx — 500 register_failed 등 → 재시도.
+            code = "register_failed"
             last_error = RegistrationError(code, retryable=True, http_status=status)
 
         assert last_error is not None
@@ -155,11 +169,19 @@ def ensure_registered(
     *,
     now_seconds: int | None = None,
     force: bool = False,
+    pending_max_polls: int = DEFAULT_PENDING_MAX_POLLS,
+    pending_poll_interval_seconds: float = DEFAULT_PENDING_POLL_INTERVAL_SECONDS,
+    sleep: Callable[[float], None] | None = None,
 ) -> DeviceIdentity:
     """부팅 진입점 — 저장된 정체성이 유효(미만료·동일 deviceId)하면 재사용, 아니면 등록.
 
     토큰 만료(계약 12h) 시 재등록으로 재발급. [D-A] 저장된 deviceId 가 현재 시리얼과 다르면
     (기판 교체·구 dsp-<hash> 파일에서 승격 등) 저장분을 버리고 재등록(레지스트리 upsert 키 = deviceId=시리얼).
+
+    **TOFU 승인 대기(2026-07-17)**: 등록이 202 pending(client.register()→None)이면 운영자가 /admin 에서
+    승인할 때까지 `pending_poll_interval_seconds` 간격으로 재등록을 폴링한다(최대 `pending_max_polls`).
+    승인 전엔 토큰이 없어 부팅이 여기서 대기하는 것이 정상(승인=사람 게이트). 소진 시 registration_pending
+    예외 → 컨테이너/서비스 restart 가 재시도(멱등·같은 deviceId).
     """
     now = now_seconds if now_seconds is not None else int(time.time())
     if not force:
@@ -171,49 +193,39 @@ def ensure_registered(
         ):
             return existing
 
-    identity = client.register()
-    store.save(identity)
-    return identity
+    _sleep = sleep if sleep is not None else time.sleep
+    for poll in range(pending_max_polls + 1):
+        identity = client.register()
+        if identity is not None:
+            store.save(identity)
+            return identity
+        # None = TOFU pending(202) — 운영자 승인 대기. 폴링 계속.
+        if poll < pending_max_polls:
+            _sleep(pending_poll_interval_seconds)
+    raise RegistrationError("registration_pending", retryable=True, http_status=202)
 
 
 def make_http_register_transport(
     register_url: str,
-    provision_key: str,
     *,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     request: Callable[..., "tuple[int, Mapping[str, Any] | None]"] = request_json,
 ) -> RegisterTransport:
-    """실 HTTP RegisterTransport 조립 — POST {register_url} (Bearer 프로비저닝 키).
+    """실 HTTP RegisterTransport 조립 — POST {register_url} (TOFU · **인증 헤더 없음**·2026-07-17).
 
     스텁 제거: RegistrationClient 의 seam 에 꽂는 **실 클라이언트**(표준 urllib).
-      - 요청 body 는 이미 build_register_request 가 만든 와이어(dict) 그대로 전송.
-      - Authorization: Bearer <provision_key>(등록 라우트 계약·503 provisioning_not_configured 방지).
-      - HTTP 응답(2xx/4xx/5xx)은 (status, body) 로 반환 → RegistrationClient 가 분류.
+      - 요청 body 는 이미 build_register_request 가 만든 와이어(dict) 그대로 전송(deviceId·name?).
+      - 공유키(Bearer 프로비저닝 키) 제거 — 보안은 서버측 pending + 운영자 승인(TOFU)으로 이동.
+      - HTTP 응답(200 승인·202 pending·4xx/5xx)은 (status, body) 로 반환 → RegistrationClient 가 분류.
       - 네트워크 실패(HttpTransportError)는 그대로 raise → RegistrationClient 가 retryable 처리.
 
     `request` 는 테스트 주입 seam(기본 = http_client.request_json).
     """
 
     def transport(req_body: dict[str, Any]) -> "tuple[int, Mapping[str, Any] | None]":
-        return request(
-            "POST",
-            register_url,
-            body=req_body,
-            headers=bearer_headers(provision_key),
-            timeout=timeout,
-        )
+        return request("POST", register_url, body=req_body, timeout=timeout)
 
     return transport
-
-
-def read_provision_key(env: Mapping[str, str] | None = None) -> str:
-    """프로비저닝 키 읽기 — DISPENSER_PROVISION_KEY(부재 시 빈 문자열).
-
-    빈 값이면 서버가 401 invalid_provision_key(또는 503)로 거부 → 부팅 로그로 표면화.
-    """
-    e = env if env is not None else os.environ
-    v = e.get(DISPENSER_PROVISION_KEY_ENV)
-    return v.strip() if isinstance(v, str) else ""
 
 
 def read_hardware_id(

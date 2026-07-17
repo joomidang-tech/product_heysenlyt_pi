@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 
 from ..adapters.device_identity_store import DeviceIdentity, DeviceIdentityStore
 from ..adapters.fake_engine_adapter import FakeEnginePort
@@ -33,21 +33,22 @@ from ..adapters.registration_client import (
     ensure_registered,
     make_http_register_transport,
     read_hardware_id,
-    read_provision_key,
 )
 from ..adapters.sse_command_source_adapter import SseCommandSourceAdapter
 from ..config.server_target import ServerConfig
 from ..core.pump_guard import PUMP_PRESETS, SyringeSpec, resolve_syringe_capacity_ml
-from ..obs.log import STAGE_ERROR, StructuredLogger
+from ..obs.log import STAGE_ERROR, STAGE_PI_RECEIVED, StructuredLogger
 from ..persistence.file_idempotency_ledger import FileIdempotencyLedger
 from ..persistence.idempotency_ledger import IdempotencyLedger, InMemoryIdempotencyLedger
 from ..pipeline.recipe_resolver import RecipeResolver
 from ..ports.engine_port import EnginePort
 from ..ports.valve_port import ValvePort
 
-# 엔진 선택 env — fake(기본·E2E) | sy01b(실 RS485·아직 스텁). 02_infra §10.
+# 엔진 선택 env(override) — 미지정이면 **자동감지**(실 Pi+시리얼 어댑터→sy01b·아니면 fake). 02_infra §10.
+#   설치 시 안 넣어도 됨("URL만"). 명시하면 그 값 우선(fake|sy01b) — E2E/개발 고정용.
 SENLYT_ENGINE_ENV = "SENLYT_ENGINE"
 # pi 실행 모드(주문 큐 mode·flavor|fragrance) — 어느 컬렉션/큐를 구독·역보고할지.
+#   ⚠️ TOFU 후 **서버 배정(identity.mode)이 우선** — 이 env 는 서버 미배정 시 폴백일 뿐(더 이상 필수 아님).
 SENLYT_MODE_ENV = "SENLYT_MODE"
 # 정체성 파일 경로 override(기본 = LOG_DIR 또는 작업 디렉터리).
 SENLYT_IDENTITY_PATH_ENV = "SENLYT_IDENTITY_PATH"
@@ -57,8 +58,8 @@ SENLYT_DEVICE_NAME_ENV = "SENLYT_DEVICE_NAME"
 SENLYT_LEDGER_PATH_ENV = "SENLYT_LEDGER_PATH"
 # 펌프 addr 배치(모드별) — 예: "aroma:1,2,3;flavor:4" (E2E 02_infra §10 pi 서비스 env).
 SENLYT_PUMP_ADDRESSES_ENV = "PUMP_ADDRESSES"
-# 기주 밸브 선택(§9-1 v2) — fake(기본·시뮬) | gpio(실기기 라즈베리파이) | off(미결선 —
-#   valve 스텝 수신 시 fail-closed drop). 핀·유량은 설정값(하드코딩 금지·설계 §9-①).
+# 기주 밸브 선택 env(override·§9-1 v2) — 미지정이면 **자동감지**(실 Pi→gpio·아니면 fake).
+#   설치 시 안 넣어도 됨("URL만"). 명시: fake(시뮬) | gpio(실기기·명시 시 결선실패=fail-fast) | off(미결선 drop).
 SENLYT_VALVE_ENV = "SENLYT_VALVE"
 # 밸브 핀 매핑(BCM) — 기본 "sour:17,normal:27" (신기주=BCM17/물리핀11·베이스=BCM27/물리핀13·2026-07-17 실배선 정정).
 SENLYT_VALVE_PINS_ENV = "SENLYT_VALVE_PINS"
@@ -95,21 +96,46 @@ def _resolve_mode(environ: Mapping[str, str]) -> str:
     return "fragrance" if mode == "fragrance" else "flavor"
 
 
+def _gpio_available() -> bool:
+    """실 라즈베리파이 GPIO 존재 여부 — `/dev/gpiomem` 존재로 판정(비-Pi=부재).
+
+    **자동감지 게이트** — 비-Pi(CI·dev·docker 컨테이너)는 이 값이 False 라 engine/valve 가 항상
+    fake 로 떨어진다(결정적). 실 Pi 에서만 실 하드웨어 자동 선택이 활성화된다.
+    """
+    return Path("/dev/gpiomem").exists()
+
+
 def build_engine(
-    environ: Mapping[str, str], *, engine: EnginePort | None = None
+    environ: Mapping[str, str],
+    *,
+    engine: EnginePort | None = None,
+    on_pi: Callable[[], bool] | None = None,
+    port_lister: "Callable[[], list] | None" = None,
 ) -> EnginePort:
-    """엔진 조립 — 주입 우선, 없으면 SENLYT_ENGINE 분기(기본 fake·유일 mock)."""
+    """엔진 조립 — 주입 우선. **env 미지정이면 자동감지**(실 Pi + 시리얼 어댑터 존재 → sy01b·아니면 fake).
+
+    설치 시 `SENLYT_ENGINE` 을 안 넣어도 된다("URL만" 목표) — 실 Pi 에 USB-RS485 펌프 어댑터가
+    붙어 있으면 sy01b, 그 외(비-Pi·어댑터 미장착)는 fake 로 자동 결정한다. 명시하면 그 값이 우선.
+    `on_pi`·`port_lister` 는 테스트 주입 seam(기본 = 실 판정).
+    """
     if engine is not None:
         return engine
-    choice = environ.get(SENLYT_ENGINE_ENV, "fake").strip().lower()
+    from ..adapters.serial_port_discovery import discover_serial_port
+
+    raw = environ.get(SENLYT_ENGINE_ENV)
+    if raw is None or raw.strip() == "":
+        # 자동감지 — 실 Pi(gpiomem) 이고 시리얼 어댑터가 잡히면 sy01b, 아니면 fake.
+        is_pi = on_pi() if on_pi is not None else _gpio_available()
+        has_port = bool(discover_serial_port(environ, port_lister=port_lister))
+        choice = "sy01b" if (is_pi and has_port) else "fake"
+    else:
+        choice = raw.strip().lower()
     if choice == "sy01b":
-        # 실 RS485 어댑터는 아직 TODO 스텁 — 명시 선택 시에만 조립(실토출 불가·부팅 자체는 허용).
-        from ..adapters.serial_port_discovery import discover_serial_port
+        # 실 RS485 어댑터의 probe/dispense 는 hw-dev 워크오더(실 시리얼). 스텁이면 self-test 가 미준비를
+        # 표면화(fail-closed) — 부팅·등록 자체는 허용(제조 트래픽만 보류).
         from ..adapters.sy01b_engine_adapter import Sy01bEngineAdapter
 
-        # USB-RS485 포트 자동 발견(by-id·포트 흔들림/펌프 교체 재인식 견고). 미발견이면
-        # 기본 경로로 조립하되 부팅 self-test(pump_health.run_self_test)가 미준비를 표면화한다.
-        port = discover_serial_port(environ)
+        port = discover_serial_port(environ, port_lister=port_lister)
         return Sy01bEngineAdapter(port=port) if port else Sy01bEngineAdapter()
     return FakeEnginePort()
 
@@ -143,32 +169,50 @@ def _float_env(environ: Mapping[str, str], key: str, default: float) -> float:
 
 
 def build_valve(
-    environ: Mapping[str, str], *, valve: "ValvePort | None" = None
+    environ: Mapping[str, str],
+    *,
+    valve: "ValvePort | None" = None,
+    on_pi: Callable[[], bool] | None = None,
 ) -> ValvePort | None:
-    """기주 밸브 조립(§9-1 v2) — 주입 우선, 없으면 SENLYT_VALVE 분기(기본 fake).
+    """기주 밸브 조립(§9-1 v2) — 주입 우선. **env 미지정이면 자동감지**(실 Pi → gpio·아니면 fake).
 
-    - fake(기본): FakeValveAdapter — 실 GPIO 없이 개방 기록(FakeEngine 짝·E2E).
-    - gpio: GpioValveAdapter — 실기기(라즈베리파이·gpiozero lazy import). 결선 실패는
-      fail-fast(BootstrapError) — 잘못된 핀으로 조용히 뜨는 것 방지.
-    - off: None — valve 스텝 수신 시 Sequencer pre-flight 가 fail-closed drop(토출 0).
+    설치 시 `SENLYT_VALVE` 를 안 넣어도 된다("URL만" 목표) — 실 Pi(GPIO 존재)면 gpio, 비-Pi 는 fake.
+      - 자동 gpio 결선 실패(gpiozero 부재 등)는 **graceful fallback → fake**(자동 선택이라 부팅 중단 X).
+      - 명시 `gpio` 는 결선 실패 시 **fail-fast**(BootstrapError) — 운영자가 콕 집었으니 조용히 넘어가지 않음.
+      - `off`: None — valve 스텝 수신 시 Sequencer pre-flight 가 fail-closed drop(토출 0).
     """
     if valve is not None:
         return valve
-    choice = environ.get(SENLYT_VALVE_ENV, "fake").strip().lower()
-    if choice == "off":
-        return None
     flow = _float_env(environ, SENLYT_VALVE_FLOW_ENV, DEFAULT_FLOW_ML_PER_SEC)
     max_open = _float_env(environ, SENLYT_VALVE_MAX_OPEN_ENV, DEFAULT_MAX_OPEN_SEC)
-    if choice == "gpio":
+
+    def _gpio() -> "GpioValveAdapter":
         from ..adapters.valve_adapter import GpioValveAdapter
 
+        return GpioValveAdapter(
+            pins=_valve_pins_from_env(environ.get(SENLYT_VALVE_PINS_ENV)),
+            flow_ml_per_sec=flow,
+            max_open_sec=max_open,
+        )
+
+    raw = environ.get(SENLYT_VALVE_ENV)
+    if raw is None or raw.strip() == "":
+        # 자동감지 — 실 Pi 면 gpio(결선 실패 시 graceful fake), 아니면 fake.
+        is_pi = on_pi() if on_pi is not None else _gpio_available()
+        if is_pi:
+            try:
+                return _gpio()
+            except Exception:  # noqa: BLE001 — 자동 선택 실패는 안전 폴백(fake), 부팅 중단 없음.
+                return FakeValveAdapter(flow_ml_per_sec=flow, max_open_sec=max_open)
+        return FakeValveAdapter(flow_ml_per_sec=flow, max_open_sec=max_open)
+
+    choice = raw.strip().lower()
+    if choice == "off":
+        return None
+    if choice == "gpio":
         try:
-            return GpioValveAdapter(
-                pins=_valve_pins_from_env(environ.get(SENLYT_VALVE_PINS_ENV)),
-                flow_ml_per_sec=flow,
-                max_open_sec=max_open,
-            )
-        except Exception as e:  # gpiozero 부재·핀 결선 실패 — fail-fast 표면화.
+            return _gpio()
+        except Exception as e:  # 명시 선택 — fail-fast(잘못된 핀으로 조용히 뜨는 것 방지).
             raise BootstrapError(f"GPIO 밸브 결선 실패: {e}") from e
     return FakeValveAdapter(flow_ml_per_sec=flow, max_open_sec=max_open)
 
@@ -265,9 +309,8 @@ def build_components(
             raise BootstrapError(
                 "deviceId(수집 시리얼) 확보 불가 — SENLYT_HARDWARE_ID 또는 /proc/cpuinfo Serial 필요"
             )
-        transport = make_http_register_transport(
-            server_config.register_url, read_provision_key(environ)
-        )
+        # TOFU(2026-07-17): 공유키 없음 — deviceId 만 제시(등록 202 pending → 운영자 승인 후 토큰).
+        transport = make_http_register_transport(server_config.register_url)
         client = RegistrationClient(
             transport,
             device_id=device_id,
@@ -293,7 +336,9 @@ def build_components(
     log.bind_device(identity.device_id)
 
     # 3) 실 어댑터 조립 — 동일 base·동일 dispenserToken·동일 logger.
-    mode = _resolve_mode(environ)
+    # mode 는 서버 배정(identity.mode·TOFU 승인 시 하달)이 **우선** — 없으면 env(SENLYT_MODE)→flavor 폴백.
+    #   서버가 SoT(운영자가 /admin 에서 기기 모드 배정) → SENLYT_MODE env 는 더 이상 필수가 아니다.
+    mode = identity.mode or _resolve_mode(environ)
     command_source = SseCommandSourceAdapter(
         server_config=server_config,
         bearer_token=identity.dispenser_token,
@@ -307,14 +352,27 @@ def build_components(
         logger=log,
     )
 
+    # 4) 엔진·밸브 자동감지 + 부팅 자가진단 로그(눈에 띄게) — "URL만" 설치에서 실제 하드웨어를
+    #    무엇으로 잡았는지 운영자가 로그로 확인한다(silent auto 금지 — auto + visible self-diagnostic).
+    engine_adapter = build_engine(environ, engine=engine)
+    valve_adapter = build_valve(environ)
+    log.event(
+        "하드웨어 자가진단 — 엔진·밸브 자동감지 결과",
+        stage=STAGE_PI_RECEIVED,
+        gpio_available=_gpio_available(),
+        engine=type(engine_adapter).__name__,
+        valve=type(valve_adapter).__name__ if valve_adapter is not None else "off",
+        mode=mode,
+    )
+
     return DaemonComponents(
         device_id=identity.device_id,
         server_config=server_config,
         identity=identity,
         command_source=command_source,
         status_sink=status_sink,
-        engine=build_engine(environ, engine=engine),
-        valve=build_valve(environ),
+        engine=engine_adapter,
+        valve=valve_adapter,
         ledger=ledger if ledger is not None else InMemoryIdempotencyLedger(),
         logger=log,
     )

@@ -258,8 +258,8 @@ def _is_status_patch(r: RecordedRequest) -> bool:
 def test_registration_and_token_handoff_over_real_http(tmp_path) -> None:
     """부팅 시 실 register 왕복 + 발급 dispenserToken 이 후속 SSE/status Bearer 로 이어진다.
 
-    갭 봉합: register 는 provision key 로, 이후는 dispenserToken 으로 Bearer 가 바뀌는 지점을
-    실 소켓으로 통합 검증(종전엔 어댑터 속성만 확인).
+    갭 봉합: register 는 인증 헤더 없음(TOFU·공유키 제거), 이후는 dispenserToken 으로 Bearer 가
+    생기는 지점을 실 소켓으로 통합 검증(종전엔 어댑터 속성만 확인).
     """
     handler = WebHandler(dispenser_token="disp-token-1")
     with running_daemon(tmp_path, handler, hardware_id="hw-e2e") as (srv, daemon, comp):
@@ -276,8 +276,8 @@ def test_registration_and_token_handoff_over_real_http(tmp_path) -> None:
         # deviceId = 수집 시리얼(서버 echo 아님).
         assert reg.method == "POST"
         assert reg.json()["deviceId"] == "hw-e2e"
-        # register Bearer = provision key.
-        assert reg.header("Authorization") == "Bearer prov"
+        # register 는 인증 헤더 없음(TOFU · 공유키 제거).
+        assert reg.header("Authorization") is None
 
         # 데몬이 응답 토큰을 보관.
         assert comp.identity.dispenser_token == "disp-token-1"

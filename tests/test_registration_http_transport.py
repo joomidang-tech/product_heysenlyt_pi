@@ -1,8 +1,9 @@
-"""실 HTTP RegisterTransport 테스트 — make_http_register_transport (스텁 제거 검증).
+"""실 HTTP RegisterTransport 테스트 — make_http_register_transport (스텁 제거 검증 · TOFU).
 
-로컬 fake 서버로 POST /api/dispensers/register 요청 shaping(Bearer 프로비저닝 키·body)·
-상태 분류(2xx/4xx/5xx)·네트워크 전송오류를 검증하고, RegistrationClient 와 실제 결합해
-재시도(R=3)까지 실 소켓으로 확인한다.
+로컬 fake 서버로 POST /api/dispensers/register 요청 shaping(**인증 헤더 없음**·body)·
+상태 분류(200 승인·202 pending·4xx/5xx)·네트워크 전송오류를 검증하고, RegistrationClient 와
+실제 결합해 재시도(R=3)·pending(None)까지 실 소켓으로 확인한다.
+공유키(프로비저닝 키) 제거(2026-07-17) — 보안은 서버측 pending + 운영자 승인(TOFU)으로 이동.
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ from senlyt_pi.adapters.registration_client import (
     RegistrationClient,
     RegistrationError,
     make_http_register_transport,
-    read_provision_key,
 )
 from support_http import FakeHttpServer
 
@@ -22,33 +22,29 @@ from support_http import FakeHttpServer
 OK_BODY = {"deviceId": "server-echo-ignored", "dispenserToken": "tok-1", "exp": 2_000_000_000}
 
 
-def test_transport_shapes_request_and_returns_ok() -> None:
+def test_transport_shapes_request_no_auth_header() -> None:
+    """TOFU: body(deviceId·name)만 전송 · Authorization 헤더 없음."""
     with FakeHttpServer() as srv:
         srv.set_handler(lambda req: {"status": 200, "json": OK_BODY})
-        transport = make_http_register_transport(
-            f"{srv.base_url}/api/dispensers/register", "prov-key-xyz"
-        )
+        transport = make_http_register_transport(f"{srv.base_url}/api/dispensers/register")
         status, body = transport({"deviceId": "10000000abcd1234", "name": "매장1"})
         assert status == 200
         assert body == OK_BODY
         rec = srv.requests[-1]
         assert rec.method == "POST"
         assert rec.path == "/api/dispensers/register"
-        assert rec.header("Authorization") == "Bearer prov-key-xyz"
+        assert rec.header("Authorization") is None  # 공유키 제거 — 인증 헤더 없음.
         assert rec.json() == {"deviceId": "10000000abcd1234", "name": "매장1"}
 
 
-def test_transport_returns_4xx_status_not_raise() -> None:
+def test_transport_returns_202_pending_not_raise() -> None:
+    """202 pending(승인 대기)은 예외 아님 — (status, body) 그대로 반환(RegistrationClient 가 분류)."""
     with FakeHttpServer() as srv:
-        srv.set_handler(
-            lambda req: {"status": 401, "json": {"code": "invalid_provision_key"}}
-        )
-        transport = make_http_register_transport(
-            f"{srv.base_url}/api/dispensers/register", "bad"
-        )
+        srv.set_handler(lambda req: {"status": 202, "json": {"deviceId": "hw-1", "status": "pending"}})
+        transport = make_http_register_transport(f"{srv.base_url}/api/dispensers/register")
         status, body = transport({"deviceId": "hw-1"})
-        assert status == 401
-        assert body == {"code": "invalid_provision_key"}
+        assert status == 202
+        assert body == {"deviceId": "hw-1", "status": "pending"}
 
 
 def test_transport_network_failure_raises_transport_error() -> None:
@@ -56,7 +52,7 @@ def test_transport_network_failure_raises_transport_error() -> None:
         raise HttpTransportError("연결 거부")
 
     transport = make_http_register_transport(
-        "http://web:3000/api/dispensers/register", "k", request=raising_request
+        "http://web:3000/api/dispensers/register", request=raising_request
     )
     with pytest.raises(HttpTransportError):
         transport({"deviceId": "hw-1"})
@@ -66,9 +62,7 @@ def test_client_with_real_transport_registers() -> None:
     """RegistrationClient + 실 HTTP transport — 성공 경로 실 소켓 왕복."""
     with FakeHttpServer() as srv:
         srv.set_handler(lambda req: {"status": 200, "json": OK_BODY})
-        transport = make_http_register_transport(
-            f"{srv.base_url}/api/dispensers/register", "k"
-        )
+        transport = make_http_register_transport(f"{srv.base_url}/api/dispensers/register")
         identity = RegistrationClient(
             transport, device_id="hw-serial", name=None, sleep=lambda _s: None
         ).register()
@@ -90,9 +84,7 @@ def test_client_retries_5xx_then_succeeds_over_socket() -> None:
 
     with FakeHttpServer() as srv:
         srv.set_handler(handler)
-        transport = make_http_register_transport(
-            f"{srv.base_url}/api/dispensers/register", "k"
-        )
+        transport = make_http_register_transport(f"{srv.base_url}/api/dispensers/register")
         identity = RegistrationClient(
             transport, device_id="hw", sleep=lambda _s: None
         ).register()
@@ -100,24 +92,23 @@ def test_client_retries_5xx_then_succeeds_over_socket() -> None:
         assert calls["n"] == 3
 
 
-def test_client_permanent_401_no_retry_over_socket() -> None:
+def test_client_pending_202_returns_none_over_socket() -> None:
+    """TOFU: 202 pending 응답 → register() 는 None(승인 대기·오류 아님) · 재시도 없이 1회."""
     with FakeHttpServer() as srv:
-        srv.set_handler(
-            lambda req: {"status": 401, "json": {"code": "invalid_provision_key"}}
-        )
-        transport = make_http_register_transport(
-            f"{srv.base_url}/api/dispensers/register", "bad"
-        )
+        srv.set_handler(lambda req: {"status": 202, "json": {"status": "pending"}})
+        transport = make_http_register_transport(f"{srv.base_url}/api/dispensers/register")
+        result = RegistrationClient(transport, device_id="hw", sleep=lambda _s: None).register()
+        assert result is None
+        assert len(srv.requests) == 1  # pending 은 register() 내부 재시도 없음.
+
+
+def test_client_permanent_400_no_retry_over_socket() -> None:
+    """400 invalid_request — 구성 오류는 재시도 없이 즉시중단(1회)."""
+    with FakeHttpServer() as srv:
+        srv.set_handler(lambda req: {"status": 400, "json": {"code": "invalid_request"}})
+        transport = make_http_register_transport(f"{srv.base_url}/api/dispensers/register")
         with pytest.raises(RegistrationError) as ei:
             RegistrationClient(transport, device_id="hw", sleep=lambda _s: None).register()
         assert ei.value.retryable is False
-        assert ei.value.code == "invalid_provision_key"
+        assert ei.value.code == "invalid_request"
         assert len(srv.requests) == 1  # 재시도 없음.
-
-
-class TestReadProvisionKey:
-    def test_reads_and_trims(self) -> None:
-        assert read_provision_key({"DISPENSER_PROVISION_KEY": " k123 "}) == "k123"
-
-    def test_absent_is_empty(self) -> None:
-        assert read_provision_key({}) == ""

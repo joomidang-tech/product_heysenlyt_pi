@@ -1,9 +1,9 @@
 """디바이스 등록 테스트 — RegisterRequest/RegisterResponse 계약 (05_api §8-1, D-A 2026-07-10).
 
 [D-A] deviceId = pi 수집 시리얼 그대로 — pi 가 시리얼을 제시하고, 서버 응답의 deviceId(echo)는
-정체성을 덮어쓰지 않는다(자기 시리얼이 권위). 등록 성공/실패 재시도(기존 R=3 준용)·permanent(400/401)
-즉시중단·정체성 파일 영속·만료 재등록(ensure_registered)·시리얼 seam 을 고정한다.
-전송은 전부 fake(seam 주입).
+정체성을 덮어쓰지 않는다(자기 시리얼이 권위). 등록 성공/실패 재시도(기존 R=3 준용)·permanent(400)
+즉시중단·**TOFU 202 pending 승인 폴링**·정체성 파일 영속·만료 재등록(ensure_registered)·시리얼 seam
+을 고정한다. 공유키(프로비저닝 키) 제거(2026-07-17) — 보안은 pending+운영자 승인으로. 전송은 fake(seam).
 """
 
 from pathlib import Path
@@ -86,11 +86,29 @@ class TestRegistrationRetry:
         assert identity.dispenser_token == "tok-1"
 
     def test_retryable_5xx_then_success(self):
-        """500 register_failed·503 provisioning_not_configured → 재시도 후 성공."""
+        """5xx(register_failed) → 재시도 후 성공."""
         t = ScriptedTransport([(500, None), (503, None), (200, OK_BODY)])
         identity = client(t).register()
         assert identity.device_id == SERIAL
         assert len(t.calls) == 3
+
+    def test_pending_202_returns_none(self):
+        """TOFU: 202 pending(승인 대기) → register() 는 None(오류 아님·폴링은 상위)."""
+        t = ScriptedTransport([(202, {"deviceId": SERIAL, "status": "pending"})])
+        assert client(t).register() is None
+        assert len(t.calls) == 1
+
+    def test_approved_response_carries_mode(self):
+        """승인(200) 응답의 mode(서버 배정)를 정체성에 싣는다 — SENLYT_MODE env 대체."""
+        t = ScriptedTransport(
+            [(200, {"dispenserToken": "tok-1", "exp": 2_000_000_000, "mode": "fragrance"})]
+        )
+        identity = client(t).register()
+        assert identity.mode == "fragrance"
+
+    def test_approved_without_mode_is_none(self):
+        """mode 미배정 승인 → identity.mode=None(pi 는 env→flavor 폴백)."""
+        assert client(ScriptedTransport([(200, OK_BODY)])).register().mode is None
 
     def test_transport_exception_is_retryable(self):
         t = ScriptedTransport([ConnectionError("down"), (200, OK_BODY)])
@@ -105,15 +123,6 @@ class TestRegistrationRetry:
         assert ei.value.retryable is True
         assert ei.value.code == "register_failed"
         assert len(t.calls) == 4  # 1 + max_retries(3).
-
-    def test_permanent_401_no_retry(self):
-        """401 invalid_provision_key — 구성 오류는 재시도 없이 즉시중단(1회 호출)."""
-        t = ScriptedTransport([(401, {"error": "invalid_provision_key"}), (200, OK_BODY)])
-        with pytest.raises(RegistrationError) as ei:
-            client(t).register()
-        assert ei.value.retryable is False
-        assert ei.value.code == "invalid_provision_key"
-        assert len(t.calls) == 1
 
     def test_permanent_400_no_retry(self):
         t = ScriptedTransport([(400, None)])
@@ -213,6 +222,34 @@ class TestEnsureRegistered:
         identity = ensure_registered(store, client(t), now_seconds=1_000)
         assert len(t.calls) == 1
         assert identity.device_id == SERIAL  # 현재 시리얼로 승격.
+
+    def test_polls_pending_until_approved(self, tmp_path: Path):
+        """TOFU: 202 pending 이 이어지면 운영자 승인(200)까지 폴링 — 사이마다 sleep."""
+        store = DeviceIdentityStore(tmp_path / "identity.json")
+        t = ScriptedTransport(
+            [(202, {"status": "pending"}), (202, {"status": "pending"}), (200, OK_BODY)]
+        )
+        slept: list[float] = []
+        identity = ensure_registered(
+            store, client(t), now_seconds=1_000, pending_poll_interval_seconds=3.0, sleep=slept.append
+        )
+        assert identity.device_id == SERIAL
+        assert len(t.calls) == 3  # pending·pending·approved
+        assert slept == [3.0, 3.0]  # 두 pending 뒤에만 대기
+        assert store.load() == identity  # 승인 후 영속
+
+    def test_pending_exhausted_raises(self, tmp_path: Path):
+        """승인이 pending_max_polls 안에 안 오면 registration_pending 예외 → restart 재시도."""
+        store = DeviceIdentityStore(tmp_path / "identity.json")
+        t = ScriptedTransport([(202, {"status": "pending"})] * 10)
+        with pytest.raises(RegistrationError) as ei:
+            ensure_registered(
+                store, client(t), now_seconds=1_000, pending_max_polls=3, sleep=lambda _s: None
+            )
+        assert ei.value.code == "registration_pending"
+        assert ei.value.http_status == 202
+        assert len(t.calls) == 4  # 1 + pending_max_polls(3)
+        assert store.load() is None  # 미승인 = 정체성 미영속
 
 
 class TestHardwareIdSeam:
