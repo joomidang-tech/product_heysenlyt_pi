@@ -60,7 +60,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Callable, Iterable, Protocol
+from typing import Callable, Iterable, Protocol, Sequence
 
 from ..core.pump_guard import PumpPreset, SyringeSpec, clamp_pump_preset
 from ..ports.engine_port import (
@@ -82,6 +82,14 @@ STATUS_ERROR_MASK = 0x0F  # 상태바이트 하위 4비트 = 에러코드
 STATUS_READY_BIT = 0x20  # bit5 = Ready(모터 정지·명령 수락 가능)
 STATUS_QUERY = "?"  # 상태 조회(모터 회전 중에도 수락되는 몇 안 되는 명령)
 TERMINATE = "TR"  # in-flight 이동 중단 + 포트 클린
+# ── 브로드캐스트(전 펌프 동시) — v1.1.0 RealPumpService._sendBroadcast 미러 ──────────────
+#   `/_{cmd}` = 전 펌프가 같은 명령을 동시에 수신(명령 1발 → 반이중 RS485 경합 없음 = D38 stage:0
+#   실패의 근본 회피). ⚠️ SY-01B 매뉴얼 §3.4 는 "_"(0x5F)를 스위치47 주소로만 적고 "브로드캐스트"로
+#   문서화하지 않는다 — v1.1.0 실기기 관례가 유일 근거. 그래서 **브로드캐스트 프레임 자체의 응답은
+#   읽지 않고**(무응답/충돌은 브로드캐스트의 물리 속성), 매 브로드캐스트 뒤 **각 펌프를 개별 `?` 로
+#   확인**해 연결성·수신을 검증한다(안 닿은 펌프는 무응답/미준비로 드러난다 — 손상 위험 0).
+BROADCAST_ADDR = "_"
+SAFE_PORT = 12  # 안전 포트 = Air(누액 없는 자세) — v1.1.0 initializeAll [4/4] I12R.
 
 DEFAULT_BAUDRATE = 9600  # 8N1
 
@@ -97,6 +105,11 @@ DEFAULT_INIT_TIMEOUT_S = 30.0
 POLL_INTERVAL_S = 0.05
 # 송신 후 펌프가 응답을 만들 시간(v1.1.0 `Future.delayed(20ms)` 원리).
 WRITE_SETTLE_S = 0.02
+# 브로드캐스트 송신 후 펌프들이 명령을 소화할 시간(v1.1.0 `_sendBroadcast` 50ms). 응답을 안 읽으므로
+#   이 대기 + 뒤이은 **개별 확인**으로만 진행을 보장한다.
+BROADCAST_SETTLE_S = 0.05
+# 브로드캐스트 초기화 스텝(TR·U200) 사이 간격(v1.1.0 initializeAll 각 500ms).
+BROADCAST_STEP_GAP_S = 0.5
 # 프로브(장착 감지) — read-only 라 짧게. 살아있는 펌프는 첫 폴에서 답한다.
 PROBE_READ_TIMEOUT_S = 1.5
 PROBE_MAX_ATTEMPTS = 5
@@ -444,6 +457,86 @@ class Sy01bEngineAdapter:
         """
         self._initialized.clear()
         return EngineResult(raw_error_code=0, detail="setup cache cleared")
+
+    # ── 브로드캐스트 초기화 (전 펌프 동시 홈 — v1.1.0 RealPumpService.initializeAll 미러) ──────
+    def _broadcast(self, command: str) -> None:
+        """`/_{command}[CR]` 전 펌프 동시 송신 — **프레임 자체의 응답은 읽지 않는다**.
+
+        브로드캐스트는 무응답/충돌이 속성이라(BROADCAST_ADDR 주석) 여기선 write 만 하고, 연결성·수신
+        검증은 **호출자가 매 브로드캐스트 뒤 각 펌프를 개별 `?` 로** 확인한다. 버스 락은 write 만
+        감싸고, 다음 개별 확인이 입력버퍼를 flush 하므로 충돌 잔여 프레임은 정리된다.
+        """
+        frame = f"{FRAME_START}{BROADCAST_ADDR}{command}{FRAME_END}".encode("ascii")
+        conn = self._conn()
+        with self._bus:
+            _reset = getattr(conn, "reset_input_buffer", None)
+            if callable(_reset):
+                try:
+                    _reset()
+                except Exception:  # noqa: BLE001 — flush 실패는 무시(최선노력).
+                    pass
+            conn.write(frame)
+            time.sleep(WRITE_SETTLE_S)
+        time.sleep(BROADCAST_SETTLE_S)  # 무응답이라 이 대기 + 뒤의 개별 확인으로만 보장.
+
+    def _verify_alive(self, addrs: "Sequence[int]", results: "dict[int, int]") -> None:
+        """각 펌프가 **응답하는지**(연결성) 개별 `?` 로 확인 — 무응답이면 그 펌프를 실패로 기록.
+
+        브로드캐스트 직후 호출한다: 방금 `/_` 명령이 그 펌프에 닿았고 펌프가 살아있으면 상태 프레임이
+        온다(에러코드여도 '응답함'). 무응답(`_NO_RESPONSE`)만 연결 끊김/미수신으로 본다 — `TR`·`U200`
+        같이 '홈 완료'가 아직인 단계에선 에러코드(7 미초기화 등)는 정상 진행이므로 실패로 보지 않는다.
+        이미 실패(!=0)로 찍힌 펌프는 건너뛴다.
+        """
+        for a in addrs:
+            if results.get(a, 0) != 0:
+                continue
+            code, _ready = self._query_status(a)
+            if code == _NO_RESPONSE:
+                results[a] = _NO_RESPONSE  # 브로드캐스트 미수신/연결 끊김.
+
+    def initialize_broadcast(self, addrs: "Sequence[int]", spec: SyringeSpec) -> "dict[int, int]":
+        """전 펌프 **동시** 초기화 — v1.1.0 `RealPumpService.initializeAll` 미러(브로드캐스트 홈).
+
+        `/_TR → /_U{tc},{stall}R → /_{initCommand} → /_I{safe}R` 를 **한 발씩** 브로드캐스트해 전
+        펌프가 같은 명령을 동시에 받게 하고(명령 1발 → 버스 경합 없음), **매 브로드캐스트 뒤 각 펌프를
+        개별 확인**한다 — TR·U200 뒤엔 연결성(`?` 응답 유무), 홈(`Z`)·안전포트(`I`) 뒤엔 Ready 폴링.
+        per-pump 순차(run_op)와 달리 홈 탐색이 동시에 돌아 v1.1.0 병렬 속도가 난다.
+
+        반환 = {addr: error_code}(0=그 펌프 정상). 힘·스톨전류는 `spec` 에서 파생(모드 분기 없음).
+        ⚠️ `"_"` 가 실기기서 실제 전 펌프에 닿는지는 관례 의존(BROADCAST_ADDR) — 안 닿으면 개별
+        확인이 무응답/타임아웃으로 그 펌프를 실패 기록(물리 손상 없음·안전 실패).
+        """
+        targets = [a for a in addrs if a >= 1]
+        results: dict[int, int] = {a: 0 for a in targets}
+        if not targets:
+            return results
+        # 초기화 = estop 복구 경로 — 로컬 래치 해제 + 셋업 캐시 무효화(개별 initialize 와 동일 이중 방어).
+        self._estop.clear()
+        for a in targets:
+            self._initialized.discard(a)
+        # [0/4] 상태 리셋(TR) — 결과 검증 안 함(에러 지우기·브릭 회귀 봉합 취지) + 연결성만 확인.
+        self._broadcast(TERMINATE)
+        time.sleep(BROADCAST_STEP_GAP_S)
+        self._verify_alive(targets, results)
+        # [1/4] 스톨전류(과부하 감지선·Code 9 방어) — spec 파생 + 연결성 확인.
+        self._broadcast(f"U{self.preset.pump_syringe_type_code},{spec.stall_current}R")
+        time.sleep(BROADCAST_STEP_GAP_S)
+        self._verify_alive(targets, results)
+        # [2/4] 원점 복귀(홈) — Z/Z1/Z2(힘은 spec.init_command 이 용량에서 파생). 각 펌프 Ready 폴.
+        self._broadcast(spec.init_command)
+        for a in targets:
+            if results[a] == 0:
+                results[a] = self._poll_until_ready(a, self.init_timeout_s)
+        # [3/4] 안전 포트(Air) — 홈이 잡힌 펌프만 의미. 브로드캐스트 후 각 성공 펌프 Ready 폴.
+        self._broadcast(f"I{SAFE_PORT}R")
+        for a in targets:
+            if results[a] == 0:
+                results[a] = self._poll_until_ready(a, self.read_timeout_s)
+        # [4/4] 전부 정상인 펌프만 셋업 캐시에 등록(다음 토출이 재초기화 건너뛰게).
+        for a in targets:
+            if results[a] == 0:
+                self._initialized.add(a)
+        return results
 
     # ── 토출 ────────────────────────────────────────────────────────────────
     def _cycle(self, cmd: EngineDispenseCommand, *, aspirate_only: bool) -> EngineResult:

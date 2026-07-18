@@ -45,7 +45,7 @@ from ..core.wire_messages import RecipeStep
 from ..obs.log import STAGE_STEP_EXEC, StructuredLogger
 from ..persistence.file_idempotency_ledger import FileIdempotencyLedger
 from ..persistence.idempotency_ledger import LedgerVerdict
-from ..ports.engine_port import EngineDispenseCommand, EnginePort
+from ..ports.engine_port import OP_INITIALIZE, EngineDispenseCommand, EnginePort
 from ..ports.valve_port import ValvePort
 from .engine_executor import EngineExecutor
 from .recipe_resolver import (
@@ -421,6 +421,14 @@ class PumpSequencer:
         """
         if len(stage_steps) == 1:
             return [self._run_one(stage_steps[0])]
+        # ── 브로드캐스트 초기화 합치기(v1.1.0 병렬 홈) ─────────────────────────────
+        #   같은 stage 가 **전부 `initialize` op** 이면, per-pump 동시 명령(반이중 RS485 경합으로
+        #   초기화가 깨졌던 D38 stage:0)이 아니라 **브로드캐스트 1콜**(명령 1발·경합 없음 + 매 발 뒤
+        #   개별 연결성 확인)로 처리한다. 브로드캐스트 미지원 엔진(Fake/구 어댑터)은 None → 아래
+        #   일반 동시 실행으로 폴백(테스트·하위호환 무영향).
+        coalesced = self._maybe_broadcast_init(stage_steps)
+        if coalesced is not None:
+            return coalesced
         pool = self._ensure_pool()
         # submit 자체의 예외(워커 스레드 생성 실패 등·리뷰 P2 봉합)도 가드 — 이미 제출된
         # future 는 **반드시 완주 대기**(고아 in-flight 모션 금지) 후 실패 결과로 집계한다.
@@ -436,6 +444,48 @@ class PumpSequencer:
             (False, StatusErrorCode.ENGINE_ERROR_PERMANENT) for _ in range(submit_failures)
         )
         return results
+
+    def _maybe_broadcast_init(
+        self, stage_steps: "Sequence[ResolvedStep | ResolvedValveStep | ResolvedOpStep]"
+    ) -> "list[tuple[bool, StatusErrorCode | None]] | None":
+        """stage 가 **전부 initialize op** 이고 엔진이 브로드캐스트를 지원하면 1콜로 합쳐 실행.
+
+        반환: 해당·지원 시 per-step (ok, code) 목록 / 아니면 None(일반 동시 실행 폴백).
+        브로드캐스트가 각 펌프에 닿았는지는 어댑터 `initialize_broadcast` 가 **펌프별로** 판정해
+        {addr: code} 로 돌려주므로, 여기서 step 순서대로 매핑해 보고한다(연결성 = 개별 확인 결과).
+        """
+        if not all(
+            isinstance(s, ResolvedOpStep) and s.op == OP_INITIALIZE for s in stage_steps
+        ):
+            return None
+        init_broadcast = getattr(self._executor.engine, "initialize_broadcast", None)
+        if not callable(init_broadcast):
+            return None  # Fake/구 어댑터 — 일반 per-pump 동시 실행으로 폴백.
+        addrs = [s.pump_addr for s in stage_steps]
+        spec = stage_steps[0].spec
+        try:
+            results = init_broadcast(addrs, spec)
+        except Exception as exc:  # noqa: BLE001 — 브로드캐스트 실패도 흡수(형제 완주 계약·다음 stage 미진입).
+            if self._log is not None:
+                self._log.error(
+                    "브로드캐스트 초기화 실패 — 전 펌프",
+                    stage=STAGE_STEP_EXEC,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            return [(False, StatusErrorCode.ENGINE_ERROR_PERMANENT) for _ in stage_steps]
+        out: list[tuple[bool, StatusErrorCode | None]] = []
+        for s in stage_steps:
+            code = results.get(s.pump_addr, -1)  # 목록에 없으면(방어) 실패 처리.
+            ok = code == 0
+            if not ok and self._log is not None:
+                self._log.error(
+                    f"브로드캐스트 초기화 실패 — pump={s.pump_addr}",
+                    stage=STAGE_STEP_EXEC,
+                    engineCode=code,
+                    pumpAddr=s.pump_addr,
+                )
+            out.append((ok, None if ok else StatusErrorCode.ENGINE_ERROR_PERMANENT))
+        return out
 
     def _run_one(
         self, step: "ResolvedStep | ResolvedValveStep | ResolvedOpStep"
