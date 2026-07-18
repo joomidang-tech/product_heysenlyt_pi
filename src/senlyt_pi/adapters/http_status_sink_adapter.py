@@ -122,7 +122,7 @@ class HttpStatusSinkAdapter:
                 stage=STAGE_STATUS_REPORT,
                 trace_id=report.trace_id,
                 order_id=_order_id_of(report.id),
-                depth=self._oq.depth,
+                queueDepth=self._oq.depth,  # 서버 allowlist 키명과 일치(구 depth 는 폐기되던 오탈자)
             )
 
     def flush_offline_queue(self) -> int:

@@ -57,10 +57,13 @@ from ..ports.status_sink_port import StatusSinkPort, TraceSpan
 from .dispatcher import Dispatcher, RecipeInterpreter
 
 
-# 로그→trace 스팬 버퍼 상한 — 서버 전송 실패가 계속되면 WARN/ERROR 로그가 무한 누적하는 것을
-#   막는다(전송 실패 자체가 로그를 만들면 피드백 폭주). 상한 초과분은 드롭(dispense 스팬은 별도로
-#   항상 append — 이 상한은 로그 스팬에만 적용). durable 버퍼·재연결 flush 는 후속(§5 견고성).
+# 로그→trace 스팬 버퍼 상한 — 서버 전송 실패가 계속되면 로그가 무한 누적하는 것을 막는다(전송
+#   실패 자체가 로그를 만들면 피드백 폭주). 상한 초과분은 드롭하되 **드롭 건수를 세어**(silent 금지)
+#   다음 flush 에 합성 WARN 으로 남긴다(dispense 스팬은 별도로 항상 append — 이 상한은 로그 스팬만).
 _LOG_TRACE_BUFFER_CAP = 500
+
+# severity 서열(DEBUG<INFO<WARN<ERROR) — ship_log_min_severity 게이트 비교용.
+_SEVERITY_RANK = {"DEBUG": 0, "INFO": 1, "WARN": 2, "ERROR": 3}
 
 
 def _now_iso_ms() -> str:
@@ -148,6 +151,13 @@ class DaemonDeps:
     poll_interval_s: float = 1.0
     # heartbeat 주기(초·§9-3). 0 이하면 heartbeat 스레드 비활성(테스트가 수동 구동).
     heartbeat_interval_s: float = 30.0
+    # 서버로 실어보낼 로그의 최소 심각도(2026-07-18 개편 — "최대한 자세히" 요구). 기본 INFO =
+    #   INFO·WARN·ERROR 를 전부 서버로 합류시켜 "무슨 작업 하다 실패했나"의 앞 맥락까지 admin 에서
+    #   본다. DEBUG(폴 단위 잡음)만 제외. 볼륨/비용이 문제되면 "WARN" 으로 올려 실패만 전송.
+    ship_log_min_severity: str = "INFO"
+    # 관측 로그(pi.log.*) 배치 flush 주기(초). ERROR/WARN 은 이와 무관하게 즉시 flush 되고,
+    #   INFO 등 일반 로그는 이 주기로 묶어 전송(HTTP 오버헤드 절감). 실패는 안 밀리고 맥락은 촘촘.
+    trace_flush_interval_s: float = 10.0
     # 긴급정지 신호 폴 소스(§9-4·GET /api/dispenser/estop) — `() -> (active, requestedAt)`.
     #   ⚠️ **명령 폴과 무관한 전용 스레드**가 이걸 fast-poll 한다. 제조 중엔 메인 폴이 블록되므로,
     #   estop 을 큐가 아니라 이 별도 축으로 받아야 제조 중에도 즉시 전 펌프를 멈춘다. None = 비활성
@@ -189,9 +199,15 @@ class SenlytDaemon:
                 setter(self._stop)
         # heartbeat 에 실을 최근 오류(관측·best-effort).
         self._last_error: StatusErrorCode | None = None
-        # ship_trace 배치 버퍼(heartbeat/shutdown 이 flush).
+        # ship_trace 배치 버퍼(heartbeat/shutdown/sender 가 flush).
         self._trace_lock = threading.Lock()
         self._trace_buffer: list[TraceSpan] = []
+        # 관측 로그 즉시 flush 신호 — WARN/ERROR 도착 시 set → sender 가 곧바로 전송(실패는 안 밀림).
+        self._trace_flush_now = threading.Event()
+        # 버퍼 상한 초과로 드롭한 로그 스팬 수(silent 금지 — flush 시 합성 WARN 으로 보고 후 리셋).
+        self._trace_dropped = 0
+        # 서버 전송 최소 심각도 서열(게이트 비교값). 기본 INFO.
+        self._ship_min_rank = _SEVERITY_RANK.get(str(deps.ship_log_min_severity).upper(), 1)
         self._hb_thread: threading.Thread | None = None
         # 긴급정지 감시 스레드(§9-4) — estop 신호를 fast-poll(별도 축). boot() 에서만 기동.
         self._estop_thread: threading.Thread | None = None
@@ -568,15 +584,19 @@ class SenlytDaemon:
         pi 운영 로그(SSE 오류·폴 실패·부팅 자가진단·타임아웃)를 web·server 와 **같은 화면·같은
         traceId** 로 합류시킨다 — "왜 멈췄나"를 admin 에서 본다(D32 멈춤 처리의 관측성 짝).
 
-        §5 정책(2026-07-18 권장 기본값):
-          - severity 게이트 = **WARN/ERROR 만**(볼륨·비용). 사건 재현 시 전량은 후속 옵션.
+        §5 정책(2026-07-18 개편 — "최대한 자세히"):
+          - severity 게이트 = **ship_log_min_severity 이상**(기본 INFO). INFO·WARN·ERROR 를 전부
+            서버로 합류 → 실패 앞 맥락(무슨 스텝 하다 멈췄나)까지 admin 에서 본다. DEBUG(폴 잡음)만 제외.
+          - **WARN/ERROR 는 즉시 flush**(`_trace_flush_now` set → sender 곧바로 전송), INFO 는
+            `trace_flush_interval_s`(기본 10s) 배치. 실패는 안 밀리고 정상 흐름은 촘촘.
           - event = ``pi.log.{severity}`` — dispense 스팬(``dispense.*``)과 구분.
           - traceId 없는 운영 로그는 ``trace_id=""`` 로 실어 admin **로그검색(service=pi)** 축에
             합류한다(타임라인 축은 traceId 있는 것만 엮인다).
           - detail(message·stage·commandSetId·error 등)은 **서버 allowlist(trace.ts)가 2차 게이트** —
             등록 안 된 키는 서버가 폐기한다(비-PII 고정 문자열만 등록).
         """
-        if record.get("severity") not in ("WARN", "ERROR"):
+        severity = str(record.get("severity", "INFO")).upper()
+        if _SEVERITY_RANK.get(severity, 1) < self._ship_min_rank:
             return
         detail: dict[str, Any] = {
             "message": record.get("message"),
@@ -591,16 +611,21 @@ class SenlytDaemon:
             trace_id=str(record.get("traceId") or ""),
             span_id=secrets.token_hex(8),
             service="pi",
-            event=f"pi.log.{str(record.get('severity', 'info')).lower()}",
-            level=str(record.get("severity", "INFO")),
+            event=f"pi.log.{severity.lower()}",
+            level=severity,
             order_id=record.get("orderId"),
             device_id=record.get("deviceId"),
             detail=detail,
         )
         with self._trace_lock:
             if len(self._trace_buffer) >= _LOG_TRACE_BUFFER_CAP:
-                return  # 전송 실패 누적·로그 폭주 방어(상한 초과분 드롭)
+                # 상한 초과분 드롭 — 조용히 버리지 않고 건수를 센다(flush 시 합성 WARN 으로 보고).
+                self._trace_dropped += 1
+                return
             self._trace_buffer.append(span)
+        # WARN/ERROR = 실패 신호 → sender 를 깨워 즉시 전송(INFO 는 배치 주기까지 대기).
+        if _SEVERITY_RANK.get(severity, 1) >= 2:
+            self._trace_flush_now.set()
 
     # ─────────────────────────────────────────────────────────────────────
     # 역보고 송신 전용 워커 — 제조 임계경로에서 네트워크 I/O 분리(감사 P2·2026-07-15)
@@ -630,6 +655,7 @@ class SenlytDaemon:
             self.deps.heartbeat_interval_s if self.deps.heartbeat_interval_s > 0 else 30.0
         )
         last_oq_flush = time.monotonic()
+        last_trace_flush = time.monotonic()
         while True:
             # ⚠️ **정지 시에도 큐를 순서대로 비운 뒤 종료**(리뷰 P2 #5 봉합·2026-07-15) — sender 가
             #   단일 소비자로 끝까지 남아 FIFO(ACCEPTED→PROGRESS→COMPLETED)를 보존한다. stop 은
@@ -645,10 +671,18 @@ class SenlytDaemon:
                 if time.monotonic() - last_oq_flush >= oq_interval:
                     self._flush_offline_queue()
                     last_oq_flush = time.monotonic()
-                self._stop.wait(0.5)
+                # 관측 로그 flush — WARN/ERROR 는 _trace_flush_now 로 즉시 깨어나고,
+                #   INFO 등 일반 로그는 trace_flush_interval_s(기본 10s) 배치로 묶어 보낸다.
+                signaled = self._trace_flush_now.wait(0.5)
+                if signaled or (
+                    time.monotonic() - last_trace_flush >= self.deps.trace_flush_interval_s
+                ):
+                    self._flush_traces()  # 내부에서 _trace_flush_now 클리어
+                    last_trace_flush = time.monotonic()
                 continue
             self._safe_report_status(report)  # 예외 삼킴(_safe_* — 관측이 제조를 막지 않는다).
             self._flush_traces()
+            last_trace_flush = time.monotonic()
 
     # ─────────────────────────────────────────────────────────────────────
     # heartbeat 30s + ship_trace 배치 flush(별도 스레드) + OQ flush
@@ -775,6 +809,27 @@ class SenlytDaemon:
         with self._trace_lock:
             spans = self._trace_buffer
             self._trace_buffer = []
+            dropped = self._trace_dropped
+            self._trace_dropped = 0
+            # 즉시-flush 신호 소비(전송 시작하므로 클리어).
+            self._trace_flush_now.clear()
+        # 상한 초과 드롭이 있었으면 합성 WARN 으로 남긴다(조용한 유실 금지 — admin 에서 보이게).
+        if dropped > 0:
+            spans.append(
+                TraceSpan(
+                    ts=self._now_iso(),
+                    trace_id="",
+                    span_id=secrets.token_hex(8),
+                    service="pi",
+                    event="pi.log.warn",
+                    level="WARN",
+                    device_id=self.deps.device_id,
+                    detail={
+                        "message": f"관측 로그 버퍼 상한({_LOG_TRACE_BUFFER_CAP}) 초과 — {dropped}건 드롭됨(네트워크 단절/폭주)",
+                        "stage": "obs",
+                    },
+                )
+            )
         if not spans:
             return
         try:

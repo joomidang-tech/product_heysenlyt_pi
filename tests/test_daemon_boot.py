@@ -562,14 +562,16 @@ def test_estop_watcher_poll_error_is_swallowed(ledger):
     assert not d._estop.is_set()
 
 
-def test_ship_log_gates_warn_error_and_maps(ledger):
-    """_ship_log — WARN/ERROR 만 스팬화(INFO/DEBUG 드롭) + 필드 매핑(pi 운영로그→trace 합류·2026-07-18).
+def test_ship_log_ships_info_and_up_drops_debug(ledger):
+    """_ship_log — 기본 게이트 INFO(INFO/WARN/ERROR 스팬화·DEBUG 드롭) + 필드 매핑 + WARN 즉시-flush 신호.
 
-    D32 멈춤 처리의 관측성 짝 — "왜 멈췄나"를 서버에서 보게 pi WARN/ERROR 로그를 trace 로 실어보낸다.
+    2026-07-18 개편("최대한 자세히") — 실패 앞 맥락(INFO)까지 서버로 합류시킨다. DEBUG(폴 잡음)만 제외.
+    WARN/ERROR 는 _trace_flush_now 를 set 해 sender 가 즉시 전송하게 한다.
     """
     d = _daemon(ledger)
-    d._ship_log({"severity": "INFO", "message": "정상", "stage": "pi수신"})  # 드롭
-    d._ship_log({"severity": "DEBUG", "message": "폴", "stage": "pi수신"})  # 드롭
+    d._ship_log({"severity": "DEBUG", "message": "폴", "stage": "pi수신"})  # 드롭(DEBUG)
+    d._ship_log({"severity": "INFO", "message": "명령 수신", "stage": "pi수신"})  # 실림(INFO)
+    assert not d._trace_flush_now.is_set()  # INFO 는 즉시 flush 신호 안 켬(배치 대기)
     d._ship_log(
         {
             "severity": "WARN",
@@ -584,8 +586,10 @@ def test_ship_log_gates_warn_error_and_maps(ledger):
         }
     )
     spans = d._trace_buffer
-    assert len(spans) == 1  # WARN 만 실린다(INFO/DEBUG 드롭)
-    s = spans[0]
+    assert len(spans) == 2  # INFO + WARN 실림(DEBUG 만 드롭)
+    assert d._trace_flush_now.is_set()  # WARN = 실패 신호 → 즉시 flush 신호 켜짐
+    assert spans[0].event == "pi.log.info" and spans[0].level == "INFO"
+    s = spans[1]
     assert s.event == "pi.log.warn"
     assert s.level == "WARN"
     assert s.service == "pi"
@@ -596,3 +600,23 @@ def test_ship_log_gates_warn_error_and_maps(ledger):
     assert s.detail["stage"] == "오류"
     assert s.detail["commandSetId"] == "c-1:1"
     assert s.detail["error"] == "SSE timeout"  # 서버 allowlist(trace.ts)가 최종 반출 게이트
+
+
+def test_ship_log_buffer_cap_drops_counted_and_reported(ledger, monkeypatch):
+    """버퍼 상한 초과분은 조용히 버리지 않고 건수를 세어 다음 flush 에 합성 WARN 으로 보고(silent 금지)."""
+    from senlyt_pi.app import daemon as dmod
+
+    monkeypatch.setattr(dmod, "_LOG_TRACE_BUFFER_CAP", 2)
+    sink = FakeStatusSink()
+    d = _daemon(ledger, status_sink=sink)
+    for i in range(4):  # cap=2 → 앞 2건 실림, 뒤 2건 드롭
+        d._ship_log({"severity": "INFO", "message": f"m{i}", "stage": "pi수신"})
+    assert d._trace_dropped == 2
+
+    d._flush_traces()
+    shipped = sink.trace_batches[-1]
+    assert len(shipped) == 3  # 실린 2건 + 드롭 보고 합성 WARN 1건
+    warn = shipped[-1]
+    assert warn.level == "WARN"
+    assert warn.detail is not None and "드롭" in warn.detail["message"]
+    assert d._trace_dropped == 0  # 보고 후 리셋
