@@ -562,16 +562,16 @@ def test_estop_watcher_poll_error_is_swallowed(ledger):
     assert not d._estop.is_set()
 
 
-def test_ship_log_ships_info_and_up_drops_debug(ledger):
-    """_ship_log — 기본 게이트 INFO(INFO/WARN/ERROR 스팬화·DEBUG 드롭) + 필드 매핑 + WARN 즉시-flush 신호.
+def test_ship_log_ships_all_levels_by_default(ledger):
+    """_ship_log — 기본 게이트 DEBUG(전 레벨 DEBUG·INFO·WARN·ERROR 전송) + 필드 매핑 + WARN 즉시-flush.
 
-    2026-07-18 개편("최대한 자세히") — 실패 앞 맥락(INFO)까지 서버로 합류시킨다. DEBUG(폴 잡음)만 제외.
-    WARN/ERROR 는 _trace_flush_now 를 set 해 sender 가 즉시 전송하게 한다.
+    2026-07-18 "하드웨어 로그 전량 전송" — 폴 단위 DEBUG 상세까지 서버로 합류시킨다.
+    WARN/ERROR 는 _trace_flush_now 를 set 해 sender 가 즉시 전송하게 한다(DEBUG/INFO 는 배치).
     """
     d = _daemon(ledger)
-    d._ship_log({"severity": "DEBUG", "message": "폴", "stage": "pi수신"})  # 드롭(DEBUG)
+    d._ship_log({"severity": "DEBUG", "message": "폴", "stage": "pi수신"})  # 실림(DEBUG)
     d._ship_log({"severity": "INFO", "message": "명령 수신", "stage": "pi수신"})  # 실림(INFO)
-    assert not d._trace_flush_now.is_set()  # INFO 는 즉시 flush 신호 안 켬(배치 대기)
+    assert not d._trace_flush_now.is_set()  # DEBUG/INFO 는 즉시 flush 신호 안 켬(배치 대기)
     d._ship_log(
         {
             "severity": "WARN",
@@ -586,10 +586,11 @@ def test_ship_log_ships_info_and_up_drops_debug(ledger):
         }
     )
     spans = d._trace_buffer
-    assert len(spans) == 2  # INFO + WARN 실림(DEBUG 만 드롭)
+    assert len(spans) == 3  # DEBUG + INFO + WARN 전부 실림(전 레벨 전송)
     assert d._trace_flush_now.is_set()  # WARN = 실패 신호 → 즉시 flush 신호 켜짐
-    assert spans[0].event == "pi.log.info" and spans[0].level == "INFO"
-    s = spans[1]
+    assert spans[0].event == "pi.log.debug" and spans[0].level == "DEBUG"
+    assert spans[1].event == "pi.log.info" and spans[1].level == "INFO"
+    s = spans[2]
     assert s.event == "pi.log.warn"
     assert s.level == "WARN"
     assert s.service == "pi"

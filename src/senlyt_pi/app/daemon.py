@@ -151,10 +151,11 @@ class DaemonDeps:
     poll_interval_s: float = 1.0
     # heartbeat 주기(초·§9-3). 0 이하면 heartbeat 스레드 비활성(테스트가 수동 구동).
     heartbeat_interval_s: float = 30.0
-    # 서버로 실어보낼 로그의 최소 심각도(2026-07-18 개편 — "최대한 자세히" 요구). 기본 INFO =
-    #   INFO·WARN·ERROR 를 전부 서버로 합류시켜 "무슨 작업 하다 실패했나"의 앞 맥락까지 admin 에서
-    #   본다. DEBUG(폴 단위 잡음)만 제외. 볼륨/비용이 문제되면 "WARN" 으로 올려 실패만 전송.
-    ship_log_min_severity: str = "INFO"
+    # 서버로 실어보낼 로그의 최소 심각도(2026-07-18 개편 — "하드웨어 로그 전량 전송" 요구). 기본
+    #   **DEBUG** = 모든 레벨(DEBUG·INFO·WARN·ERROR)을 서버로 합류시킨다 — 실기기 진단 시 폴 단위
+    #   상세(시리얼 왕복·명령 바이트·힘 선택)까지 admin 에서 본다. DEBUG 는 폴(~1s) 단위라 볼륨이
+    #   크므로, 진단이 끝나 볼륨/비용이 문제되면 "INFO"(정상 흐름) 또는 "WARN"(실패만)으로 올린다.
+    ship_log_min_severity: str = "DEBUG"
     # 관측 로그(pi.log.*) 배치 flush 주기(초). ERROR/WARN 은 이와 무관하게 즉시 flush 되고,
     #   INFO 등 일반 로그는 이 주기로 묶어 전송(HTTP 오버헤드 절감). 실패는 안 밀리고 맥락은 촘촘.
     trace_flush_interval_s: float = 10.0
@@ -585,10 +586,11 @@ class SenlytDaemon:
         pi 운영 로그(SSE 오류·폴 실패·부팅 자가진단·타임아웃)를 web·server 와 **같은 화면·같은
         traceId** 로 합류시킨다 — "왜 멈췄나"를 admin 에서 본다(D32 멈춤 처리의 관측성 짝).
 
-        §5 정책(2026-07-18 개편 — "최대한 자세히"):
-          - severity 게이트 = **ship_log_min_severity 이상**(기본 INFO). INFO·WARN·ERROR 를 전부
-            서버로 합류 → 실패 앞 맥락(무슨 스텝 하다 멈췄나)까지 admin 에서 본다. DEBUG(폴 잡음)만 제외.
-          - **WARN/ERROR 는 즉시 flush**(`_trace_flush_now` set → sender 곧바로 전송), INFO 는
+        §5 정책(2026-07-18 개편 — "하드웨어 로그 전량 전송"):
+          - severity 게이트 = **ship_log_min_severity 이상**(기본 **DEBUG** = 전 레벨 전송).
+            DEBUG·INFO·WARN·ERROR 를 전부 서버로 합류 → 실기기 진단 시 폴 단위 시리얼 왕복·명령
+            바이트까지 admin 에서 본다(볼륨 크면 상수만 INFO/WARN 로 올림).
+          - **WARN/ERROR 는 즉시 flush**(`_trace_flush_now` set → sender 곧바로 전송), DEBUG/INFO 는
             `trace_flush_interval_s`(기본 10s) 배치. 실패는 안 밀리고 정상 흐름은 촘촘.
           - event = ``pi.log.{severity}`` — dispense 스팬(``dispense.*``)과 구분.
           - traceId 없는 운영 로그는 ``trace_id=""`` 로 실어 admin **로그검색(service=pi)** 축에
