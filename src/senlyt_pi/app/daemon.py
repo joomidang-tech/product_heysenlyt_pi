@@ -149,6 +149,11 @@ class DaemonDeps:
     estop_source: Callable[[], "tuple[bool, str | None]"] | None = None
     # estop fast-poll 주기(초). estop 은 반응성이 생명이라 heartbeat(30s)보다 훨씬 짧게.
     estop_poll_interval_s: float = 1.0
+    # 긴급정지 공유 래치(§9-4) — **어댑터·시퀀서·데몬이 같은 Event 를 봐야** '공유 _estop' 설계가
+    #   실제로 하나다. bootstrap 이 이 이벤트를 만들어 Sy01bEngineAdapter(estop_event=)·시퀀서·여기에
+    #   모두 주입한다. 미주입 시 데몬이 자체 생성(테스트/구성 폴백) — 이 경우 _trigger_estop 이
+    #   emergency_stop_all 로 어댑터 축도 함께 구동하므로 협조적으로 동작한다.
+    estop_event: "threading.Event | None" = None
 
 
 class SenlytDaemon:
@@ -165,7 +170,9 @@ class SenlytDaemon:
         # 긴급정지 래치(§9-4) — 감시 스레드가 서버 estop 신호를 보고 set, 복구가 clear. 시퀀서에
         #   주입해 "다음 stage 미시작"을 강제하고, 어댑터는 emergency_stop_all/clear_estop 로 구동한다.
         #   shutdown(_stop)과 분리(estop 후엔 복구가 이어지지만 shutdown 은 종료).
-        self._estop = threading.Event()
+        #   ⚠️ **공유 이벤트 우선** — bootstrap 이 어댑터에도 주입한 같은 Event 를 받으면 어댑터의
+        #   in-flight 모션 폴이 이 래치를 직접 본다(설계 '단일 공유 _estop'). 미주입 시 자체 생성.
+        self._estop = deps.estop_event if deps.estop_event is not None else threading.Event()
         # estop 상승엣지 판정용 마지막 처리 시각(같은 신호 재처리 방지).
         self._last_estop_at: str | None = None
         # SSE 어댑터에 종료 신호 결선(감사 P3) — 순회 중 SIGTERM 시 제너레이터 즉시 종료(우아한
@@ -230,6 +237,15 @@ class SenlytDaemon:
             heartbeatIntervalS=self.deps.heartbeat_interval_s,
         )
         self._recover()
+        # 부팅 복구 직후 밸브 강제 닫힘(§L1 선택적 SW 완화·F2 이중안전) — 직전 세션이 SIGKILL 로
+        #   죽어 밸브가 열린 채 남았을 수 있다. shutdown 경로의 close_all 이 안 돈 창을 부팅에서 닫는다.
+        #   valve 미주입(off)이면 skip. GpioValveAdapter 는 생성 시 이미 닫힘이라 대부분 중복이지만,
+        #   물리 잔존 방어의 이중 안전(근본 해결은 HW normally-closed + 워치독).
+        if self.deps.valve is not None:
+            try:
+                self.deps.valve.close_all()
+            except Exception:  # noqa: BLE001 — 밸브 닫힘 실패가 부팅을 막지 않는다(best-effort).
+                pass
         # 부팅 자가진단(fail-closed 관측·EP-08) — 매핑 펌프 0 이면 제조 보류(heartbeat 만)를 표면화.
         self._boot_self_test()
         # 부팅 시 원장 압축 — append-only 무한 성장·부팅 replay O(N) 완화(감사 P2 봉합·

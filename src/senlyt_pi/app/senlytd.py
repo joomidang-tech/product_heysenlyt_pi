@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from typing import Mapping
 
 from ..obs.log import STAGE_ERROR, STAGE_PI_RECEIVED, StructuredLogger
@@ -107,10 +108,14 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
 
     try:
         ledger = build_ledger(environ)
+        # 긴급정지 공유 래치(§9-4) — **어댑터·시퀀서·데몬이 같은 Event** 를 보게 여기서 한 번 만들어
+        #   build_components(→build_engine→어댑터)·DaemonDeps 양쪽에 주입한다(설계 '단일 공유 _estop').
+        estop_event = threading.Event()
         # fetch_settings=True — 부팅 1회 서버 settings 스냅샷으로 시린지 용량 SoT 반영(O-18·안전 급소).
         #   best-effort(실패=모드 기본 폴백). 조립 self-test(_selftest)는 fetch 안 함(펌프 미구동).
         components = build_components(
-            environ, ledger=ledger, logger=logger, fetch_settings=True
+            environ, ledger=ledger, logger=logger, fetch_settings=True,
+            estop_event=estop_event,
         )
     except ServerTargetError as e:
         logger.error(
@@ -137,6 +142,8 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
             environ,
             engine=components.engine,
             server_settings=getattr(components, "server_settings", None),
+            # 서버배정 mode 우선(env 폴백) — 'URL만' 설치 식향 기기가 예상주소[1,2]만 프로브(부팅지연 0).
+            mode=getattr(components, "mode", None),
         ),
         commandset_source=components.command_source,  # 동일 SSE 어댑터가 두 축 제공.
         logger=components.logger,
@@ -144,6 +151,8 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         # 긴급정지 fast-poll 소스(§9-4) — HTTP status_sink 의 estop GET 을 device_id 로 바인딩한다.
         #   제조 중에도 즉시 선점하려면 명령 폴과 무관한 이 별도 축이 필요하다.
         estop_source=lambda: components.status_sink.poll_estop(components.device_id),
+        # 어댑터에 주입한 것과 **같은 공유 래치** — 데몬·시퀀서·어댑터가 하나의 estop 이벤트를 본다.
+        estop_event=estop_event,
     )
     daemon = SenlytDaemon(deps)
     _install_signal_handlers(daemon, logger)

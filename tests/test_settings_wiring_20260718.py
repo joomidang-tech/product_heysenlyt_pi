@@ -58,6 +58,39 @@ def test_absent_settings_falls_back_to_mode_default():
     assert r.pump_map[1].max_volume_ul == 500
 
 
+class _Bus123:
+    """주소 1·2·3 모두 응답하는 버스 — 프로브 범위(expected)가 결과를 가른다."""
+
+    def probe(self, addr: int) -> bool:
+        return addr in (1, 2, 3)
+
+
+def test_mode_param_overrides_env_for_probe_range():
+    """#3(2026-07-18) — mode 인자(서버배정)가 env 보다 우선. 'URL만' 설치(env 없음) 식향 기기가
+    예상주소 [1,2]만 프로브해 부재 addr 3 낭비를 없앤다."""
+    # env 없음 + mode='flavor' → [1,2]만 (버스는 3도 응답하지만 프로브 범위 밖).
+    r = build_resolver({}, engine=_Bus123(), mode="flavor")
+    assert sorted(r.pump_map) == [1, 2]
+    # mode 미주입 + env 없음 → 향장향 기본 [1,2,3].
+    r2 = build_resolver({}, engine=_Bus123())
+    assert sorted(r2.pump_map) == [1, 2, 3]
+    # mode 가 env 를 이긴다(env=fragrance 인데 mode=flavor → [1,2]).
+    r3 = build_resolver({"SENLYT_MODE": "fragrance"}, engine=_Bus123(), mode="flavor")
+    assert sorted(r3.pump_map) == [1, 2]
+
+
+def test_build_engine_injects_shared_estop_event():
+    """#4(2026-07-18) — build_engine(estop_event=ev) 이 어댑터에 **같은 Event** 를 주입한다
+    (설계 '단일 공유 _estop'). fake 경로도 동일."""
+    import threading
+
+    from senlyt_pi.app.bootstrap import build_engine
+
+    ev = threading.Event()
+    fake = build_engine({"SENLYT_ENGINE": "fake"}, estop_event=ev)
+    assert fake._estop is ev  # 공유 이벤트가 그대로 주입됨
+
+
 # ── 2) build_components fetch seam ──────────────────────────────────────────
 
 
