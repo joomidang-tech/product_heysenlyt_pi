@@ -5,11 +5,10 @@ P0 HW 안전 — 식향 Code 11(플런저 오버로드·과다흡입) 재발 방
 "하드코딩 24000 vs 파생 9600"의 2.5배 불일치였다(SoT 서두).
 
 Dart `lib/core/pump_guard.dart` 포팅이되, **수치 정본 = 서버 TS**:
-  - Dart 이관본의 구값 2건은 버그로 판정, 서버 TS(v1.1.0 확정값)로 정정:
-    ① validSyringeCapacitiesMl 4종 [1.25,0.5,2.5,5] → **9종**
-       [0.025,0.05,0.1,0.25,0.5,1.0,1.25,2.5,5.0] (pumpGuard.ts VALID_SYRINGE_ML)
-    ② cavro_xlp6000·cavro_xcalibur pumpSyringeTypeCode 0 → **200**
-       (pumpGuard.ts PUMP_PRESETS — 빌트인 3종 전부 U200)
+  - Dart 이관본의 validSyringeCapacitiesMl 4종 [1.25,0.5,2.5,5] → **9종**
+    [0.025,0.05,0.1,0.25,0.5,1.0,1.25,2.5,5.0] (pumpGuard.ts VALID_SYRINGE_ML)으로 정정.
+  - Tecan(Cavro XLP6000·XCalibur) 프리셋은 제거됨(2026-07-18 · 미도입·기기 미입고 — 서버 TS와 동일).
+    현재 빌트인 = SY-01B 1종(+ custom). Dart 파일엔 남아 있으나 그건 동결된 포팅 오라클.
   - 그 외(프리셋 수치·custom 절대상한·기본값·단조성 2줄 순서)는 서버 TS와 대조 완료(동일).
 
 라운딩(부록A P-8): round = half-up(양수 도메인 JS `Math.round` = `floor(x+0.5)`).
@@ -28,7 +27,7 @@ from typing import Any, Mapping
 class PumpPreset:
     """PumpPreset 7필드 — SoT §6-1 (고정 필드명·타입·순서)."""
 
-    pump_preset_id: str  # ∈ {sy01b, cavro_xlp6000, cavro_xcalibur, custom}
+    pump_preset_id: str  # 항상 "sy01b" (사용자 지정·Tecan/Cavro 제거·2026-07-18)
     pump_full_stroke: int  # 풀스트로크
     pump_max_start_speed_hz: int  # v 상한(start speed)
     pump_max_top_speed_hz: int  # V 상한(top speed)
@@ -39,9 +38,8 @@ class PumpPreset:
 
 # 빌트인 프리셋 정식 수치표 — SoT §6-2 (입력 무시·강제 · 바이트 동일 SoT = pumpGuard.ts).
 #
-# XCalibur 의 v/V/c 는 미확정(§6-2 `*`, O-12) → **보수적 SY-01B 하한**(1000/6000/5400) 채택.
-# 속도 clamp 는 낮을수록 안전. typeCode 는 빌트인 3종 전부 **200**(서버 TS 정본 —
-# Dart 이관본의 cavro 0 은 구값 버그였다).
+# 현재 빌트인 = SY-01B 1종. 사용자 지정(custom)·Tecan(Cavro)은 제거됨(2026-07-18 · 서버 pumpGuard.ts
+# 와 동일) — clamp 는 어떤 입력이든 SY-01B 로 정규화한다. 도입 시 이 표에 1항목만 되살리면 된다.
 PUMP_PRESETS: dict[str, PumpPreset] = {
     "sy01b": PumpPreset(
         pump_preset_id="sy01b",
@@ -52,35 +50,7 @@ PUMP_PRESETS: dict[str, PumpPreset] = {
         pump_max_slope=20,
         pump_syringe_type_code=200,
     ),
-    "cavro_xlp6000": PumpPreset(
-        pump_preset_id="cavro_xlp6000",
-        pump_full_stroke=6000,
-        pump_max_start_speed_hz=8000,
-        pump_max_top_speed_hz=48000,
-        pump_max_cutoff_speed_hz=21600,
-        pump_max_slope=20,
-        pump_syringe_type_code=200,  # 서버 pumpGuard.ts U200 (v1.1.0 확정)
-    ),
-    "cavro_xcalibur": PumpPreset(
-        pump_preset_id="cavro_xcalibur",
-        pump_full_stroke=3000,
-        pump_max_start_speed_hz=1000,  # * SY-01B 하한(미확정·보수적)
-        pump_max_top_speed_hz=6000,  # * SY-01B 하한
-        pump_max_cutoff_speed_hz=5400,  # * SY-01B 하한
-        pump_max_slope=20,
-        pump_syringe_type_code=200,  # 서버 pumpGuard.ts U200 (v1.1.0 확정)
-    ),
 }
-
-# custom 절대상한 — SoT §6-3 (pumpGuard.ts CUSTOM_LIMITS 와 바이트 동일).
-_CUSTOM_STROKE_MIN = 100
-_CUSTOM_STROKE_MAX = 96000
-_CUSTOM_SPEED_MIN = 1
-_CUSTOM_SPEED_MAX = 48000
-_CUSTOM_SLOPE_MIN = 1
-_CUSTOM_SLOPE_MAX = 40
-_CUSTOM_TYPE_MIN = 0
-_CUSTOM_TYPE_MAX = 999
 
 # 유효 syringe 용량 이산값(mL) — v1.1.0 allowlist **9종**(서버 pumpGuard.ts VALID_SYRINGE_ML 정본).
 VALID_SYRINGE_CAPACITIES_ML: frozenset[float] = frozenset(
@@ -93,70 +63,14 @@ def _round_half_up(x: float) -> int:
     return math.floor(x + 0.5)
 
 
-def _clamp_int(v: Any, lo: int, hi: int, fallback: int) -> int:
-    """정수 clamp(round 후 [min,max]) — TS `clampInt`. NaN/누락 → fallback.
-
-    Dart `_clampInt` 등가: num 이 아니면 문자열 파싱 시도. bool 은 수치로 취급하지 않는다.
-    """
-    n: float | None
-    if isinstance(v, bool):  # Python bool 은 int 서브클래스 — 수치 아님(방어).
-        n = None
-    elif isinstance(v, (int, float)):
-        n = float(v)
-    else:
-        try:
-            n = float(str(v))
-        except (TypeError, ValueError):
-            n = None
-    if n is None or not math.isfinite(n):
-        return fallback
-    r = _round_half_up(n)
-    return lo if r < lo else (hi if r > hi else r)
-
-
 def clamp_pump_preset(cfg: Mapping[str, Any] | None) -> PumpPreset:
     """clampPumpPreset(cfg) — SoT §6-3 (서버 ↔ pi 동일 알고리즘).
 
-    1) builtin(sy01b|cavro_xlp6000|cavro_xcalibur) → 표의 정식 수치 그대로(입력 전부 무시).
-    2) custom → 절대상한 clamp + 속도 단조성 강제(⚠️ 2줄 순서 고정·부록A P-7).
-    3) unknown id → sy01b 폴백.
-    4) 미설정/누락 → sy01b 프리셋(호출 측이 None 전달).
+    **항상 SY-01B 로 정규화**한다(사용자 지정 제거·2026-07-18). 입력 pumpPresetId·수치
+    (custom·unknown·레거시 포함)는 전부 무시하고 SY-01B 정식 수치를 강제 → 손 튜닝값이
+    물리로 가는 경로 차단(과다흡입 안전). syringeCapacityMl 은 호출 측이 별도 주입한다.
     """
-    raw_id = cfg.get("pumpPresetId") if cfg is not None else None
-    preset_id = raw_id if isinstance(raw_id, str) else "sy01b"
-
-    # 1) builtin — 정식 수치 강제(입력 수치 전부 무시).
-    builtin = PUMP_PRESETS.get(preset_id)
-    if builtin is not None and preset_id != "custom":
-        return builtin
-
-    # 3) unknown id → sy01b 폴백.
-    if preset_id != "custom":
-        return PUMP_PRESETS["sy01b"]
-
-    # 2) custom → 절대상한 clamp (기본값 = 서버 TS 와 동일: 12000/1000/6000/5400/20/200).
-    get = cfg.get if cfg is not None else (lambda _k: None)
-    stroke = _clamp_int(get("pumpFullStroke"), _CUSTOM_STROKE_MIN, _CUSTOM_STROKE_MAX, 12000)
-    v = _clamp_int(get("pumpMaxStartSpeedHz"), _CUSTOM_SPEED_MIN, _CUSTOM_SPEED_MAX, 1000)
-    big_v = _clamp_int(get("pumpMaxTopSpeedHz"), _CUSTOM_SPEED_MIN, _CUSTOM_SPEED_MAX, 6000)
-    c = _clamp_int(get("pumpMaxCutoffSpeedHz"), _CUSTOM_SPEED_MIN, _CUSTOM_SPEED_MAX, 5400)
-    slope = _clamp_int(get("pumpMaxSlope"), _CUSTOM_SLOPE_MIN, _CUSTOM_SLOPE_MAX, 20)
-    type_code = _clamp_int(get("pumpSyringeTypeCode"), _CUSTOM_TYPE_MIN, _CUSTOM_TYPE_MAX, 200)
-
-    # 속도 단조성 강제 — ⚠️ 순서 고정(부록A P-7: 2줄 순서가 바이트 동일이어야 경계 입력 결과 일치).
-    #   (SY-01B 제약 v ≤ c ≤ V)
-    c = min(max(c, v), big_v)
-    v = min(v, c)
-
-    return PumpPreset(
-        pump_preset_id="custom",
-        pump_full_stroke=stroke,
-        pump_max_start_speed_hz=v,
-        pump_max_top_speed_hz=big_v,
-        pump_max_cutoff_speed_hz=c,
-        pump_max_slope=slope,
-        pump_syringe_type_code=type_code,
-    )
+    return PUMP_PRESETS["sy01b"]
 
 
 def resolve_syringe_capacity_ml(raw: Any, *, is_flavor: bool) -> float:

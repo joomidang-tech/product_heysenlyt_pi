@@ -1,8 +1,8 @@
 """PumpGuard 회귀 — SoT §6 (byte-parity 안전 급소·부록A P-7/P-8).
 
-Dart `test/pump_guard_test.dart` 포팅 + **서버 TS(pumpGuard.ts) 정본 대조 정정 2건**:
-  ① cavro_xlp6000/xcalibur typeCode 는 200 (Dart 이관본 0 = 구값 버그)
-  ② 유효 시린지 용량 = 9종 allowlist (Dart 이관본 4종 = 구값 버그)
+Dart `test/pump_guard_test.dart` 포팅 + **서버 TS(pumpGuard.ts) 정본 대조**:
+  - 유효 시린지 용량 = 9종 allowlist (Dart 이관본 4종 = 구값 버그 → 정정)
+  - Tecan(Cavro) 프리셋은 제거됨(2026-07-18 · 미도입·기기 미입고) — 미지 id→sy01b 폴백으로 커버.
 """
 
 from senlyt_pi.core.pump_guard import (
@@ -36,23 +36,12 @@ class TestClampPumpPresetBuiltin:
         assert p.pump_max_slope == 20
         assert p.pump_syringe_type_code == 200
 
-    def test_cavro_xlp6000_table(self):
-        """cavro_xlp6000 — 표 그대로 (typeCode 200 = 서버 pumpGuard.ts 정본)."""
-        p = clamp_pump_preset({"pumpPresetId": "cavro_xlp6000"})
-        assert p.pump_full_stroke == 6000
-        assert p.pump_max_start_speed_hz == 8000
-        assert p.pump_max_top_speed_hz == 48000
-        assert p.pump_max_cutoff_speed_hz == 21600
-        assert p.pump_syringe_type_code == 200  # 서버 TS U200 (Dart 구값 0 은 버그)
-
-    def test_cavro_xcalibur_conservative(self):
-        """cavro_xcalibur — v/V/c 미확정은 SY-01B 하한(§6-2 * / O-12)."""
-        p = clamp_pump_preset({"pumpPresetId": "cavro_xcalibur"})
-        assert p.pump_full_stroke == 3000
-        assert p.pump_max_start_speed_hz == 1000  # SY-01B 하한
-        assert p.pump_max_top_speed_hz == 6000
-        assert p.pump_max_cutoff_speed_hz == 5400
-        assert p.pump_syringe_type_code == 200  # 서버 TS U200 (Dart 구값 0 은 버그)
+    def test_removed_tecan_id_falls_back_to_sy01b(self):
+        """제거된 Tecan(Cavro) id → sy01b 폴백(2026-07-18 미도입·레거시 저장값 방어)."""
+        for removed in ("cavro_xlp6000", "cavro_xcalibur"):
+            p = clamp_pump_preset({"pumpPresetId": removed})
+            assert p.pump_preset_id == "sy01b"
+            assert p.pump_full_stroke == 12000
 
     def test_unknown_id_falls_back_to_sy01b(self):
         """unknown id → sy01b 폴백(§6-3.3)."""
@@ -67,44 +56,26 @@ class TestClampPumpPresetBuiltin:
 
 
 class TestClampPumpPresetCustom:
-    """clampPumpPreset — custom 절대상한 + 단조성(§6-3.2·부록A P-7)."""
+    """clampPumpPreset — custom(레거시)·임의 수치는 SY-01B 로 정규화(사용자 지정 제거·2026-07-18)."""
 
-    def test_absolute_limits(self):
-        """절대상한 clamp."""
+    def test_custom_normalizes_to_sy01b(self):
+        """손 튜닝값 무시 — pumpPresetId·6수치 전부 SY-01B 정식값으로 강제(과다흡입 안전)."""
         p = clamp_pump_preset({
             "pumpPresetId": "custom",
-            "pumpFullStroke": 999999,  # → 96000
-            "pumpMaxStartSpeedHz": 0,  # → 1
-            "pumpMaxTopSpeedHz": 999999,  # → 48000
-            "pumpMaxCutoffSpeedHz": 999999,  # → 48000
-            "pumpMaxSlope": 999,  # → 40
-            "pumpSyringeTypeCode": 9999,  # → 999
+            "pumpFullStroke": 999999,
+            "pumpMaxStartSpeedHz": 40000,
+            "pumpMaxTopSpeedHz": 48000,
+            "pumpMaxCutoffSpeedHz": 21600,
+            "pumpMaxSlope": 999,
+            "pumpSyringeTypeCode": 9999,
         })
-        assert p.pump_full_stroke == 96000
-        assert p.pump_max_top_speed_hz == 48000
-        assert p.pump_max_slope == 40
-        assert p.pump_syringe_type_code == 999
-        # 단조성: v ≤ c ≤ V. v 입력 1 → clamp 후 v≤c 유지.
-        assert p.pump_max_start_speed_hz <= p.pump_max_cutoff_speed_hz
-        assert p.pump_max_cutoff_speed_hz <= p.pump_max_top_speed_hz
-
-    def test_monotonicity_two_line_order(self):
-        """단조성 2줄 순서 — c=min(max(c,v),V); v=min(v,c) 경계 결과(부록A P-7).
-
-        v=5000, V=1000, c=100 (역전 입력) → c=min(max(100,5000),1000)=1000; v=min(5000,1000)=1000.
-        """
-        p = clamp_pump_preset({
-            "pumpPresetId": "custom",
-            "pumpFullStroke": 12000,
-            "pumpMaxStartSpeedHz": 5000,
-            "pumpMaxTopSpeedHz": 1000,
-            "pumpMaxCutoffSpeedHz": 100,
-            "pumpMaxSlope": 20,
-            "pumpSyringeTypeCode": 200,
-        })
-        assert p.pump_max_cutoff_speed_hz == 1000, "c = min(max(c,v),V)"
-        assert p.pump_max_start_speed_hz == 1000, "v = min(v,c)"
-        assert p.pump_max_top_speed_hz == 1000
+        assert p.pump_preset_id == "sy01b"
+        assert p.pump_full_stroke == 12000
+        assert p.pump_max_start_speed_hz == 1000
+        assert p.pump_max_top_speed_hz == 6000
+        assert p.pump_max_cutoff_speed_hz == 5400
+        assert p.pump_max_slope == 20
+        assert p.pump_syringe_type_code == 200
 
 
 class TestSyringeSpec:
