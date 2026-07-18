@@ -63,6 +63,27 @@ class TestReportStatus:
             sink.report_status(_report("COMPLETED", step_k=2))
             assert srv.requests[-1].json()["status"] == "COMPLETED"
 
+    def test_maintenance_id_skips_order_status_no_404_noise(self) -> None:
+        """정비 봉투(mnt-)는 주문이 없어 주문 status 창구로 안 보낸다 — PATCH 자체가 안 나감(404 노이즈 봉합).
+
+        정비 상태는 commandSet 전이 보고가 담당. 여기선 주문 역보고 축에서 제외돼 죽은 PATCH·404 WARN 이 사라진다.
+        """
+        with FakeHttpServer() as srv:
+            srv.set_handler(lambda req: {"status": 404, "json": {"code": "order_not_found"}})
+            sink = HttpStatusSinkAdapter(base_url=srv.base_url, bearer_token="t", mode="flavor")
+            mnt = StatusReport(
+                id="mnt-abc123",
+                phase="PROGRESS",
+                step_k=1,
+                step_n=2,
+                error_code=None,
+                request_id="req-mnt",
+                trace_id="trace-mnt",
+                updated_at="2026-07-18T00:00:00.000Z",
+            )
+            sink.report_status(mnt)
+            assert srv.requests == [], "정비 id 는 주문 status PATCH 를 만들지 않아야(404 노이즈 없음)"
+
     def test_offline_queue_flush_on_reconnect(self) -> None:
         """단절(전송오류) 중 적재 → 재연결 시 실 서버로 FIFO flush(멱등)."""
         oq = OfflineQueue()

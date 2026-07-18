@@ -48,6 +48,11 @@ TRACE_BATCH_MAX = 100
 RequestFn = Callable[..., "tuple[int, Mapping[str, Any] | None]"]
 
 
+# 정비 봉투 PK 접두(web `commandSet.ts`: maintenance = `mnt-{uuid}` / manufacture = `{orderId}:{attempt}`).
+#   정비는 주문이 없어 주문 status 창구로 보내면 404 → 이 접두로 판별해 주문 역보고 축에서 제외한다.
+_MAINTENANCE_ID_PREFIX = "mnt-"
+
+
 def _order_id_of(command_id: str) -> str:
     """합성키 `{orderId}:{attempt}` → orderId(마지막 콜론 앞). 콜론 없으면 그대로."""
     return command_id.rsplit(":", 1)[0]
@@ -112,7 +117,15 @@ class HttpStatusSinkAdapter:
     # ─────────────────────────────────────────────────────────────────────
 
     def report_status(self, report: StatusReport) -> None:
-        """주문 status 전진 역보고 — OQ 적재 후 즉시 flush(단절이면 큐에 남아 재연결 시 전송)."""
+        """주문 status 전진 역보고 — OQ 적재 후 즉시 flush(단절이면 큐에 남아 재연결 시 전송).
+
+        ⚠️ 정비(maintenance·`mnt-`) 봉투는 주문이 없다 → 주문 status 창구(PATCH /orders/{id})로 보내면
+          매번 404("서버 거부"). 정비 상태는 commandSet 전이 보고(report_command_set_transition·PATCH
+          /commandsets/{id})가 담당하므로 **주문 역보고 축에서 제외**한다(2026-07-18 · 404 노이즈 봉합).
+          진행 관측(trace 스팬)은 상위(_publish_progress)가 별도로 남기므로 무영향.
+        """
+        if report.id.startswith(_MAINTENANCE_ID_PREFIX):
+            return
         self._oq.enqueue(report)
         self._oq.reconnect()  # 온라인 가정 후 flush 시도 — 네트워크 실패면 send 가 False→큐 유지.
         sent = self._oq.flush(self._send_status_once)

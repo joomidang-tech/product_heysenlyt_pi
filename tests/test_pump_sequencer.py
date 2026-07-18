@@ -331,3 +331,38 @@ def test_estop_during_manufacture_preempts_in_flight(ledger):
         timer.cancel()
     assert r.outcome is JobOutcome.ESTOP_ABORTED
     assert r.steps_done < 3, "in-flight 선점 — 전 stage 완주 못 함"
+
+
+def test_op_failure_logs_raw_code_and_detail(ledger, fake):
+    """정비 엔진 op 실패 시 raw 엔진코드·detail 을 ERROR 로그로 남긴다.
+
+    ENGINE_ERROR_PERMANENT 로만 뭉개져 "홈 실패/스톨/시리얼 오류" 구분이 로그로 불가하던
+    진단 사각을 봉합(2026-07-18 실증 21:05). run_op → raw=2·detail='permanent' 를 로그로 특정.
+    """
+    from senlyt_pi.adapters.fake_engine_adapter import FakeEngineOutcome
+    from senlyt_pi.obs.log import StructuredLogger
+    from senlyt_pi.pipeline.recipe_resolver import ResolvedOpStep
+
+    records: list = []
+    log = StructuredLogger(device_id="dev-A")
+    log.bind_sink(records.append)
+    fake.script_all(FakeEngineOutcome.PERMANENT)  # run_op → raw_error_code=2, detail="permanent"
+    seq = PumpSequencer(
+        ledger=ledger,
+        engine=fake,
+        resolver=RecipeResolver({1: SPEC}),
+        request_id_gen=lambda: "req-0",
+        now_iso=lambda: "2026-07-03T00:00:00.000Z",
+        logger=log,
+    )
+    op_step = ResolvedOpStep(idx=0, pump_addr=1, op="initialize", flavor="f", spec=SPEC)
+    ok, err = seq._run_one(op_step)
+
+    assert ok is False
+    assert err is StatusErrorCode.ENGINE_ERROR_PERMANENT
+    errs = [r for r in records if r.get("severity") == "ERROR"]
+    assert len(errs) == 1, "실패 원인이 ERROR 로그로 남아야(진단 봉합)"
+    detail = errs[0].get("detail") or {}
+    assert detail.get("engineCode") == 2
+    assert detail.get("error") == "permanent"
+    assert detail.get("pumpAddr") == 1

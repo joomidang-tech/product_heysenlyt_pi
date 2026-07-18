@@ -232,6 +232,7 @@ class SenlytDaemon:
             now_iso=self._now_iso,
             valve=deps.valve,
             estop_event=self._estop,  # §9-4 — 감시 스레드 set 시 다음 stage 미시작(하드 중단).
+            logger=self._log,  # 스텝 실패 시 raw 엔진코드·detail 을 로그로 남겨 원인 특정 가능.
         )
         # 봉투 전이 sink — status_sink 가 report_command_set_transition 을 제공하면 꽂는다.
         commandset_sink = getattr(deps.status_sink, "report_command_set_transition", None)

@@ -42,6 +42,7 @@ from typing import Callable, Sequence
 from ..core.order_status import DispensePhase
 from ..core.pump_guard import StatusErrorCode
 from ..core.wire_messages import RecipeStep
+from ..obs.log import STAGE_STEP_EXEC, StructuredLogger
 from ..persistence.file_idempotency_ledger import FileIdempotencyLedger
 from ..persistence.idempotency_ledger import LedgerVerdict
 from ..ports.engine_port import EngineDispenseCommand, EnginePort
@@ -126,9 +127,12 @@ class PumpSequencer:
         valve: ValvePort | None = None,
         max_parallel: int = 8,
         estop_event: "threading.Event | None" = None,
+        logger: "StructuredLogger | None" = None,
     ) -> None:
         self.ledger = ledger
         self.resolver = resolver
+        # 실패 진단 로그용(2026-07-18) — 스텝 실패 시 raw 엔진코드·detail 을 남긴다(없으면 미기록).
+        self._log = logger
         self._executor = EngineExecutor(engine, max_retries=max_retries)
         self.request_id_gen = request_id_gen
         self.publisher = publisher
@@ -450,6 +454,16 @@ class PumpSequencer:
                 #   한다(자동 재시도 = 의도치 않은 반복 물리 동작).
                 res = self._engine_op(step)
                 ok = res.raw_error_code == 0
+                if not ok and self._log is not None:
+                    # ⚠️ 실패 원인(raw 엔진코드·detail)을 남긴다 — 없으면 ENGINE_ERROR_PERMANENT 로만
+                    #   뭉개져 "홈 실패/플런저 스톨/시리얼 오류" 구분이 로그로 불가(2026-07-18 실증 봉합).
+                    self._log.error(
+                        f"정비 엔진 조작 실패 — op={step.op}·pump={step.pump_addr}",
+                        stage=STAGE_STEP_EXEC,
+                        engineCode=res.raw_error_code,
+                        error=res.detail,
+                        pumpAddr=step.pump_addr,
+                    )
                 return (ok, None if ok else StatusErrorCode.ENGINE_ERROR_PERMANENT)
 
             if isinstance(step, ResolvedValveStep):
@@ -458,6 +472,12 @@ class PumpSequencer:
                     # pre-flight 가 걸렀어야 하는 경로 — 방어적 fail-closed.
                     return (False, StatusErrorCode.CMD_VALIDATION_FAILED)
                 res = valve.dispense_volume(step.base, step.volume_ml)
+                if not res.ok and self._log is not None:
+                    self._log.error(
+                        f"기주 밸브 토출 실패 — base={step.base}",
+                        stage=STAGE_STEP_EXEC,
+                        error=res.detail,
+                    )
                 # 밸브 실패 = permanent(시간축 재시도는 과토출 위험 — 재시도 없음·설계 §8).
                 return (res.ok, None if res.ok else StatusErrorCode.ENGINE_ERROR_PERMANENT)
 
@@ -474,8 +494,15 @@ class PumpSequencer:
             )
             res = self._executor.run_step(cmd)
             return (res.is_success, res.error_code)
-        except Exception:
-            # 어댑터 예외 = permanent 실패로 흡수(형제 태스크 완주·settle 경로 보존).
+        except Exception as exc:  # noqa: BLE001 — 어댑터 예외 흡수(형제 완주·settle 보존).
+            # 예외 메시지를 남긴다 — 안 남기면 ENGINE_ERROR_PERMANENT 로만 뭉개져 시리얼 오류인지
+            #   무엇인지 로그로 특정 불가(어댑터 예외가 가장 큰 진단 사각이었음·2026-07-18 실증 봉합).
+            if self._log is not None:
+                self._log.error(
+                    "스텝 실행 중 예외(어댑터) — permanent 실패로 흡수",
+                    stage=STAGE_STEP_EXEC,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
             return (False, StatusErrorCode.ENGINE_ERROR_PERMANENT)
 
     def _engine_op(self, step: "ResolvedOpStep"):
