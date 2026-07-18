@@ -84,6 +84,19 @@ def test_sink_receives_record() -> None:
     assert captured[0]["message"] == "x"
 
 
+def test_bind_sink_wires_after_construction() -> None:
+    """sink 없이 생성 후 bind_sink 로 지연 결선 — 데몬이 부팅 시 자기 _ship_log 를 꽂는 경로(2026-07-18)."""
+    captured: list[dict] = []
+    logger = StructuredLogger(device_id="dev-A", stream=io.StringIO(), now_iso=lambda: "t")
+    logger.warn("결선 전", stage=STAGE_STEP_EXEC)  # sink 미결선 — 아무 일 없음
+    assert captured == []
+    logger.bind_sink(captured.append)
+    logger.warn("결선 후", stage=STAGE_STEP_EXEC)  # 결선 후 — sink 수신
+    assert len(captured) == 1
+    assert captured[0]["message"] == "결선 후"
+    assert captured[0]["severity"] == "WARN"
+
+
 def test_nine_korean_stages_defined() -> None:
     assert STAGES == frozenset(
         {

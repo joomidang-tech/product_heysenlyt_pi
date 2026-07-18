@@ -87,6 +87,14 @@ class StructuredLogger:
         """등록 후 deviceId 바인딩 — 이후 모든 레코드에 자동 부착."""
         self.device_id = device_id
 
+    def bind_sink(self, sink: Callable[[dict[str, Any]], None]) -> None:
+        """서버 전송 sink 결선 — 데몬이 부팅 시 자기 `_ship_log` 를 꽂는다(생성 후 지연 결선).
+
+        `event()` 가 매 레코드(dict)를 stderr 방출과 **함께** 이 sink 로도 넘긴다 → pi 운영 로그가
+        서버 trace 로 합류(admin 관측). sink 는 best-effort — 예외는 event() 가 삼킨다(제조 무영향).
+        """
+        self._sink = sink
+
     def event(
         self,
         message: str,

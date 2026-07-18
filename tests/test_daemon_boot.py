@@ -560,3 +560,39 @@ def test_estop_watcher_poll_error_is_swallowed(ledger):
     d = _daemon(ledger, estop_source=boom)
     d.poll_estop_once()  # 예외 안 나야 함
     assert not d._estop.is_set()
+
+
+def test_ship_log_gates_warn_error_and_maps(ledger):
+    """_ship_log — WARN/ERROR 만 스팬화(INFO/DEBUG 드롭) + 필드 매핑(pi 운영로그→trace 합류·2026-07-18).
+
+    D32 멈춤 처리의 관측성 짝 — "왜 멈췄나"를 서버에서 보게 pi WARN/ERROR 로그를 trace 로 실어보낸다.
+    """
+    d = _daemon(ledger)
+    d._ship_log({"severity": "INFO", "message": "정상", "stage": "pi수신"})  # 드롭
+    d._ship_log({"severity": "DEBUG", "message": "폴", "stage": "pi수신"})  # 드롭
+    d._ship_log(
+        {
+            "severity": "WARN",
+            "message": "폴 주기 오류(삼킴)",
+            "stage": "오류",
+            "traceId": "tr-1",
+            "orderId": "o-1",
+            "deviceId": "dev-A",
+            "commandSetId": "c-1:1",
+            "ts": "2026-07-18T00:00:00.000Z",
+            "detail": {"error": "SSE timeout"},
+        }
+    )
+    spans = d._trace_buffer
+    assert len(spans) == 1  # WARN 만 실린다(INFO/DEBUG 드롭)
+    s = spans[0]
+    assert s.event == "pi.log.warn"
+    assert s.level == "WARN"
+    assert s.service == "pi"
+    assert s.trace_id == "tr-1"
+    assert s.order_id == "o-1"
+    assert s.detail is not None
+    assert s.detail["message"] == "폴 주기 오류(삼킴)"
+    assert s.detail["stage"] == "오류"
+    assert s.detail["commandSetId"] == "c-1:1"
+    assert s.detail["error"] == "SSE timeout"  # 서버 allowlist(trace.ts)가 최종 반출 게이트

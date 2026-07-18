@@ -28,7 +28,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Any, Callable
 
 from ..core.command_set import (
     MAINTENANCE_COMMAND_SET_PREFIX,
@@ -55,6 +55,12 @@ from ..ports.engine_port import EnginePort
 from ..ports.valve_port import ValvePort
 from ..ports.status_sink_port import StatusSinkPort, TraceSpan
 from .dispatcher import Dispatcher, RecipeInterpreter
+
+
+# 로그→trace 스팬 버퍼 상한 — 서버 전송 실패가 계속되면 WARN/ERROR 로그가 무한 누적하는 것을
+#   막는다(전송 실패 자체가 로그를 만들면 피드백 폭주). 상한 초과분은 드롭(dispense 스팬은 별도로
+#   항상 append — 이 상한은 로그 스팬에만 적용). durable 버퍼·재연결 flush 는 후속(§5 견고성).
+_LOG_TRACE_BUFFER_CAP = 500
 
 
 def _now_iso_ms() -> str:
@@ -229,6 +235,9 @@ class SenlytDaemon:
 
     def boot(self) -> None:
         """부팅 — BootRecovery → heartbeat 스레드 기동 → 상시 소비 루프(stop 플래그까지)."""
+        # 구조화 로그(WARN/ERROR) → 서버 trace sink 결선(첫 로그보다 먼저 — 부팅 자가진단·복구 로그도
+        #   서버로 합류시킨다). event() 가 이후 매 WARN/ERROR 레코드를 _ship_log 로 넘긴다.
+        self._log.bind_sink(self._ship_log)
         self._log.info(
             "senlytd 상시 소비 루프 시작(복구→구독→멱등→실행→역보고)",
             stage=STAGE_PI_RECEIVED,
@@ -551,6 +560,46 @@ class SenlytDaemon:
             else {"stepPhase": phase.wire, "errorCode": error_code.wire},
         )
         with self._trace_lock:
+            self._trace_buffer.append(span)
+
+    def _ship_log(self, record: dict[str, Any]) -> None:
+        """구조화 로그 레코드 → trace 스팬으로 실어 서버 중앙집중(기존 ship_trace 재사용·신규 전송 0).
+
+        pi 운영 로그(SSE 오류·폴 실패·부팅 자가진단·타임아웃)를 web·server 와 **같은 화면·같은
+        traceId** 로 합류시킨다 — "왜 멈췄나"를 admin 에서 본다(D32 멈춤 처리의 관측성 짝).
+
+        §5 정책(2026-07-18 권장 기본값):
+          - severity 게이트 = **WARN/ERROR 만**(볼륨·비용). 사건 재현 시 전량은 후속 옵션.
+          - event = ``pi.log.{severity}`` — dispense 스팬(``dispense.*``)과 구분.
+          - traceId 없는 운영 로그는 ``trace_id=""`` 로 실어 admin **로그검색(service=pi)** 축에
+            합류한다(타임라인 축은 traceId 있는 것만 엮인다).
+          - detail(message·stage·commandSetId·error 등)은 **서버 allowlist(trace.ts)가 2차 게이트** —
+            등록 안 된 키는 서버가 폐기한다(비-PII 고정 문자열만 등록).
+        """
+        if record.get("severity") not in ("WARN", "ERROR"):
+            return
+        detail: dict[str, Any] = {
+            "message": record.get("message"),
+            "stage": record.get("stage"),
+            "commandSetId": record.get("commandSetId"),
+        }
+        inner = record.get("detail")
+        if isinstance(inner, dict):
+            detail.update(inner)  # error 등 구조화 필드 — 서버 allowlist 가 최종 반출 결정
+        span = TraceSpan(
+            ts=str(record.get("ts") or self._now_iso()),
+            trace_id=str(record.get("traceId") or ""),
+            span_id=secrets.token_hex(8),
+            service="pi",
+            event=f"pi.log.{str(record.get('severity', 'info')).lower()}",
+            level=str(record.get("severity", "INFO")),
+            order_id=record.get("orderId"),
+            device_id=record.get("deviceId"),
+            detail=detail,
+        )
+        with self._trace_lock:
+            if len(self._trace_buffer) >= _LOG_TRACE_BUFFER_CAP:
+                return  # 전송 실패 누적·로그 폭주 방어(상한 초과분 드롭)
             self._trace_buffer.append(span)
 
     # ─────────────────────────────────────────────────────────────────────
