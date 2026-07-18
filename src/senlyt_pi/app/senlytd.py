@@ -53,6 +53,27 @@ def _resolve_poll_interval_s(environ: Mapping[str, str]) -> float:
     return ms / 1000.0 if ms > 0 else 1.0
 
 
+def _resolve_trace_flush_s(environ: Mapping[str, str]) -> float:
+    """SENLYT_TRACE_FLUSH_INTERVAL_MS(기본 10000) → 초. DEBUG/INFO 배치 주기(RC8 노브)."""
+    raw = environ.get("SENLYT_TRACE_FLUSH_INTERVAL_MS", "").strip()
+    if not raw:
+        return 10.0
+    try:
+        ms = float(raw)
+    except ValueError:
+        return 10.0
+    return ms / 1000.0 if ms > 0 else 10.0
+
+
+def _resolve_ship_log_min_severity(environ: Mapping[str, str]) -> str:
+    """SENLYT_SHIP_LOG_MIN_SEVERITY(기본 DEBUG=전 레벨 전송) — 이 값 이상 severity 만 서버 합류(RC8 노브).
+
+    DEBUG 폭주를 운영 중 INFO/WARN 으로 **재배포 없이** 낮추는 안전밸브. 유효값 아니면 DEBUG 폴백.
+    """
+    raw = environ.get("SENLYT_SHIP_LOG_MIN_SEVERITY", "").strip().upper()
+    return raw if raw in ("DEBUG", "INFO", "WARN", "ERROR") else "DEBUG"
+
+
 def _selftest(environ: Mapping[str, str], logger: StructuredLogger) -> int:
     """실 어댑터 조립 self-test — ServerConfig 결정 + 실 등록 + 어댑터 결선(펌프 미구동)."""
     from ..config.server_target import ServerTargetError
@@ -148,6 +169,9 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         commandset_source=components.command_source,  # 동일 SSE 어댑터가 두 축 제공.
         logger=components.logger,
         poll_interval_s=_resolve_poll_interval_s(environ),
+        # 관측 로그 볼륨 노브(RC8) — 재배포 없이 env 로 조절. 기본 = DEBUG 전량·10s 배치.
+        ship_log_min_severity=_resolve_ship_log_min_severity(environ),
+        trace_flush_interval_s=_resolve_trace_flush_s(environ),
         # 긴급정지 fast-poll 소스(§9-4) — HTTP status_sink 의 estop GET 을 device_id 로 바인딩한다.
         #   제조 중에도 즉시 선점하려면 명령 폴과 무관한 이 별도 축이 필요하다.
         estop_source=lambda: components.status_sink.poll_estop(components.device_id),

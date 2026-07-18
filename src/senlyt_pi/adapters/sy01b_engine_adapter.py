@@ -63,6 +63,7 @@ import time
 from typing import Callable, Iterable, Protocol, Sequence
 
 from ..core.pump_guard import PumpPreset, SyringeSpec, clamp_pump_preset
+from ..obs.log import STAGE_STEP_EXEC, StructuredLogger
 from ..ports.engine_port import (
     OP_ESTOP,
     OP_INITIALIZE,
@@ -202,7 +203,11 @@ class Sy01bEngineAdapter:
         serial_factory: SerialFactory | None = None,
         stop_event: threading.Event | None = None,
         estop_event: threading.Event | None = None,
+        logger: StructuredLogger | None = None,
     ) -> None:
+        # 시리얼 관측 로거(RC4·2026-07-19) — 매 프레임 송신/응답·estop TR·홈상실·오버로드·브로드캐스트
+        #   수신확인을 서버 trace 로 흘린다("실기기서 무슨 바이트가 오갔나"를 admin 에서). None 이면 무계측.
+        self._log = logger
         self.port = port
         self.baudrate = baudrate
         # bounded-read 계약(F1) — 한 트랜잭션의 수신 상한.
@@ -263,13 +268,19 @@ class Sy01bEngineAdapter:
         전량 시도).
         """
         self._estop.set()
+        # 긴급정지 = 안전상 가장 중요한 이벤트 → WARN(즉시 flush·headroom 보호)로 서버 표면화(RC4).
+        if self._log is not None:
+            self._log.warn("긴급정지 발동 — 전 펌프 TR 발송", stage=STAGE_STEP_EXEC)
         for addr in addrs:
             if addr < 1:
                 continue  # 0 = RS485 브로드캐스트 금지
             try:
                 self._txn(addr, TERMINATE)
             except Exception:  # noqa: BLE001 — 한 펌프 TR 실패가 나머지 정지를 막지 않는다.
-                pass
+                if self._log is not None:
+                    self._log.warn(
+                        "긴급정지 TR 발송 실패", stage=STAGE_STEP_EXEC, pumpAddr=addr
+                    )
             self._initialized.discard(addr)
 
     def clear_estop(self) -> None:
@@ -316,7 +327,17 @@ class Sy01bEngineAdapter:
                 if self._stop.is_set():
                     break
                 time.sleep(0.005)
-            return buf.decode("ascii", errors="ignore")
+            resp = buf.decode("ascii", errors="ignore")
+        # 시리얼 왕복 관측(RC4) — 버스 락 **밖**에서 로깅(락 홀드 최소화). 매 프레임이라 DEBUG.
+        if self._log is not None:
+            self._log.debug(
+                "시리얼 왕복",
+                stage=STAGE_STEP_EXEC,
+                pumpAddr=addr,
+                command=command,
+                response=(resp.strip() or "(무응답)"),
+            )
+        return resp
 
     def _query_status(self, addr: int, *, read_timeout_s: float | None = None) -> tuple[int, bool]:
         """`?` 한 번 — `(error_code, ready)`. 모터 회전 중에도 수락되는 명령이다."""
@@ -359,6 +380,13 @@ class Sy01bEngineAdapter:
                 # 무응답·미초기화 = 아직 준비 안 됨(계속 폴링). 단 7 은 셋업 캐시 무효화(재초기화 신호).
                 if code == 7:
                     self._initialized.discard(addr)
+                    if self._log is not None:
+                        self._log.warn(
+                            "펌프 홈 상실(Code 7) — 재초기화 예약",
+                            stage=STAGE_STEP_EXEC,
+                            pumpAddr=addr,
+                            engineCode=7,
+                        )
                 time.sleep(POLL_INTERVAL_S)
                 continue
             if code in (9, 10):
@@ -368,6 +396,13 @@ class Sy01bEngineAdapter:
                 except Exception:  # noqa: BLE001 — TR 실패가 에러 보고를 막지 않는다.
                     pass
                 self._initialized.discard(addr)
+                if self._log is not None:
+                    self._log.warn(
+                        "펌프 오버로드 래치 — TR+재초기화 강제",
+                        stage=STAGE_STEP_EXEC,
+                        pumpAddr=addr,
+                        engineCode=code,
+                    )
                 return code
             if code != 0:
                 return code  # 그 외 하드웨어 에러 — 즉시 상위 분류로.
@@ -478,6 +513,15 @@ class Sy01bEngineAdapter:
             conn.write(frame)
             time.sleep(WRITE_SETTLE_S)
         time.sleep(BROADCAST_SETTLE_S)  # 무응답이라 이 대기 + 뒤의 개별 확인으로만 보장.
+        # 브로드캐스트 송신 관측(RC4·검증 갭 봉합) — `_txn` 을 안 거치므로 여기서 별도 DEBUG.
+        #   pumpAddr=0 = 전 펌프(브로드캐스트) 표식. 응답은 뒤이은 _verify_alive/_poll 이 펌프별로 남긴다.
+        if self._log is not None:
+            self._log.debug(
+                "브로드캐스트 송신",
+                stage=STAGE_STEP_EXEC,
+                pumpAddr=0,
+                command=f"/{BROADCAST_ADDR}{command}",
+            )
 
     def _verify_alive(self, addrs: "Sequence[int]", results: "dict[int, int]") -> None:
         """각 펌프가 **응답하는지**(연결성) 개별 `?` 로 확인 — 무응답이면 그 펌프를 실패로 기록.
@@ -493,6 +537,12 @@ class Sy01bEngineAdapter:
             code, _ready = self._query_status(a)
             if code == _NO_RESPONSE:
                 results[a] = _NO_RESPONSE  # 브로드캐스트 미수신/연결 끊김.
+                if self._log is not None:
+                    self._log.warn(
+                        "브로드캐스트 미수신 — 펌프 무응답/연결 끊김",
+                        stage=STAGE_STEP_EXEC,
+                        pumpAddr=a,
+                    )
 
     def initialize_broadcast(self, addrs: "Sequence[int]", spec: SyringeSpec) -> "dict[int, int]":
         """전 펌프 **동시** 초기화 — v1.1.0 `RealPumpService.initializeAll` 미러(브로드캐스트 홈).

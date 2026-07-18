@@ -622,9 +622,28 @@ class SenlytDaemon:
         )
         with self._trace_lock:
             if len(self._trace_buffer) >= _LOG_TRACE_BUFFER_CAP:
-                # 상한 초과분 드롭 — 조용히 버리지 않고 건수를 센다(flush 시 합성 WARN 으로 보고).
-                self._trace_dropped += 1
-                return
+                # RC5 — **심각도 인지 드롭**(2026-07-19). 버퍼가 저가치 DEBUG/INFO 로 차 있을 때 그 순간
+                #   도착한 WARN/ERROR(가장 중요한 실패 신호)가 밀려나던 결함 봉합. WARN 이상이면 가장
+                #   오래된 DEBUG/INFO 를 evict 하고 자리 확보, 저심각도만 있으면 신착을 드롭(기존 동작).
+                if _SEVERITY_RANK.get(severity, 1) >= 2:
+                    evict_idx = next(
+                        (
+                            i
+                            for i, s in enumerate(self._trace_buffer)
+                            if _SEVERITY_RANK.get(str(s.level).upper(), 1) < 2
+                        ),
+                        None,
+                    )
+                    if evict_idx is not None:
+                        del self._trace_buffer[evict_idx]  # 오래된 DEBUG/INFO 밀어냄
+                    else:
+                        # 버퍼 전량 WARN/ERROR — 가장 오래된 것을 드롭(최신 실패 신호가 더 가치).
+                        self._trace_buffer.pop(0)
+                    self._trace_dropped += 1
+                else:
+                    # 저심각도(DEBUG/INFO) 신착 — 조용히 버리지 않고 건수를 센다(flush 시 합성 WARN).
+                    self._trace_dropped += 1
+                    return
             self._trace_buffer.append(span)
         # WARN/ERROR = 실패 신호 → sender 를 깨워 즉시 전송(INFO 는 배치 주기까지 대기).
         if _SEVERITY_RANK.get(severity, 1) >= 2:

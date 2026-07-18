@@ -133,6 +133,7 @@ def build_engine(
     on_pi: Callable[[], bool] | None = None,
     port_lister: "Callable[[], list] | None" = None,
     estop_event: "threading.Event | None" = None,
+    logger: StructuredLogger | None = None,
 ) -> EnginePort:
     """엔진 조립 — 주입 우선. **env 미지정이면 자동감지**(실 Pi + 시리얼 어댑터 존재 → sy01b·아니면 fake).
 
@@ -162,8 +163,8 @@ def build_engine(
         #   모션 폴이 데몬이 세운 래치를 직접 보고 즉시 bail 한다(설계 '단일 공유 _estop').
         #   port=None(미탐지) 이면 어댑터 기본값(/dev/ttyUSB0) 유지 — None 을 넘기지 않는다.
         if port:
-            return Sy01bEngineAdapter(port=port, estop_event=estop_event)
-        return Sy01bEngineAdapter(estop_event=estop_event)
+            return Sy01bEngineAdapter(port=port, estop_event=estop_event, logger=logger)
+        return Sy01bEngineAdapter(estop_event=estop_event, logger=logger)
     return FakeEnginePort(estop_event=estop_event)
 
 
@@ -484,7 +485,7 @@ def build_components(
 
     # 4) 엔진·밸브 자동감지 + 부팅 자가진단 로그(눈에 띄게) — "URL만" 설치에서 실제 하드웨어를
     #    무엇으로 잡았는지 운영자가 로그로 확인한다(silent auto 금지 — auto + visible self-diagnostic).
-    engine_adapter = build_engine(environ, engine=engine, estop_event=estop_event)
+    engine_adapter = build_engine(environ, engine=engine, estop_event=estop_event, logger=log)
     valve_adapter = build_valve(environ)
     log.event(
         "하드웨어 자가진단 — 엔진·밸브 자동감지 결과",

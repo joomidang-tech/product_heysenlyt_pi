@@ -268,8 +268,10 @@ class HttpStatusSinkAdapter:
                     "POST", url, body=body, headers=headers, timeout=self.timeout
                 )
             except HttpTransportError:
-                # best-effort — trace 유실은 제조를 막지 않는다(§10-6 (1)). 조용히 포기.
-                return
+                # best-effort — trace 유실은 제조를 막지 않는다(§10-6 (1)).
+                # ⚠️ RC2(2026-07-19): `return` → `continue` — 한 청크 전송 실패가 **나머지 청크 전량을
+                #   포기**시키던 결함 봉합. 실패 청크만 스킵하고 다음 청크는 계속 전송한다.
+                continue
 
     # ─────────────────────────────────────────────────────────────────────
     # 05_api §8  CommandSet 봉투 전이 보고 — PATCH commandsets/[id]
