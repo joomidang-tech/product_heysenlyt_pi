@@ -419,16 +419,17 @@ class PumpSequencer:
         - 다스텝 stage 는 ThreadPoolExecutor 로 병렬 — **전 future 완주 대기**(부분 취소 없음).
           per-step 재시도(EngineExecutor R=3)는 태스크 안에서 펌프별 **독립** 진행.
         """
-        if len(stage_steps) == 1:
-            return [self._run_one(stage_steps[0])]
-        # ── 브로드캐스트 초기화 합치기(v1.1.0 병렬 홈) ─────────────────────────────
-        #   같은 stage 가 **전부 `initialize` op** 이면, per-pump 동시 명령(반이중 RS485 경합으로
-        #   초기화가 깨졌던 D38 stage:0)이 아니라 **브로드캐스트 1콜**(명령 1발·경합 없음 + 최종
-        #   Ready 폴로 펌프별 판정)로 처리한다. 브로드캐스트 미지원 엔진(Fake/구 어댑터)은 None →
-        #   아래 일반 동시 실행으로 폴백(테스트·하위호환 무영향).
+        # ── 정비 초기화 = fire-and-forget 브로드캐스트 (1펌프·다펌프 공통) ──────────
+        #   initialize op stage 는 **`len==1` 이라도** 개별 run_op 경로(`_ensure_ready` 의
+        #   Ready 폴 — 깨진 시리얼 링크에서 -1000 오탐, 2026-07-19 실기기)로 보내지 않고
+        #   브로드캐스트 fire-and-forget 1콜로 처리한다(명령 1발·경합 없음·폴 없음).
+        #   브로드캐스트 미지원 엔진(Fake/구 어댑터)은 None → 아래 기존 경로로 폴백
+        #   (테스트·하위호환 무영향).
         coalesced = self._maybe_broadcast_init(stage_steps)
         if coalesced is not None:
             return coalesced
+        if len(stage_steps) == 1:
+            return [self._run_one(stage_steps[0])]
         pool = self._ensure_pool()
         # submit 자체의 예외(워커 스레드 생성 실패 등·리뷰 P2 봉합)도 가드 — 이미 제출된
         # future 는 **반드시 완주 대기**(고아 in-flight 모션 금지) 후 실패 결과로 집계한다.
@@ -450,11 +451,14 @@ class PumpSequencer:
     ) -> "list[tuple[bool, StatusErrorCode | None]] | None":
         """stage 가 **전부 initialize op** 이고 엔진이 브로드캐스트를 지원하면 1콜로 합쳐 실행.
 
-        반환: 해당·지원 시 per-step (ok, code) 목록 / 아니면 None(일반 동시 실행 폴백).
-        브로드캐스트가 각 펌프에 닿았는지는 어댑터 `initialize_broadcast` 가 **최종 Ready 폴**로
-        펌프별 판정해 {addr: code} 로 돌려주므로, 여기서 step 순서대로 매핑해 보고한다
-        (연결성 = 끝 폴 결과 — 진짜 죽은 펌프만 타임아웃으로 드러난다).
+        반환: 해당·지원 시 per-step (ok, code) 목록 / 아니면 None(기존 경로 폴백).
+        어댑터 `initialize_broadcast` 는 **fire-and-forget**(2026-07-19) — 명령만 쏘고 `?` 판정
+        없이 전 펌프 성공({addr: 0})을 돌려준다. 진짜 죽은 펌프는 이후 토출 경로의 Ready 폴에서
+        드러난다(silent-success 는 정비 한정 허용). 비-0 은 estop/shutdown 이 시퀀스를 중단한
+        경우뿐이다(캐시 미등록·운영자 재시도).
         """
+        if not stage_steps:
+            return None  # 방어 — resolver 가 빈 stage 를 막지만, all([])==True 함정 차단.
         if not all(
             isinstance(s, ResolvedOpStep) and s.op == OP_INITIALIZE for s in stage_steps
         ):
@@ -464,6 +468,13 @@ class PumpSequencer:
             return None  # Fake/구 어댑터 — 일반 per-pump 동시 실행으로 폴백.
         addrs = [s.pump_addr for s in stage_steps]
         spec = stage_steps[0].spec
+        if self._log is not None:
+            # 폴 없이 발사만 하므로, "명령이 나갔다"는 사실 자체를 관측 흔적으로 남긴다.
+            self._log.info(
+                "정비 초기화 발사(fire-and-forget·폴 생략)",
+                stage=STAGE_STEP_EXEC,
+                pumpAddrs=addrs,
+            )
         try:
             results = init_broadcast(addrs, spec)
         except Exception as exc:  # noqa: BLE001 — 브로드캐스트 실패도 흡수(형제 완주 계약·다음 stage 미진입).
@@ -478,9 +489,10 @@ class PumpSequencer:
         for s in stage_steps:
             code = results.get(s.pump_addr, -1)  # 목록에 없으면(방어) 실패 처리.
             ok = code == 0
+            # fire-and-forget 정상 경로에선 전부 0 — 비-0 = estop/shutdown 중단(+매핑 누락 방어).
             if not ok and self._log is not None:
                 self._log.error(
-                    f"브로드캐스트 초기화 실패 — pump={s.pump_addr}",
+                    f"정비 초기화 미완 — pump={s.pump_addr}",
                     stage=STAGE_STEP_EXEC,
                     engineCode=code,
                     pumpAddr=s.pump_addr,
