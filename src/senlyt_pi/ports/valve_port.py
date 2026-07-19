@@ -8,6 +8,8 @@
   - try/finally 닫힘: 오류가 나도 반드시 close.
   - 최대 개방 클램프: openSec ≤ max_open_sec(밸브가 영원히 열리는 것 차단).
   - 시작·종료 시 닫힘(Active-LOW·initial off).
+  - 래치 개방(open_latch·2026-07-19 스위치)도 **무기한 금지** — auto_close_sec 뒤 어댑터
+    타이머가 반드시 자동 닫힘(close_all 은 타이머 취소 포함 멱등).
 """
 
 from __future__ import annotations
@@ -38,6 +40,14 @@ class ValvePort(Protocol):
 
         open_sec 지정(점검 "N초 열기"·2026-07-19) 시 그 시간으로 직접 개방(max 클램프 동일),
         None 이면 기존대로 volume_ml ÷ flowRate 파생(제조 기주 토출)."""
+        ...
+
+    def open_latch(self, base: str, auto_close_sec: float) -> ValveDispenseResult:
+        """base 밸브를 **비블로킹 래치 개방**한다(관제 ON/OFF 스위치·2026-07-19).
+
+        즉시 반환하며, auto_close_sec(어댑터 max_open_sec 클램프 동일) 뒤 타이머가 자동으로
+        닫는다 — 무기한 개방 금지(열림 방치 = 기주 유출). 먼저 닫으려면 close_all(스위치 OFF).
+        상호배타는 dispense_volume 과 동일(open 전 전 밸브 close)."""
         ...
 
     def close_all(self) -> None:

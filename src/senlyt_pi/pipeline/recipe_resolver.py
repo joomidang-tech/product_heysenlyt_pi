@@ -105,6 +105,9 @@ class ResolvedValveStep:
     stage: int = 0
     # 개방 시간 직접 지정(점검 "N초 열기"·2026-07-19) — None = volume_ml→flowRate 파생(제조).
     open_sec: float | None = None
+    # 밸브 스위치(2026-07-19) — "open"=래치 개방(open_sec 상한 뒤 어댑터 자동 닫힘·비블로킹) ·
+    #   "close"=즉시 강제 닫힘(멱등·인자 불요). None = 기존 시간축 토출/점검.
+    valve_op: str | None = None
 
 
 class RecipeValidationError(Exception):
@@ -239,10 +242,31 @@ class RecipeResolver:
                     raise RecipeValidationError("multiple_valve_steps", idx=s.idx)
                 if s.base not in VALVE_BASES:
                     raise RecipeValidationError("unknown_valve_base", idx=s.idx)
+                # 밸브 스위치(2026-07-19) — op 화이트리스트(모르는 op 는 fail-closed drop).
+                valve_op = s.op
+                if valve_op is not None and valve_op not in ("open", "close"):
+                    raise RecipeValidationError("unknown_valve_op", idx=s.idx)
                 volume_ml = float(s.volume_ml) if s.volume_ml is not None else 0.0
                 open_sec = getattr(s, "open_sec", None)
+                if valve_op == "close":
+                    # 닫기 = 인자 불요(openSec·volumeMl 무시) — 멱등 강제 닫힘이라 게이트 없음.
+                    resolved.append(
+                        ResolvedValveStep(
+                            idx=s.idx,
+                            base=s.base,
+                            volume_ml=0.0,
+                            flavor=s.flavor,
+                            stage=stage,
+                            open_sec=None,
+                            valve_op="close",
+                        )
+                    )
+                    continue
+                if valve_op == "open" and open_sec is None:
+                    # 래치 개방은 자동 닫힘 상한(openSec)이 **필수** — 무기한 개방 금지(fail-closed).
+                    raise RecipeValidationError("valve_open_requires_open_sec", idx=s.idx)
                 if open_sec is not None:
-                    # 점검 "N초 열기"(2026-07-19) — 개방시간 직접 지정. 유한·양수만(어댑터가
+                    # 점검 "N초 열기"/래치 개방(2026-07-19) — 개방시간 직접 지정. 유한·양수만(어댑터가
                     #   max_open_sec 로 상한 클램프·거부). volume_ml 은 관측 라벨용(0 허용).
                     if not math.isfinite(float(open_sec)) or float(open_sec) <= 0:
                         raise RecipeValidationError("non_positive_valve_open_sec", idx=s.idx)
@@ -256,6 +280,7 @@ class RecipeResolver:
                         flavor=s.flavor,
                         stage=stage,
                         open_sec=(float(open_sec) if open_sec is not None else None),
+                        valve_op=valve_op,
                     )
                 )
                 continue

@@ -839,9 +839,22 @@ class SenlytDaemon:
                     device_id=self.deps.device_id,
                     error=str(e),
                 )
+        # 기주 밸브 즉시 닫힘(2026-07-19 스위치 래치 도입 동반) — 래치 개방(ON) 중 estop 이 오면
+        #   펌프 TR 만으로는 밸브가 열린 채 남는다(기주 유출). close_all = 타이머 취소 포함 멱등.
+        valve = self.deps.valve
+        if valve is not None:
+            try:
+                valve.close_all()
+            except Exception as e:  # noqa: BLE001 — 밸브 닫힘 실패가 estop 래치를 막지 않는다.
+                self._log.warn(
+                    "긴급정지 밸브 닫힘 오류(래치 유지)",
+                    stage=STAGE_ERROR,
+                    device_id=self.deps.device_id,
+                    error=str(e),
+                )
         self._last_error = StatusErrorCode.INTERRUPTED
         self._log.warn(
-            "긴급정지 발동 — 전 펌프 TR + 진행 제조 하드 중단(§9-4)",
+            "긴급정지 발동 — 전 펌프 TR + 기주 밸브 close + 진행 제조 하드 중단(§9-4)",
             stage=STAGE_ERROR,
             device_id=self.deps.device_id,
             pumps=addrs,

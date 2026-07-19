@@ -580,6 +580,32 @@ class PumpSequencer:
                 if valve is None:
                     # pre-flight 가 걸렀어야 하는 경로 — 방어적 fail-closed.
                     return (False, StatusErrorCode.CMD_VALIDATION_FAILED)
+                # ── 밸브 스위치(2026-07-19) — open=래치 개방(비블로킹·자동 닫힘)·close=즉시 닫힘. ──
+                valve_op = getattr(step, "valve_op", None)
+                if valve_op == "close":
+                    # 멱등 강제 닫힘(래치 타이머 취소 포함) — close_all 은 실패 개념이 없다(best-effort
+                    #   불변식: 어댑터가 예외 없이 전 밸브 off). 예외는 바깥 except 가 흡수.
+                    valve.close_all()
+                    return (True, None)
+                if valve_op == "open":
+                    open_latch = getattr(valve, "open_latch", None)
+                    if not callable(open_latch):
+                        # 구 어댑터(래치 미지원) — fail-closed(조용한 성공 금지).
+                        if self._log is not None:
+                            self._log.error(
+                                f"밸브 래치 미지원 어댑터 — base={step.base}",
+                                stage=STAGE_STEP_EXEC,
+                                error="valve adapter has no open_latch",
+                            )
+                        return (False, StatusErrorCode.CMD_VALIDATION_FAILED)
+                    res = open_latch(step.base, step.open_sec)
+                    if not res.ok and self._log is not None:
+                        self._log.error(
+                            f"기주 밸브 래치 개방 실패 — base={step.base}",
+                            stage=STAGE_STEP_EXEC,
+                            error=res.detail,
+                        )
+                    return (res.ok, None if res.ok else StatusErrorCode.ENGINE_ERROR_PERMANENT)
                 # open_sec 지정(점검 "N초 열기") 시 3-인자 호출 — 구 테스트 더블(2-인자) 하위호환.
                 if step.open_sec is not None:
                     res = valve.dispense_volume(step.base, step.volume_ml, step.open_sec)

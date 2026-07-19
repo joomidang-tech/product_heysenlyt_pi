@@ -61,6 +61,9 @@ class RecipeStep:
     #   열기" 점검용 — 구 pi 는 이 키를 몰라 volumeMl(0) 파생 0초 개방 = 무해 no-op(하위호환).
     open_sec: float | None = None
     # engineOp 전용 — "estop" | "initialize" | "plungerFull" | "plungerHome"(wire camelCase 그대로).
+    # valve 전용(2026-07-19 스위치) — "open"(래치 개방·openSec 뒤 자동 닫힘) | "close"(즉시 닫힘).
+    #   부재 = 기존 시간축 토출/점검. 구 pi 는 이 키를 몰라 open→openSec 시간 개방(동등 열화),
+    #   close→volumeMl 0 RR drop(무해 no-op) — 하위호환.
     op: str | None = None
     # ── 회전 밸브 구멍 + 속도 (2026-07-17 · 서버가 배치·정책을 해석해 실어 보낸다) ──────
     #
@@ -118,6 +121,7 @@ class RecipeStep:
         if kind == VALVE_STEP_KIND:
             base = str(j["base"])
             raw_open = j.get("openSec")
+            raw_vop = j.get("op")  # 밸브 스위치(2026-07-19) — "open"|"close"(검증은 RR).
             return RecipeStep(
                 idx=int(j["idx"]),
                 pump_addr=VALVE_PUMP_ADDR,
@@ -132,6 +136,7 @@ class RecipeStep:
                     if isinstance(raw_open, (int, float)) and not isinstance(raw_open, bool)
                     else None
                 ),
+                op=(str(raw_vop) if isinstance(raw_vop, str) else None),
             )
         def _opt_int(key: str) -> int | None:
             v = j.get(key)
@@ -166,7 +171,7 @@ class RecipeStep:
                 out["valvePort"] = self.in_port  # 이동 전 회전 밸브(왕복 보존·from_json 대칭)
             return out
         if self.kind == VALVE_STEP_KIND:
-            return {
+            vout: dict[str, Any] = {
                 "idx": self.idx,
                 "stage": self.effective_stage,
                 "kind": VALVE_STEP_KIND,
@@ -179,6 +184,13 @@ class RecipeStep:
                 "pumpAddr": VALVE_PUMP_ADDR,
                 "volume": 0,
             }
+            # 보유할 때만 방출(왕복 보존 — from_json 대칭). openSec 은 종전 미방출로 왕복 유실이던
+            # 잠복 결함을 op(스위치·2026-07-19) 추가와 함께 봉합.
+            if self.open_sec is not None:
+                vout["openSec"] = self.open_sec
+            if self.op is not None:
+                vout["op"] = self.op
+            return vout
         m: dict[str, Any] = {
             "idx": self.idx,
             "pumpAddr": self.pump_addr,
