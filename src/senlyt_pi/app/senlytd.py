@@ -189,6 +189,9 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
             mode=getattr(components, "mode", None),
         ),
         commandset_source=components.command_source,  # 동일 SSE 어댑터가 두 축 제공.
+        # 주기 HW 감시 기대 주소(실시간 판단·2026-07-19) — 부팅 인식이 비어도 이 주소들을 계속
+        #   프로브해 pumpHealth 로 보고(어댑터 미장착 = silent 빨강, USB 꽂히면 ok 초록 자동 전환).
+        hw_watch_addrs=(1, 2) if getattr(components, "mode", None) == "flavor" else (1, 2, 3),
         logger=components.logger,
         poll_interval_s=_resolve_poll_interval_s(environ),
         heartbeat_interval_s=_resolve_heartbeat_interval_s(environ),

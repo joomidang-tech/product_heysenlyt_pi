@@ -265,3 +265,47 @@ class TestHealthProbe:
         assert (
             Sy01bEngineAdapter(serial_factory=lambda *_a: silent).health_probe(1) == "silent"
         )
+
+
+# ── E. 실시간 HW 감시 — 부팅 인식 실패여도 기대 주소를 계속 프로브 (2026-07-19 확정) ──
+
+
+class TestHwWatchRealtime:
+    def test_health_probe_uses_watch_addrs_when_pump_map_empty(self):
+        """pump_map 이 비어도(어댑터 미장착 부팅) hw_watch_addrs 를 프로브해 pumpHealth 를
+        만든다 — admin 이 '부팅 스냅샷'이 아니라 실시간 무응답(빨강)을 본다."""
+        from senlyt_pi.app.daemon import DaemonDeps, SenlytDaemon
+        from senlyt_pi.persistence.idempotency_ledger import InMemoryIdempotencyLedger
+
+        class _Probe:
+            def __init__(self):
+                self.asked: list[int] = []
+
+            def health_probe(self, addr: int) -> str:
+                self.asked.append(addr)
+                return "silent"  # 어댑터 없음 — 전 주소 무응답(정직한 빨강)
+
+        class _Sink:
+            def send_heartbeat(self, hb):
+                self.last = hb
+
+            def report_status(self, r):
+                pass
+
+        engine = _Probe()
+        d = SenlytDaemon(
+            DaemonDeps(
+                device_id="dev-A",
+                command_source=type("S", (), {"commands": lambda s, i: iter(())})(),
+                status_sink=_Sink(),
+                engine=engine,  # type: ignore[arg-type]
+                ledger=InMemoryIdempotencyLedger(),  # type: ignore[arg-type]
+                heartbeat_interval_s=0,
+                hw_watch_addrs=(1, 2),
+            )
+        )
+        assert sorted(d._sequencer.resolver.pump_map) == []  # 부팅 인식 실패 상황
+        d._refresh_hw_health()
+        assert engine.asked == [1, 2]  # 기대 주소를 실측했다(실시간 판단)
+        assert d._pump_health == {1: "silent", 2: "silent"}
+        assert d._hw_checked_at is not None

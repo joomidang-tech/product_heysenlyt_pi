@@ -85,8 +85,14 @@ def test_engine_autodetect_pi_with_serial_is_sy01b() -> None:
     assert isinstance(eng, Sy01bEngineAdapter)
 
 
-def test_engine_autodetect_pi_without_serial_is_fake() -> None:
-    assert isinstance(build_engine({}, on_pi=lambda: True, port_lister=list), FakeEnginePort)
+def test_engine_autodetect_pi_without_serial_is_still_sy01b() -> None:
+    """실 Pi + 어댑터 미발견 → **그래도 sy01b** (2026-07-19 개정 — fake 조용 후퇴 금지).
+
+    종전엔 fake 로 떨어져 명령이 모의로 조용히 성공했다(17:08 실측: USB 사망 후 재시작 →
+    admin '엔진 fake'·done 인데 실물 정지). 이제 sy01b 로 기동해 정직하게 실패(무응답
+    silent=빨강)하고, 핫플러그 자가 재연결이 USB 등장 시 스스로 붙는다."""
+    eng = build_engine({}, on_pi=lambda: True, port_lister=list)
+    assert isinstance(eng, Sy01bEngineAdapter)
 
 
 def test_engine_autodetect_non_pi_is_fake_even_with_serial() -> None:

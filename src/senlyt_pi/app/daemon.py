@@ -172,6 +172,11 @@ class DaemonDeps:
     #   모두 주입한다. 미주입 시 데몬이 자체 생성(테스트/구성 폴백) — 이 경우 _trigger_estop 이
     #   emergency_stop_all 로 어댑터 축도 함께 구동하므로 협조적으로 동작한다.
     estop_event: "threading.Event | None" = None
+    # 주기 HW 감시의 기대 주소(2026-07-19 "실시간 판단" 확정) — 부팅 자동인식(pump_map)이 **비어
+    #   있어도** 이 주소들은 계속 프로브해 pumpHealth(silent=빨강)로 보고한다. 종전엔 pump_map 이
+    #   빈 채 부팅하면(어댑터 미장착 등) 감시 대상 0 → admin 이 부팅 스냅샷 폴백에 갇혔다.
+    #   mode 파생(flavor=[1,2]·fragrance=[1,2,3]) — senlytd 가 주입. None = pump_map 만(하위호환).
+    hw_watch_addrs: "tuple[int, ...] | None" = None
 
 
 class SenlytDaemon:
@@ -862,6 +867,11 @@ class SenlytDaemon:
             return
         pumps = sorted(self._sequencer.resolver.pump_map)
         if not pumps:
+            # 부팅 인식 실패(어댑터 미장착 등)여도 **기대 주소를 계속 실측**한다(실시간 판단 —
+            #   2026-07-19 확정). 그래야 admin 이 "무응답(빨강)"을 정직하게 보여주고, USB 가
+            #   나중에 꽂히면 ok(초록)로 살아나는 것도 보인다.
+            pumps = sorted(self.deps.hw_watch_addrs or ())
+        if not pumps:
             return
         health: dict[int, str] = {}
         for addr in pumps:
@@ -873,6 +883,16 @@ class SenlytDaemon:
                 health[addr] = "silent"
         self._pump_health = health
         self._hw_checked_at = self._now_iso()
+        # 펌프는 응답하는데 부팅 인식(pump_map)이 비어 제조가 보류 중인 상태를 표면화(WARN 즉시
+        #   flush — 30s 주기 반복은 "조치 필요 지속" 신호로 의도). 자동 재발견은 백로그(resolver
+        #   재구성 필요) — 현 복구 경로는 senlytd 재시작.
+        if not self._sequencer.resolver.pump_map and any(v == "ok" for v in health.values()):
+            self._log.warn(
+                "펌프 응답 감지 — 부팅 인식 실패로 제조 보류 중(재시작 시 재개·자동 재발견 백로그)",
+                stage=STAGE_PI_RECEIVED,
+                device_id=self.deps.device_id,
+                pumpHealth={str(a): s for a, s in health.items()},
+            )
 
     def _emit_heartbeat(self) -> None:
         """heartbeat 전송(queueDepth 파생) + ship_trace 배치 flush + OQ flush — 전부 best-effort."""

@@ -152,10 +152,15 @@ def build_engine(
 
     raw = environ.get(SENLYT_ENGINE_ENV)
     if raw is None or raw.strip() == "":
-        # 자동감지 — 실 Pi(gpiomem) 이고 시리얼 어댑터가 잡히면 sy01b, 아니면 fake.
+        # 자동감지(2026-07-19 개정) — **실 Pi 면 무조건 sy01b**. 종전엔 부팅 순간 시리얼 어댑터가
+        #   안 보이면 fake 로 후퇴했는데, 그러면 실기기에서 명령이 전부 **모의로 조용히 성공**해
+        #   운영자가 "done 인데 실물이 안 움직임"으로 오판한다(17:08 실측 — USB 사망 후 재시작이
+        #   fake 로 떠 admin 에 '엔진 fake' 표시). 사용자 확정: "fake 가 기본이 아니라, 연결이 안
+        #   되면 '안 됐다'고 표시되는 게 기본동작". 어댑터 미발견 상태의 sy01b 는 정직하게 실패
+        #   (무응답·pumpHealth silent=빨강)하고, 핫플러그 자가 재연결(_reconnect_serial)이 USB
+        #   등장 시 스스로 붙는다. fake = 비-Pi 개발환경 또는 SENLYT_ENGINE=fake 명시뿐.
         is_pi = on_pi() if on_pi is not None else _gpio_available()
-        has_port = bool(discover_serial_port(environ, port_lister=port_lister))
-        choice = "sy01b" if (is_pi and has_port) else "fake"
+        choice = "sy01b" if is_pi else "fake"
     else:
         choice = raw.strip().lower()
     if choice == "sy01b":
