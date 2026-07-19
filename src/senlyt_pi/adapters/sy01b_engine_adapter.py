@@ -751,6 +751,23 @@ class Sy01bEngineAdapter:
         self._broadcast(f"I{SAFE_PORT}R")
         if not self._ff_wait(BROADCAST_STEP_GAP_S):
             return self._ff_abort(targets, results)
+        # ── 생존 게이트(2026-07-19 "기기 뽑혔는데 완료" 봉합) ────────────────────────────
+        #   fire-and-forget(폴 판정 없음)은 유지하되, 시퀀스 **종료 후** 펌프당 `?` 1발로
+        #   "전 펌프 완전 무응답"만 걸러낸다. 판정 비대칭이 핵심:
+        #     - garbled(깨진 프레임) = **살아있음** → 성공 유지 — 12:09 오탐(깨진 링크를 실패로
+        #       오판)은 이 게이트로 재발하지 않는다(그 사고의 응답은 쓰레기였지 무음이 아니었다).
+        #     - 전원/케이블이 빠진 펌프만 silent → 그때 done 이라 말하면 거짓이므로 실패 보고.
+        #   비용 = 정상 시 펌프당 ~26ms · 무응답 시에만 1.5s×N(PROBE_READ_TIMEOUT).
+        if all(self.health_probe(a) == "silent" for a in targets):
+            if self._log is not None:
+                self._log.warn(
+                    "정비 초기화 — 전 펌프 무응답(연결·전원 확인 필요) → 실패 보고(거짓 완료 방지)",
+                    stage=STAGE_STEP_EXEC,
+                    pumpAddrs=list(targets),
+                )
+            for a in targets:
+                results[a] = _NO_RESPONSE
+            return results  # 캐시 미등록 — 다음 시도가 다시 셋업.
         # [4/4] 전 펌프 초기화 간주(캐시 등록) — 다음 토출이 셋업을 건너뛰고, 죽은 펌프는
         #   그 토출의 첫 주소지정 명령(Ready 폴)에서 무응답으로 드러난다.
         #   ⚠️ 마지막 재확인 — estop 의 `_initialized.discard`(안전 무효화)를 무조건 add 로

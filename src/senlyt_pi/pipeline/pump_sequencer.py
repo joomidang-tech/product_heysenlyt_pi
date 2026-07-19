@@ -580,7 +580,11 @@ class PumpSequencer:
                 if valve is None:
                     # pre-flight 가 걸렀어야 하는 경로 — 방어적 fail-closed.
                     return (False, StatusErrorCode.CMD_VALIDATION_FAILED)
-                res = valve.dispense_volume(step.base, step.volume_ml)
+                # open_sec 지정(점검 "N초 열기") 시 3-인자 호출 — 구 테스트 더블(2-인자) 하위호환.
+                if step.open_sec is not None:
+                    res = valve.dispense_volume(step.base, step.volume_ml, step.open_sec)
+                else:
+                    res = valve.dispense_volume(step.base, step.volume_ml)
                 if not res.ok and self._log is not None:
                     self._log.error(
                         f"기주 밸브 토출 실패 — base={step.base}",

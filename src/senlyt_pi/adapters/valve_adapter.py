@@ -59,26 +59,31 @@ class FakeValveAdapter:
         self.close_all_calls = 0
         self.fail_next = False
 
-    def dispense_volume(self, base: str, volume_ml: float) -> ValveDispenseResult:
+    def dispense_volume(
+        self, base: str, volume_ml: float, open_sec: "float | None" = None
+    ) -> ValveDispenseResult:
         err = _validate_base(base)
         if err is not None:
             return ValveDispenseResult(ok=False, open_sec=0.0, detail=err)
-        open_sec = volume_ml / self.flow_ml_per_sec
+        # open_sec 직접 지정(점검 "N초 열기"·2026-07-19) 우선 — 없으면 volume_ml→flowRate 파생.
+        sec = float(open_sec) if open_sec is not None else volume_ml / self.flow_ml_per_sec
+        if sec <= 0:
+            return ValveDispenseResult(ok=False, open_sec=0.0, detail="open_sec_must_be_positive")
         # 클램프 발동 = 요청량 미충족(under-dispense) — 조용한 성공 금지(리뷰 P2 봉합).
         # 개방 자체를 거부(fail-closed·기주 낭비 0) — 설정(flow/max) 오류를 즉시 표면화.
-        if open_sec > self.max_open_sec:
+        if sec > self.max_open_sec:
             return ValveDispenseResult(
                 ok=False, open_sec=0.0,
-                detail=f"open_sec_exceeds_max({open_sec:.2f}s > {self.max_open_sec:.2f}s)",
+                detail=f"open_sec_exceeds_max({sec:.2f}s > {self.max_open_sec:.2f}s)",
             )
         with self._lock:
             if self.fail_next:
                 self.fail_next = False
-                return ValveDispenseResult(ok=False, open_sec=open_sec, detail="injected_failure")
+                return ValveDispenseResult(ok=False, open_sec=sec, detail="injected_failure")
             if self.delay_s > 0:
                 self._sleep(self.delay_s)
-            self.dispensed.append((base, volume_ml, open_sec))
-        return ValveDispenseResult(ok=True, open_sec=open_sec)
+            self.dispensed.append((base, volume_ml, sec))
+        return ValveDispenseResult(ok=True, open_sec=sec)
 
     def available_bases(self) -> list[str]:
         # Fake = 전 base 사용가능(실 GPIO 없음). 연결상태 표시용 read-only.
@@ -122,28 +127,33 @@ class GpioValveAdapter:
             for base, pin in resolved.items()
         }
 
-    def dispense_volume(self, base: str, volume_ml: float) -> ValveDispenseResult:
+    def dispense_volume(
+        self, base: str, volume_ml: float, open_sec: "float | None" = None
+    ) -> ValveDispenseResult:
         err = _validate_base(base)
         if err is not None:
             return ValveDispenseResult(ok=False, open_sec=0.0, detail=err)
         valve = self._valves.get(base)
         if valve is None:
             return ValveDispenseResult(ok=False, open_sec=0.0, detail=f"unwired_base:{base}")
-        open_sec = volume_ml / self.flow_ml_per_sec
+        # open_sec 직접 지정(점검 "N초 열기"·2026-07-19) 우선 — 없으면 volume_ml→flowRate 파생.
+        sec = float(open_sec) if open_sec is not None else volume_ml / self.flow_ml_per_sec
+        if sec <= 0:
+            return ValveDispenseResult(ok=False, open_sec=0.0, detail="open_sec_must_be_positive")
         # 클램프 발동 = under-dispense — 개방 전 fail-closed 거부(조용한 성공 금지·리뷰 P2).
-        if open_sec > self.max_open_sec:
+        if sec > self.max_open_sec:
             return ValveDispenseResult(
                 ok=False, open_sec=0.0,
-                detail=f"open_sec_exceeds_max({open_sec:.2f}s > {self.max_open_sec:.2f}s)",
+                detail=f"open_sec_exceeds_max({sec:.2f}s > {self.max_open_sec:.2f}s)",
             )
         with self._lock:
             self._close_all_unlocked()  # 상호배타 — 한 잔에 밸브 1개.
             valve.on()
             try:
-                self._sleep(open_sec)
+                self._sleep(sec)
             finally:
                 valve.off()  # 오류가 나도 반드시 닫힘(7/13 규약).
-        return ValveDispenseResult(ok=True, open_sec=open_sec)
+        return ValveDispenseResult(ok=True, open_sec=sec)
 
     def close_all(self) -> None:
         with self._lock:

@@ -106,16 +106,25 @@ class TestFireAndForgetSucceedsRegardlessOfLink:
 
 
 class TestNoStatusQueryDuringInit:
-    def test_no_query_frames_at_all(self):
-        """초기화 시퀀스에서 상태 조회(`?`)가 **한 발도** 나가지 않는다.
+    def test_no_query_frames_during_sequence(self):
+        """초기화 **시퀀스 중**(브로드캐스트 사이) 상태 조회(`?`)가 나가지 않는다.
 
-        단발 확인(10:13 오탐)이든 Ready 폴(12:09 오탐)이든, 브로드캐스트 초기화 안의
-        `?` 는 이 기기에서 오탐원이다. 어떤 형태로든 되살아나면 회귀다.
+        단발 확인(10:13 오탐)이든 Ready 폴(12:09 오탐)이든, 브로드캐스트 **사이**의 `?` 는
+        이 기기에서 오탐원이다. 단, 시퀀스 **종료 후** 펌프당 1발의 생존 프로브(`?`)는 허용
+        (2026-07-19 "뽑혔는데 완료" 봉합) — 판정이 다르다: 깨진 응답(garbled)=성공 유지,
+        **전 펌프 완전 무음**일 때만 실패라 12:09 류 오탐이 구조적으로 불가능하다.
         """
         fake = BusScriptedSerial()
         a = adapter_with(fake, read_timeout_s=0.1, init_timeout_s=1.0)
         a.initialize_broadcast([1, 2], SPEC_05)
-        assert _queries(fake.written) == [], "초기화 중 `?` 부활 = 2026-07-19 오탐 회귀"
+        # 마지막 브로드캐스트(/_I12R) 이전에는 `?` 0발.
+        last_bc = max(i for i, w in enumerate(fake.written) if w.startswith("/_"))
+        before = [w for w in fake.written[: last_bc + 1] if w.rstrip("\r").endswith("?")]
+        assert before == [], "브로드캐스트 사이 `?` 부활 = 2026-07-19 오탐 회귀"
+        # 종료 후 = 생존 프로브(단락 — 한 펌프라도 살아있음이 확인되면 나머지 생략).
+        after = fake.written[last_bc + 1 :]
+        assert after and all(w.rstrip("\r").endswith("?") for w in after)
+        assert after[0] == "/1?\r"
 
 
 # ── C. 와이어 순서 — 눈감고 브로드캐스트 4발뿐 ─────────────────────────────────
@@ -127,9 +136,13 @@ class TestWireOrder:
         a = adapter_with(fake, read_timeout_s=0.1, init_timeout_s=1.0)
         results = a.initialize_broadcast([1, 2], SPEC_05)
         assert results == {1: 0, 2: 0}
-        # 순서: 상태리셋 → 스톨전류 → 홈 → 안전포트(0.5mL → U200,5 · Z1R · I12).
-        assert fake.written == ["/_TR\r", "/_U200,5R\r", "/_Z1R\r", "/_I12R\r"], (
-            "초기화 와이어 = 브로드캐스트 4발뿐 — 주소지정 프레임이 끼면 회귀"
+        # 순서: 상태리셋 → 스톨전류 → 홈 → 안전포트(0.5mL → U200,5 · Z1R · I12)
+        #   + 종료 후 생존 프로브(`?`·단락 — 첫 펌프 생존 확인 시 나머지 생략·2026-07-19).
+        assert fake.written[:4] == ["/_TR\r", "/_U200,5R\r", "/_Z1R\r", "/_I12R\r"], (
+            "초기화 와이어 = 브로드캐스트 4발 — 사이에 주소지정 프레임이 끼면 회귀"
+        )
+        assert all(w.rstrip("\r").endswith("?") for w in fake.written[4:]), (
+            "브로드캐스트 이후는 생존 프로브(`?`)만 허용"
         )
 
 
@@ -157,23 +170,22 @@ class TestDispenseSetupStillPolls:
         code = a._setup(1, SPEC_05)
         assert code != 0, "토출 셋업까지 fire-and-forget 이 번지면 EP-03 위반(위험한 회귀)"
 
-    def test_dead_pump_registered_by_init_still_fails_at_dispense(self):
-        """통합 경로 앵커(리뷰 P2) — 오성공 캐시 등록 → 다음 토출에서 실패로 드러난다.
+    def test_all_silent_init_reports_failure_not_done(self):
+        """**전 펌프 완전 무응답**이면 초기화가 실패를 보고한다(2026-07-19 "뽑혔는데 완료" 봉합).
 
-        fire-and-forget 초기화는 죽은 펌프도 캐시에 등록해 다음 토출이 `_ensure_ready`
-        셋업을 건너뛴다. 그래도 `_cycle` 의 첫 주소지정 명령(`I{port}R` Ready 폴)이
-        무응답을 잡아야 "silent-success 가 토출까지 전파"가 안 된다 — 이 사슬이 정비
-        한정 허용(트레이드오프 §4)의 안전 근거이므로 통합으로 앵커한다.
+        구 계약(전부 오성공 허용)은 USB/전원이 빠진 기기에서도 admin 에 "완료"가 떠 운영자를
+        속였다(실기기 관찰). 새 계약: 시퀀스 종료 후 생존 프로브가 전 펌프 silent 면 실패 보고 +
+        캐시 미등록. garbled(깨진 응답)는 여전히 성공(TestFireAndForgetSucceedsRegardlessOfLink)
+        — 링크 노이즈 오탐(12:09) 회귀 없음.
         """
         fake = DeadSerial(default=b"")
         a = adapter_with(fake, read_timeout_s=0.02, init_timeout_s=0.1)
         results = a.initialize_broadcast([1], SPEC_05)
-        assert results == {1: 0}  # 정비는 오성공(허용).
-        assert a._initialized == {1}  # 캐시 등록 → 다음 토출 셋업 스킵.
+        assert results == {1: FAKE_TIMEOUT_RAW_CODE}, "전 펌프 무음인데 done = 거짓 완료"
+        assert a._initialized == set()  # 캐시 미등록 — 다음 시도가 다시 셋업.
+        # 그래도 토출 경계는 독립적으로 방어된다(EP-03) — 셋업 폴이 무응답을 잡는다.
         res = a.dispense(cmd())
-        assert res.raw_error_code == FAKE_TIMEOUT_RAW_CODE, (
-            "죽은 펌프가 토출에서도 성공하면 silent-success 전파 — 물리 안전 회귀"
-        )
+        assert res.raw_error_code == FAKE_TIMEOUT_RAW_CODE
 
 
 # ── E. estop 우선 — fire-and-forget 창을 estop 이 뚫는다(리뷰 P1·P2) ─────────────

@@ -103,6 +103,8 @@ class ResolvedValveStep:
     volume_ml: float  # 기주 고정 20mL
     flavor: str  # 관측 라벨 `base:{base}`
     stage: int = 0
+    # 개방 시간 직접 지정(점검 "N초 열기"·2026-07-19) — None = volume_ml→flowRate 파생(제조).
+    open_sec: float | None = None
 
 
 class RecipeValidationError(Exception):
@@ -238,7 +240,13 @@ class RecipeResolver:
                 if s.base not in VALVE_BASES:
                     raise RecipeValidationError("unknown_valve_base", idx=s.idx)
                 volume_ml = float(s.volume_ml) if s.volume_ml is not None else 0.0
-                if not math.isfinite(volume_ml) or volume_ml <= 0:
+                open_sec = getattr(s, "open_sec", None)
+                if open_sec is not None:
+                    # 점검 "N초 열기"(2026-07-19) — 개방시간 직접 지정. 유한·양수만(어댑터가
+                    #   max_open_sec 로 상한 클램프·거부). volume_ml 은 관측 라벨용(0 허용).
+                    if not math.isfinite(float(open_sec)) or float(open_sec) <= 0:
+                        raise RecipeValidationError("non_positive_valve_open_sec", idx=s.idx)
+                elif not math.isfinite(volume_ml) or volume_ml <= 0:
                     raise RecipeValidationError("non_positive_valve_volume", idx=s.idx)
                 resolved.append(
                     ResolvedValveStep(
@@ -247,6 +255,7 @@ class RecipeResolver:
                         volume_ml=volume_ml,
                         flavor=s.flavor,
                         stage=stage,
+                        open_sec=(float(open_sec) if open_sec is not None else None),
                     )
                 )
                 continue

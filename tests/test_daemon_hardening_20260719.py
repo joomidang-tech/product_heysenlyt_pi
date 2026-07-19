@@ -309,3 +309,27 @@ class TestHwWatchRealtime:
         assert engine.asked == [1, 2]  # 기대 주소를 실측했다(실시간 판단)
         assert d._pump_health == {1: "silent", 2: "silent"}
         assert d._hw_checked_at is not None
+
+
+# ── F. 기주 밸브 openSec 직접 지정 (점검 "N초 열기" · 2026-07-19) ────────────────
+
+
+class TestValveOpenSec:
+    def test_open_sec_overrides_flow_derivation_and_clamps(self):
+        from senlyt_pi.adapters.valve_adapter import FakeValveAdapter
+        from senlyt_pi.core.wire_messages import RecipeStep
+
+        v = FakeValveAdapter(flow_ml_per_sec=10.0, max_open_sec=15.0)
+        # 직접 지정 — flowRate 파생(20/10=2s) 대신 5s 개방.
+        r = v.dispense_volume("sour", 0.0, 5.0)
+        assert r.ok and r.open_sec == 5.0
+        # 상한 초과 = fail-closed 거부(개방 0).
+        assert not v.dispense_volume("sour", 0.0, 16.0).ok
+        # 0 이하 거부.
+        assert not v.dispense_volume("normal", 0.0, 0.0).ok
+        # wire 파싱 — openSec 키가 RecipeStep.open_sec 로 실린다(volumeMl 부재 허용).
+        step = RecipeStep.from_json({"kind": "valve", "idx": 0, "base": "sour", "openSec": 5})
+        assert step.open_sec == 5.0 and step.volume_ml == 0.0
+        # 구 계약(volumeMl 파생)은 불변.
+        legacy = v.dispense_volume("normal", 20.0)
+        assert legacy.ok and legacy.open_sec == 2.0

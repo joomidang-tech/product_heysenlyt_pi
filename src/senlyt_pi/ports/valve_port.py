@@ -31,8 +31,13 @@ class ValveDispenseResult:
 class ValvePort(Protocol):
     """기주 밸브 포트 — volume_ml → openSec 파생(flowRate 설정)은 어댑터 책임."""
 
-    def dispense_volume(self, base: str, volume_ml: float) -> ValveDispenseResult:
-        """base("normal"|"sour") 밸브를 volume_ml 에 해당하는 시간만큼 개방 후 닫는다."""
+    def dispense_volume(
+        self, base: str, volume_ml: float, open_sec: "float | None" = None
+    ) -> ValveDispenseResult:
+        """base("normal"|"sour") 밸브를 개방 후 닫는다.
+
+        open_sec 지정(점검 "N초 열기"·2026-07-19) 시 그 시간으로 직접 개방(max 클램프 동일),
+        None 이면 기존대로 volume_ml ÷ flowRate 파생(제조 기주 토출)."""
         ...
 
     def close_all(self) -> None:

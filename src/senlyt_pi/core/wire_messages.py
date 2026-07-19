@@ -56,6 +56,10 @@ class RecipeStep:
     stage: int | None = None  # None = idx (하위호환·§9-1 v2)
     base: str | None = None  # valve 전용 — "normal" | "sour"
     volume_ml: float | None = None  # valve 전용 — 기주 부피(고정 20mL)
+    # valve 전용(2026-07-19 점검 기능) — **개방 시간 직접 지정**(초). 있으면 volume_ml→flowRate
+    #   파생 대신 이 값으로 개방(어댑터 max_open_sec 클램프는 동일 적용). 관제 "기주밸브 N초
+    #   열기" 점검용 — 구 pi 는 이 키를 몰라 volumeMl(0) 파생 0초 개방 = 무해 no-op(하위호환).
+    open_sec: float | None = None
     # engineOp 전용 — "estop" | "initialize" | "plungerFull" | "plungerHome"(wire camelCase 그대로).
     op: str | None = None
     # ── 회전 밸브 구멍 + 속도 (2026-07-17 · 서버가 배치·정책을 해석해 실어 보낸다) ──────
@@ -113,6 +117,7 @@ class RecipeStep:
             )
         if kind == VALVE_STEP_KIND:
             base = str(j["base"])
+            raw_open = j.get("openSec")
             return RecipeStep(
                 idx=int(j["idx"]),
                 pump_addr=VALVE_PUMP_ADDR,
@@ -121,7 +126,12 @@ class RecipeStep:
                 kind=VALVE_STEP_KIND,
                 stage=stage,
                 base=base,
-                volume_ml=float(j["volumeMl"]),
+                volume_ml=float(j.get("volumeMl", 0.0)),
+                open_sec=(
+                    float(raw_open)
+                    if isinstance(raw_open, (int, float)) and not isinstance(raw_open, bool)
+                    else None
+                ),
             )
         def _opt_int(key: str) -> int | None:
             v = j.get(key)
