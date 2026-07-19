@@ -7,7 +7,7 @@
   - report_status  → PATCH /api/dispenser/orders/{orderId}?mode=  (주문 status 전진·§9-2).
                      phase→WireStatus 매핑(§4-5) 후 {status, requestId, traceId} 전송.
                      **OQ(오프라인 큐) 경유** — 단절 중 적재·재연결 FIFO flush(멱등·§4-6).
-  - send_heartbeat → PATCH /api/dispenser/heartbeat  (30s 주기·§9-3·traceId 없음).
+  - send_heartbeat → PATCH /api/dispenser/heartbeat  (10s 주기·§9-3·traceId 없음).
   - ship_trace     → POST /api/dispenser/trace  (best-effort 배치 ≤100 span·§10-4).
   - report_command_set_transition → PATCH /api/dispenser/commandsets/{id}  (봉투 전이·05_api §8).
     (Dispatcher.commandset_sink 로 꽂아 delivered→running→done|failed 전이를 서버에 보고.)
@@ -199,7 +199,7 @@ class HttpStatusSinkAdapter:
         return self._log.device_id if self._log is not None else None
 
     # ─────────────────────────────────────────────────────────────────────
-    # §9-3  heartbeat — PATCH heartbeat (30s·traceId 없음)
+    # §9-3  heartbeat — PATCH heartbeat (10s·traceId 없음)
     # ─────────────────────────────────────────────────────────────────────
 
     def send_heartbeat(self, hb: Heartbeat) -> None:

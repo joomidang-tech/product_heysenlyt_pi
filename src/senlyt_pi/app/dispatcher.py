@@ -227,7 +227,7 @@ class Dispatcher:
         pumps: "list[int] | None" = None,
         valves: "list[str] | None" = None,
     ) -> Heartbeat:
-        """하트비트 조립(§9-3·30s 주기) — queueDepth 는 Sequencer 에서 파생(유휴=0).
+        """하트비트 조립(§9-3·10s 주기) — queueDepth 는 Sequencer 에서 파생(유휴=0).
         전송(PATCH /api/dispenser/heartbeat)은 StatusSinkPort 어댑터 책임.
         pumps/valves = 기기 연결상태(연결상태 기능) — 데몬이 자동인식 결과를 실어 준다."""
         return Heartbeat(

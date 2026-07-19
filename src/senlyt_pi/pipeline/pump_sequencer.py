@@ -423,9 +423,9 @@ class PumpSequencer:
             return [self._run_one(stage_steps[0])]
         # ── 브로드캐스트 초기화 합치기(v1.1.0 병렬 홈) ─────────────────────────────
         #   같은 stage 가 **전부 `initialize` op** 이면, per-pump 동시 명령(반이중 RS485 경합으로
-        #   초기화가 깨졌던 D38 stage:0)이 아니라 **브로드캐스트 1콜**(명령 1발·경합 없음 + 매 발 뒤
-        #   개별 연결성 확인)로 처리한다. 브로드캐스트 미지원 엔진(Fake/구 어댑터)은 None → 아래
-        #   일반 동시 실행으로 폴백(테스트·하위호환 무영향).
+        #   초기화가 깨졌던 D38 stage:0)이 아니라 **브로드캐스트 1콜**(명령 1발·경합 없음 + 최종
+        #   Ready 폴로 펌프별 판정)로 처리한다. 브로드캐스트 미지원 엔진(Fake/구 어댑터)은 None →
+        #   아래 일반 동시 실행으로 폴백(테스트·하위호환 무영향).
         coalesced = self._maybe_broadcast_init(stage_steps)
         if coalesced is not None:
             return coalesced
@@ -451,8 +451,9 @@ class PumpSequencer:
         """stage 가 **전부 initialize op** 이고 엔진이 브로드캐스트를 지원하면 1콜로 합쳐 실행.
 
         반환: 해당·지원 시 per-step (ok, code) 목록 / 아니면 None(일반 동시 실행 폴백).
-        브로드캐스트가 각 펌프에 닿았는지는 어댑터 `initialize_broadcast` 가 **펌프별로** 판정해
-        {addr: code} 로 돌려주므로, 여기서 step 순서대로 매핑해 보고한다(연결성 = 개별 확인 결과).
+        브로드캐스트가 각 펌프에 닿았는지는 어댑터 `initialize_broadcast` 가 **최종 Ready 폴**로
+        펌프별 판정해 {addr: code} 로 돌려주므로, 여기서 step 순서대로 매핑해 보고한다
+        (연결성 = 끝 폴 결과 — 진짜 죽은 펌프만 타임아웃으로 드러난다).
         """
         if not all(
             isinstance(s, ResolvedOpStep) and s.op == OP_INITIALIZE for s in stage_steps

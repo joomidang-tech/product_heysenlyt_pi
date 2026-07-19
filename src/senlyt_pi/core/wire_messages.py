@@ -265,7 +265,7 @@ class StatusReport:
 class Heartbeat:
     """heartbeat request — SoT §9-3. ⚠️ traceId 없음(주문 무관·deviceId 상관).
 
-    주기 30s(±jitter). online 판정 = 최근 3주기(90s) 내(서버 판정·pi 시계 미신뢰).
+    주기 10s(±jitter·SENLYT_HEARTBEAT_INTERVAL_MS). online 표시 판정 = 최근 3주기(30s)·안전 판정(reclaim 등)은 90s 별도 창(서버 판정·pi 시계 미신뢰).
     """
 
     device_id: str

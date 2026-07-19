@@ -39,7 +39,7 @@ class StatusSinkPort(Protocol):
         ...
 
     def send_heartbeat(self, hb: Heartbeat) -> None:
-        """PATCH /api/dispenser/heartbeat — 30s 주기(§9-3)."""
+        """PATCH /api/dispenser/heartbeat — 10s 주기(§9-3)."""
         ...
 
     def ship_trace(self, spans: Sequence[TraceSpan]) -> None:

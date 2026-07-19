@@ -33,6 +33,9 @@ SENLYT_SELFTEST_ENV = "SENLYT_SELFTEST"
 SENLYT_RUN_ENV = "SENLYT_RUN"
 # 폴링 간격(ms) — 기본 1000ms(1s). SenlytDaemon.poll_interval_s 로 환산.
 SENLYT_POLL_INTERVAL_MS_ENV = "SENLYT_POLL_INTERVAL_MS"
+# heartbeat 주기(ms) — 기본 10000ms(10s). 서버 online 표시 창(30s=3주기)과 정합 — 값을 바꾸면
+#   서버 표시 창도 함께 조정할 것.
+SENLYT_HEARTBEAT_INTERVAL_MS_ENV = "SENLYT_HEARTBEAT_INTERVAL_MS"
 
 _TRUTHY = ("1", "true", "TRUE")
 
@@ -51,6 +54,25 @@ def _resolve_poll_interval_s(environ: Mapping[str, str]) -> float:
     except ValueError:
         return 1.0
     return ms / 1000.0 if ms > 0 else 1.0
+
+
+def _resolve_heartbeat_interval_s(environ: Mapping[str, str]) -> float:
+    """SENLYT_HEARTBEAT_INTERVAL_MS(기본 10000) → 초. 파싱 실패·비양수는 10.0s 로 안전 폴백.
+
+    파싱 성공한 양수 값은 [1.0s, 30.0s] 클램프 —
+      상한 30s = 서버 online 표시 창(30s=3주기) 붕괴 방지(주기 > 창이면 항상 offline 표시).
+      하한 1s  = 서버/Firestore 쓰기 폭주 방지.
+    """
+    raw = environ.get(SENLYT_HEARTBEAT_INTERVAL_MS_ENV, "").strip()
+    if not raw:
+        return 10.0
+    try:
+        ms = float(raw)
+    except ValueError:
+        return 10.0
+    if ms <= 0:
+        return 10.0
+    return min(max(ms / 1000.0, 1.0), 30.0)
 
 
 def _resolve_trace_flush_s(environ: Mapping[str, str]) -> float:
@@ -169,6 +191,7 @@ def _run(environ: Mapping[str, str], logger: StructuredLogger) -> int:
         commandset_source=components.command_source,  # 동일 SSE 어댑터가 두 축 제공.
         logger=components.logger,
         poll_interval_s=_resolve_poll_interval_s(environ),
+        heartbeat_interval_s=_resolve_heartbeat_interval_s(environ),
         # 관측 로그 볼륨 노브(RC8) — 재배포 없이 env 로 조절. 기본 = DEBUG 전량·10s 배치.
         ship_log_min_severity=_resolve_ship_log_min_severity(environ),
         trace_flush_interval_s=_resolve_trace_flush_s(environ),
