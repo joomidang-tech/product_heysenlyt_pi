@@ -47,6 +47,7 @@ from ..obs.log import STAGE_ERROR, STAGE_PI_RECEIVED, StructuredLogger
 from ..persistence.file_idempotency_ledger import FileIdempotencyLedger
 from ..persistence.idempotency_ledger import IdempotencyLedger, InMemoryIdempotencyLedger
 from ..pipeline.pump_health import auto_pump_map, discover_pumps
+from ..pipeline.trace_spill import TraceSpill
 from ..pipeline.recipe_resolver import RecipeResolver
 from ..ports.engine_port import EnginePort
 from ..ports.valve_port import ValvePort
@@ -63,6 +64,9 @@ SENLYT_IDENTITY_PATH_ENV = "SENLYT_IDENTITY_PATH"
 SENLYT_DEVICE_NAME_ENV = "SENLYT_DEVICE_NAME"
 # 멱등 ledger 파일 경로 override(기본 = LOG_DIR 또는 작업 디렉터리).
 SENLYT_LEDGER_PATH_ENV = "SENLYT_LEDGER_PATH"
+# 관측 로그 디스크 스풀 파일 경로 override(기본 = LOG_DIR 또는 작업 디렉터리).
+#   단절 중 전송 실패한 trace 배치를 보존 → 재연결 시 전량 업로드(유실 0 · 2026-07-19).
+SENLYT_TRACE_SPILL_PATH_ENV = "SENLYT_TRACE_SPILL_PATH"
 # 펌프 addr 배치(모드별) — 예: "aroma:1,2,3;flavor:4" (E2E 02_infra §10 pi 서비스 env).
 SENLYT_PUMP_ADDRESSES_ENV = "PUMP_ADDRESSES"
 # 기주 밸브 선택 env(override·§9-1 v2) — 미지정이면 **자동감지**(실 Pi→gpio·아니면 fake).
@@ -77,6 +81,7 @@ SENLYT_VALVE_MAX_OPEN_ENV = "SENLYT_VALVE_MAX_OPEN_SEC"
 
 DEFAULT_IDENTITY_FILENAME = "device-identity.json"
 DEFAULT_LEDGER_FILENAME = "idempotency-ledger.log"
+DEFAULT_TRACE_SPILL_FILENAME = "trace-spill.jsonl"
 
 
 class BootstrapError(Exception):
@@ -261,6 +266,16 @@ def _ledger_path(environ: Mapping[str, str]) -> Path:
     log_dir = environ.get("LOG_DIR", "").strip()
     base = Path(log_dir) if log_dir else Path.cwd()
     return base / DEFAULT_LEDGER_FILENAME
+
+
+def _trace_spill_path(environ: Mapping[str, str]) -> Path:
+    """관측 로그 스풀 경로 — ledger/identity 와 같은 우선순위(override > LOG_DIR > cwd)."""
+    explicit = environ.get(SENLYT_TRACE_SPILL_PATH_ENV, "").strip()
+    if explicit:
+        return Path(explicit)
+    log_dir = environ.get("LOG_DIR", "").strip()
+    base = Path(log_dir) if log_dir else Path.cwd()
+    return base / DEFAULT_TRACE_SPILL_FILENAME
 
 
 def build_ledger(environ: Mapping[str, str]) -> FileIdempotencyLedger:
@@ -480,6 +495,8 @@ def build_components(
         server_config=server_config,
         bearer_token=identity.dispenser_token,
         mode=mode,
+        # 관측 로그 디스크 스풀(단절 유실 0) — 전송 실패 배치를 보존, 재연결/재부팅 후 업로드.
+        trace_spill=TraceSpill(_trace_spill_path(environ)),
         logger=log,
     )
 

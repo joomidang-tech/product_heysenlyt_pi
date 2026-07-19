@@ -628,6 +628,33 @@ def test_ship_log_ships_all_levels_by_default(ledger):
     assert s.detail["error"] == "SSE timeout"  # 서버 allowlist(trace.ts)가 최종 반출 게이트
 
 
+def test_ship_log_overflow_spills_to_disk_sink_no_drop(ledger, monkeypatch):
+    """버퍼 상한 도달 + sink 가 스풀 지원 → 오래된 절반을 spill_traces 로 배출, 드롭 0 (2026-07-19 유실 0).
+
+    스풀 지원 sink 에선 메모리 overflow 가 더 이상 드롭이 아니다 — 디스크로 넘겨 재연결 시
+    서버 합류한다. 드롭 계수(합성 WARN)는 스풀 미지원 sink 전용 폴백으로만 남는다.
+    """
+    from senlyt_pi.app import daemon as dmod
+
+    monkeypatch.setattr(dmod, "_LOG_TRACE_BUFFER_CAP", 4)
+
+    class SpillingSink(FakeStatusSink):
+        def __init__(self):
+            super().__init__()
+            self.spilled: list = []
+
+        def spill_traces(self, spans) -> None:
+            self.spilled.extend(spans)
+
+    sink = SpillingSink()
+    d = _daemon(ledger, status_sink=sink)
+    for i in range(6):  # cap=4 → 5번째에서 overflow(오래된 2건 배출) 후 계속 적재.
+        d._ship_log({"severity": "INFO", "message": f"m{i}", "stage": "pi수신"})
+    assert d._trace_dropped == 0, "스풀 지원 sink 에선 드롭이 없어야(유실 0)"
+    assert [s.detail["message"] for s in sink.spilled] == ["m0", "m1"]  # 오래된 것부터 디스크로.
+    assert [s.detail["message"] for s in d._trace_buffer] == ["m2", "m3", "m4", "m5"]
+
+
 def test_ship_log_buffer_cap_drops_counted_and_reported(ledger, monkeypatch):
     """버퍼 상한 초과분은 조용히 버리지 않고 건수를 세어 다음 flush 에 합성 WARN 으로 보고(silent 금지)."""
     from senlyt_pi.app import daemon as dmod

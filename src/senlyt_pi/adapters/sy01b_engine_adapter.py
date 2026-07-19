@@ -172,6 +172,16 @@ def _pyserial_factory(port: str, baudrate: int, timeout_s: float) -> SerialLike:
 _RESPONSE_PREFIX = FRAME_START + "0"
 
 
+def _printable(raw: str) -> str:
+    r"""로그용 응답 이스케이프 — 비인쇄 바이트를 `\xNN` 로 표기(2026-07-19 QA).
+
+    깨진 링크의 응답엔 제어 바이트(BEL 0x07·ETX 0x03 등)가 섞인다. 그대로 로그에 실으면
+    journald 가 `[300B blob data]` 로 뭉개거나 서버 뷰에서 `` 로만 보여 판독이 어렵다.
+    사람이 읽는 `\x07` 표기로 바꿔 "어떤 바이트가 왔는지"가 어디서든 보이게 한다.
+    """
+    return "".join(ch if 32 <= ord(ch) < 127 else f"\\x{ord(ch):02x}" for ch in raw)
+
+
 def parse_status(response: str) -> tuple[int, bool]:
     """상태 프레임 → `(error_code, ready)`. 프레임이 없으면 `(_NO_RESPONSE, False)`.
 
@@ -305,6 +315,7 @@ class Sy01bEngineAdapter:
         timeout_s = read_timeout_s if read_timeout_s is not None else self.read_timeout_s
         frame = f"{FRAME_START}{addr}{command}{FRAME_END}".encode("ascii")
         conn = self._conn()
+        t0 = time.monotonic()
         with self._bus:  # ← 수 ms. 모터가 도는 동안엔 절대 잡고 있지 않는다.
             # ⛔ **크로스-트랜잭션 입력 flush**(P2·2026-07-18) — 공유 버스라 직전 트랜잭션의 지연/부분
             #   프레임이 입력 버퍼에 남으면 이번 응답 앞에 붙어 상태바이트를 오독한다(silent-success/
@@ -338,13 +349,18 @@ class Sy01bEngineAdapter:
                 time.sleep(0.005)
             resp = buf.decode("ascii", errors="ignore")
         # 시리얼 왕복 관측(RC4) — 버스 락 **밖**에서 로깅(락 홀드 최소화). 매 프레임이라 DEBUG.
+        #   traceId/commandSetId 는 시퀀서가 이 스레드에 바인딩한 컨텍스트로 자동 부착(2026-07-19) —
+        #   "어느 명령의 어느 왕복이 깨졌는지"가 admin trace 타임라인에서 한 줄로 엮인다.
+        #   response 는 \xNN 이스케이프(제어 바이트가 journald blob·판독 불가를 만들던 문제 해소),
+        #   elapsedMs 로 "무응답 5초 대기 vs 즉답" 지연 분해가 로그만으로 가능해진다.
         if self._log is not None:
             self._log.debug(
                 "시리얼 왕복",
                 stage=STAGE_STEP_EXEC,
                 pumpAddr=addr,
                 command=command,
-                response=(resp.strip() or "(무응답)"),
+                response=(_printable(resp.strip()) or "(무응답)"),
+                elapsedMs=round((time.monotonic() - t0) * 1000),
             )
         return resp
 
@@ -438,15 +454,35 @@ class Sy01bEngineAdapter:
         return f"v{start}V{top}c{cutoff}L{lp}"
 
     # ── 셋업 ────────────────────────────────────────────────────────────────
-    def _settle(self, addr: int, command: str, timeout_s: float, *, poll: bool = False) -> int:
-        """명령 송신 → 즉답 판정 → (poll 이면) 완료까지 폴링. 반환 = error_code."""
+    def _settle(
+        self,
+        addr: int,
+        command: str,
+        timeout_s: float,
+        *,
+        poll: bool = False,
+        ack_tolerant: bool = False,
+    ) -> int:
+        """명령 송신 → 즉답 판정 → (poll 이면) 완료까지 폴링. 반환 = error_code.
+
+        `ack_tolerant`(poll=True 전용·2026-07-19 QA "흡입/배출 이슈"): 즉답이 무응답/깨진
+        프레임이어도 즉시 실패하지 않고 **폴이 최종 판정**한다. 근거(실기기 로그 실측):
+          - 이 기기 링크는 응답 프레임을 간헐적으로 깨뜨린다(`C`·`\\x07`·무응답). 그래도 명령
+            자체는 펌프에 닿아 **플런저는 실제로 움직인다** — ACK 만 깨진 것.
+          - 반면 폴(`_poll_until_ready`)은 쓰레기·무응답·Code 7 을 재시도로 견디며 진짜
+            완료(Ready+위치)를 확인한다 — 13:37:39 성공 건이 증명(폴 중 쓰레기 3회에도 완주).
+          - 즉 "즉답 1회 읽기"가 유일한 단일 실패 지점이라 깨진 링크에서 복권이 됐다.
+        silent-success 아님 — 성공 판정은 언제나 폴의 실제 완료 확인이다. 진짜 죽은 펌프
+        (전 왕복 무응답)는 폴 타임아웃(_NO_RESPONSE)으로 여전히 정직하게 실패한다.
+        ⚠️ 즉답이 **명시적 에러 코드**(1~15)면 tolerant 여도 기존대로 즉시 실패(진짜 에러).
+        """
         raw = self._txn(addr, command)
-        if not raw:
-            return _NO_RESPONSE  # 빈 응답 = 실패(silent-success 금지·v1.0 콸콸콸 교훈)
-        code, _ready = parse_status(raw)
-        if code == _NO_RESPONSE:
-            return _MALFORMED  # 뭔가 받긴 했는데 상태 프레임이 아니다 — 실패측으로.
-        if code != 0:
+        code, _ready = parse_status(raw) if raw else (_NO_RESPONSE, False)
+        garbled = code == _NO_RESPONSE  # 무응답이거나, 받긴 했는데 상태 프레임이 아님.
+        if garbled and not (poll and ack_tolerant):
+            # 빈 응답 = 실패(silent-success 금지·v1.0 콸콸콸 교훈) / 프레임 아님 = 실패측.
+            return _NO_RESPONSE if not raw else _MALFORMED
+        if not garbled and code != 0:
             # ⚠️ **즉답 재초기화-필수 에러(7 미초기화·9/10 오버로드)는 셋업 캐시를 무효화**한다
             #   (2026-07-18·브릭 회귀 봉합). 폴링을 안 타는 즉답 경로라 여기서 discard 하지 않으면
             #   `_ensure_ready` 캐시-skip 이 재초기화를 영영 막아 그 펌프가 브릭된다. 셋업 중엔 addr 가
@@ -456,6 +492,15 @@ class Sy01bEngineAdapter:
             return code
         if not poll:
             return 0
+        if garbled and self._log is not None:
+            # 관대 경로 진입 흔적 — "즉답이 깨졌지만 폴로 실제 완료를 확인한다"를 흐름 로그로 남긴다.
+            self._log.info(
+                "명령 즉답 깨짐/무응답 — 모션 폴로 완료 판정(ack-tolerant·링크 노이즈 관대)",
+                stage=STAGE_STEP_EXEC,
+                pumpAddr=addr,
+                command=command,
+                response=(_printable(raw.strip()) or "(무응답)"),
+            )
         return self._poll_until_ready(addr, timeout_s)
 
     def _setup(self, addr: int, spec: SyringeSpec) -> int:
@@ -723,8 +768,31 @@ class Sy01bEngineAdapter:
             else:
                 # 미지의 op = 거부(안전측). 새 동작은 계약에 명시적으로 추가해야 한다.
                 return EngineResult(raw_error_code=_MALFORMED, detail=f"unknown op {cmd.op}")
+            # ── v1.1.0 시퀀스 복원(2026-07-19 QA "흡입/배출 이슈") ──────────────────
+            #   v1.1.0 aspirate/dispenseSyringe = **밸브 먼저 회전**(흡입=air·배출=output) 후
+            #   플런저 이동. v1.2.0 은 회전 없이 A 만 쏴서, 마지막에 열려 있던 액체 포트로
+            #   흡입/역류하는 격차가 있었다. 포트는 서버(배치 SoT)가 해석해 실어 준다 —
+            #   None(구 서버)이면 기존처럼 회전 생략(하위호환). 회전 실패 시 이동하지 않는다
+            #   (엉뚱한 포트로 플런저를 밀면 역류·과부하 — v1.1.0 도 moveValve 실패는 전파).
+            if cmd.valve_port is not None:
+                code = self._settle(
+                    addr,
+                    f"I{cmd.valve_port}R",
+                    self.read_timeout_s,
+                    poll=True,
+                    ack_tolerant=True,
+                )
+                if code != 0:
+                    return EngineResult(
+                        raw_error_code=code, detail=f"valve I{cmd.valve_port} ({cmd.op})"
+                    )
+            # 이동 성패는 **폴의 실제 완료 확인**이 판정(ack_tolerant · v1.1.0 _validateResponse 가
+            #   빈/깨진 즉답을 통과시키고 폴이 판정하던 필드 검증 구조의 미러) — 이 기기의 간헐
+            #   프레임 파손(즉답 `C`·`\x07`·무응답)이 즉시 permanent 로 오판되던 것을 봉합.
             speed = self._speed_cmd(None, None)  # 정비 이동은 프리셋 기본 속도.
-            code = self._settle(addr, f"{speed}A{target}R", self.motion_timeout_s, poll=True)
+            code = self._settle(
+                addr, f"{speed}A{target}R", self.motion_timeout_s, poll=True, ack_tolerant=True
+            )
             return EngineResult(raw_error_code=code, detail=cmd.op)
         except Exception as e:  # noqa: BLE001
             return EngineResult(raw_error_code=_NO_RESPONSE, detail=f"serial error: {e}")

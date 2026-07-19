@@ -8,7 +8,10 @@
                      phase→WireStatus 매핑(§4-5) 후 {status, requestId, traceId} 전송.
                      **OQ(오프라인 큐) 경유** — 단절 중 적재·재연결 FIFO flush(멱등·§4-6).
   - send_heartbeat → PATCH /api/dispenser/heartbeat  (10s 주기·§9-3·traceId 없음).
-  - ship_trace     → POST /api/dispenser/trace  (best-effort 배치 ≤100 span·§10-4).
+  - ship_trace     → POST /api/dispenser/trace  (배치 ≤100 span·§10-4).
+                     **TraceSpill(디스크 스풀) 경유** — 전송 실패 배치를 버리지 않고 스풀에
+                     보존, 재연결 시 FIFO 업로드(2026-07-19 · "서버가 전부" 원칙: 긴 단절
+                     구간의 DEBUG/INFO 도 서버에서 전량 보인다 — journalctl 갈 일 없게).
   - report_command_set_transition → PATCH /api/dispenser/commandsets/{id}  (봉투 전이·05_api §8).
     (Dispatcher.commandset_sink 로 꽂아 delivered→running→done|failed 전이를 서버에 보고.)
 
@@ -19,6 +22,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
 from ..config.server_target import ServerConfig
@@ -33,6 +37,7 @@ from ..obs.log import (
     StructuredLogger,
 )
 from ..pipeline.offline_queue import OfflineQueue
+from ..pipeline.trace_spill import TraceSpill
 from ..ports.status_sink_port import TraceSpan
 from .http_client import (
     DEFAULT_TIMEOUT_SECONDS,
@@ -56,6 +61,11 @@ _MAINTENANCE_ID_PREFIX = "mnt-"
 def _order_id_of(command_id: str) -> str:
     """합성키 `{orderId}:{attempt}` → orderId(마지막 콜론 앞). 콜론 없으면 그대로."""
     return command_id.rsplit(":", 1)[0]
+
+
+def _utc_now_iso() -> str:
+    """스풀 합성 WARN 용 UTC ISO8601(ms) — 데몬 now_iso 와 같은 포맷."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _span_to_json(s: TraceSpan) -> dict[str, Any]:
@@ -92,6 +102,7 @@ class HttpStatusSinkAdapter:
         bearer_token: str = "",
         mode: str = "flavor",
         offline_queue: OfflineQueue | None = None,
+        trace_spill: TraceSpill | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         request: RequestFn = request_json,
         request_id_gen: Callable[[], str] | None = None,
@@ -108,6 +119,8 @@ class HttpStatusSinkAdapter:
         self._log = logger
         # OQ — report_status 는 항상 이 큐를 경유(단절 중 적재·재연결 flush·멱등).
         self._oq = offline_queue if offline_queue is not None else OfflineQueue()
+        # 관측 로그 디스크 스풀(단절 유실 0) — None 이면 구 best-effort 동작(테스트·하위호환).
+        self._spill = trace_spill
 
     def _config(self) -> ServerConfig:
         return self.server_config or ServerConfig(base_url=self.base_url)
@@ -258,23 +271,99 @@ class HttpStatusSinkAdapter:
     # ─────────────────────────────────────────────────────────────────────
 
     def ship_trace(self, spans: Sequence[TraceSpan]) -> None:
-        """trace span 배치 전송 — best-effort. 100개 초과는 청크로 분할. 실패는 삼킨다(§10-6)."""
+        """trace span 배치 전송 — 100개 초과는 청크로 분할. 예외는 밖으로 안 던진다(§10-6).
+
+        **스풀 유무로 유실 정책이 갈린다** (2026-07-19 · "서버가 전부" 원칙):
+          - 스풀 있음(실기기 기본): 전송 실패 배치를 **TraceSpill(디스크)에 보존** 후 반환.
+            스풀에 잔여가 있으면 새 스팬보다 **스풀을 먼저 배출**(FIFO·시간순 보존)하고, 아직
+            단절이면 새 스팬도 스풀 뒤에 붙인다. 재연결 시 sender 의 주기 flush 가 전량 업로드
+            → 긴 단절 구간의 DEBUG/INFO 도 서버에서 다 보인다(유실 0·journalctl 불필요).
+          - 스풀 없음(구 어댑터·일부 테스트): 종전 best-effort — 실패 청크만 스킵하고 계속
+            (RC2: 한 청크 실패가 나머지 전량을 포기시키던 결함 봉합 유지).
+        """
         if not spans:
             return
-        url = self._config().trace_url
-        headers = bearer_headers(self.bearer_token)
-        for start in range(0, len(spans), TRACE_BATCH_MAX):
-            chunk = spans[start : start + TRACE_BATCH_MAX]
-            body = {"logs": [_span_to_json(s) for s in chunk]}
-            try:
-                self._request(
-                    "POST", url, body=body, headers=headers, timeout=self.timeout
-                )
-            except HttpTransportError:
-                # best-effort — trace 유실은 제조를 막지 않는다(§10-6 (1)).
-                # ⚠️ RC2(2026-07-19): `return` → `continue` — 한 청크 전송 실패가 **나머지 청크 전량을
-                #   포기**시키던 결함 봉합. 실패 청크만 스킵하고 다음 청크는 계속 전송한다.
+        # 스풀 잔여 우선 배출 — 순서 보존. 여기선 소량(≤5배치)만 시도해 sender 사이클이 대형
+        #   스풀에 통째로 잡히지 않게 한다(잔량은 주기 flush 몫). 여전히 단절이면 새 스팬도
+        #   스풀 뒤에 이어붙이고 끝(시간 역전 방지).
+        if self._spill is not None and self._spill.depth > 0:
+            self.flush_trace_spill(max_batches=5)
+            if self._spill.depth > 0:
+                self._spill.append([_span_to_json(s) for s in spans])
+                return
+        chunks = [
+            [_span_to_json(s) for s in spans[start : start + TRACE_BATCH_MAX]]
+            for start in range(0, len(spans), TRACE_BATCH_MAX)
+        ]
+        for i, chunk in enumerate(chunks):
+            if self._send_trace_batch(chunk):
                 continue
+            if self._spill is not None:
+                # 실패 청크부터 끝까지 스풀(순서 보존) — 재연결 flush 가 이어서 전송.
+                self._spill.append([d for c in chunks[i:] for d in c])
+                return
+            # 스풀 없음 — 실패 청크만 스킵(best-effort·RC2).
+
+    def _send_trace_batch(self, batch: "list[dict[str, Any]]") -> bool:
+        """직렬화된 span 배치 1회 POST — 성공 True / 전송오류 False (스풀 drain 의 send seam).
+
+        ⛔ 여기서 StructuredLogger 로 로그를 찍지 말 것 — drain 의 send 콜백으로 불리며,
+        로거 sink 는 daemon `_trace_lock` 을 잡는다(락 역전 데드락 재료·TraceSpill docstring).
+        """
+        try:
+            self._request(
+                "POST",
+                self._config().trace_url,
+                body={"logs": batch},
+                headers=bearer_headers(self.bearer_token),
+                timeout=self.timeout,
+            )
+            return True
+        except HttpTransportError:
+            return False
+
+    def spill_traces(self, spans: Sequence[TraceSpan]) -> None:
+        """전송 시도 없이 곧장 스풀에 적재 — 데몬 메모리 버퍼 overflow 의 배출구(드롭 대체)."""
+        if self._spill is None or not spans:
+            return
+        self._spill.append([_span_to_json(s) for s in spans])
+
+    def flush_trace_spill(self, *, max_batches: int | None = 50) -> int:
+        """스풀 FIFO 업로드(재연결·부팅 시) — 성공 전송 스팬 수 반환.
+
+        `max_batches`(기본 50 = 5k 스팬)로 한 사이클의 배출량을 상한 — 대형 스풀도 sender
+        주기 몇 번에 나눠 비운다(사이클 시간 유계·리뷰 P2-5). trim 으로 잘려나간 건수가
+        있으면 **합성 WARN 스팬**으로 서버에 표면화한다(조용한 유실 금지 — 상한 20k 를
+        넘길 만큼 긴 단절이었다는 사실 자체가 신호).
+        """
+        if self._spill is None:
+            return 0
+        sent = self._spill.drain(
+            self._send_trace_batch, batch_max=TRACE_BATCH_MAX, max_batches=max_batches
+        )
+        dropped = self._spill.pop_dropped()
+        if dropped > 0:
+            ok = self._send_trace_batch(
+                [
+                    {
+                        "ts": _utc_now_iso(),
+                        "traceId": "",
+                        "spanId": uuid.uuid4().hex[:16],
+                        "service": "pi",
+                        "event": "pi.log.warn",
+                        "level": "WARN",
+                        "detail": {
+                            "message": f"관측 로그 스풀 상한 초과 — 오래된 {dropped}건 잘림(초장기 단절/디스크 실패)",
+                            "stage": "obs",
+                        },
+                    }
+                ]
+            )
+            if not ok:
+                # 합성 WARN 도 전송 실패(단절 지속) — 카운트를 되살려 다음 flush 가 재시도
+                #   (리뷰 P2-4: "N건 잘림" 신호 자체가 조용히 소실되면 '조용한 유실 금지' 모순).
+                self._spill.restore_dropped(dropped)
+        return sent
 
     # ─────────────────────────────────────────────────────────────────────
     # 05_api §8  CommandSet 봉투 전이 보고 — PATCH commandsets/[id]

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from datetime import datetime, timezone
 from typing import Any, Callable, TextIO
 
@@ -86,10 +87,38 @@ class StructuredLogger:
         #   bind_sink 시 replay 한다. 그 구간 로그가 sink=None 이라 서버 미도달하던 사각 봉합. 상한 200 으로
         #   무한성장 방지(부팅 로그는 소수).
         self._pending: "list[dict[str, Any]]" = []
+        # 스텝 실행 컨텍스트(스레드로컬 · 2026-07-19 QA "흡입/배출 이슈") — 시퀀서가 스텝 실행 전
+        #   traceId/orderId/commandSetId 를 바인딩하면, 그 스레드에서 나가는 **모든** 로그(어댑터
+        #   시리얼 왕복 DEBUG·정비 실패 ERROR 등)에 자동 부착된다. 구조: 어댑터는 trace 를 모른다
+        #   (명령에 상관 필드가 없다) → 호출 스레드의 컨텍스트로 엮는다. 명시 인자가 항상 이긴다.
+        #   덕분에 admin trace 타임라인에서 "어느 명령의 어느 시리얼 왕복이 깨졌는지"가 한 줄로 보인다.
+        self._step_ctx = threading.local()
 
     def bind_device(self, device_id: str) -> None:
         """등록 후 deviceId 바인딩 — 이후 모든 레코드에 자동 부착."""
         self.device_id = device_id
+
+    def bind_step_context(
+        self,
+        *,
+        trace_id: str | None = None,
+        order_id: str | None = None,
+        command_set_id: str | None = None,
+    ) -> None:
+        """이 스레드의 스텝 실행 컨텍스트 바인딩 — 이후 이 스레드 로그에 상관 필드 자동 부착.
+
+        시퀀서가 스텝 실행 직전에 부르고, 끝나면 `clear_step_context()` 로 반드시 걷는다
+        (워커 스레드는 풀에서 재사용되므로 안 걷으면 다음 잡에 전 잡의 trace 가 새어 붙는다).
+        """
+        self._step_ctx.trace_id = trace_id
+        self._step_ctx.order_id = order_id
+        self._step_ctx.command_set_id = command_set_id
+
+    def clear_step_context(self) -> None:
+        """이 스레드의 스텝 컨텍스트 해제(finally 에서 호출)."""
+        self._step_ctx.trace_id = None
+        self._step_ctx.order_id = None
+        self._step_ctx.command_set_id = None
 
     def bind_sink(self, sink: Callable[[dict[str, Any]], None]) -> None:
         """서버 전송 sink 결선 — 데몬이 부팅 시 자기 `_ship_log` 를 꽂는다(생성 후 지연 결선).
@@ -123,16 +152,20 @@ class StructuredLogger:
         Returns: 방출한 레코드(dict) — 테스트/후속 상관에 재사용.
         """
         sev = severity if severity in _SEVERITIES else "INFO"
+        # 상관 필드 — 명시 인자 > 스레드 스텝 컨텍스트 > null (어댑터 로그가 자동으로 trace 에 엮인다).
+        ctx = self._step_ctx
         record: dict[str, Any] = {
             "ts": self._now_iso(),
             "service": self.service,
             "severity": sev,
             "stage": stage if stage in STAGES else stage,  # 미지 stage 도 그대로(관측 우선)
             "message": message,
-            "traceId": trace_id,
-            "orderId": order_id,
+            "traceId": trace_id if trace_id is not None else getattr(ctx, "trace_id", None),
+            "orderId": order_id if order_id is not None else getattr(ctx, "order_id", None),
             "deviceId": device_id if device_id is not None else self.device_id,
-            "commandSetId": command_set_id,
+            "commandSetId": (
+                command_set_id if command_set_id is not None else getattr(ctx, "command_set_id", None)
+            ),
         }
         # 상관 키가 하나라도 빠지지 않도록 보증(방어).
         for k in _CORRELATION_KEYS:

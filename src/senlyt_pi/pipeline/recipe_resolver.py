@@ -86,6 +86,9 @@ class ResolvedOpStep:
     flavor: str
     spec: SyringeSpec
     stage: int = 0
+    # 플런저 이동 **전** 회전할 밸브 포트(v1.1.0 시퀀스 복원·2026-07-19) — 흡입=air/배출=output.
+    #   서버(포트 배치 SoT)가 해석해 실어 보낸다. None(구 서버) = 어댑터가 회전 생략(하위호환).
+    valve_port: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +216,10 @@ class RecipeResolver:
                         flavor=s.flavor,
                         spec=op_spec,
                         stage=stage,
+                        # 이동 전 밸브 회전 대상(1~12 밖·비정수는 안전측 무시 → 회전 생략).
+                        valve_port=(
+                            s.in_port if s.in_port is not None and 1 <= s.in_port <= 12 else None
+                        ),
                     )
                 )
                 pumps = stage_pumps.setdefault(stage, set())

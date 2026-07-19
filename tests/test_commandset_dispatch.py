@@ -96,6 +96,9 @@ def harness(tmp_path: Path, fake: FakeEnginePort):
         interpret=interpret,
         commandset_source=source,
         commandset_sink=sink,
+        # 신선도 게이트 시계 seam — fixture created_at(2026-07-09)과 같은 시각으로 고정해
+        #   기존 시나리오가 전부 "신선한 봉투"로 판정되게 한다(게이트 자체는 신규 테스트가 검증).
+        now_s=lambda: 1783555200.0,  # 2026-07-09T00:00:00Z epoch
     )
     yield dispatcher, source, sink, interpret_calls
     ledger.close()

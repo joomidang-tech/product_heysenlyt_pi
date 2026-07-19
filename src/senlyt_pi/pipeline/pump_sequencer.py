@@ -133,6 +133,11 @@ class PumpSequencer:
         self.resolver = resolver
         # 실패 진단 로그용(2026-07-18) — 스텝 실패 시 raw 엔진코드·detail 을 남긴다(없으면 미기록).
         self._log = logger
+        # 현재 실행 중 잡의 상관(traceId, commandSetId) — 스텝 실행 스레드가 로거에 바인딩해
+        #   어댑터 시리얼 왕복 DEBUG·정비 실패 ERROR 가 그 잡의 trace 로 자동 엮인다
+        #   (2026-07-19 QA "흡입/배출" — traceId=null 로그라 흐름 추적이 안 되던 사각 봉합).
+        #   단일 in-flight(동시 1잡)라 인스턴스 필드 1개로 충분하다.
+        self._job_ctx: "tuple[str, str] | None" = None
         self._executor = EngineExecutor(engine, max_retries=max_retries)
         self.request_id_gen = request_id_gen
         self.publisher = publisher
@@ -217,6 +222,8 @@ class PumpSequencer:
                 self._busy = False
 
     def _run_job(self, job: _PendingJob) -> JobReport:
+        # 스텝 로그 상관 컨텍스트 갱신 — 이후 스텝 실행(_run_one·브로드캐스트)이 스레드에 바인딩.
+        self._job_ctx = (job.trace_id, job.command_id)
         # ── IL-02: 멱등 게이트 — 이미 본 합성키(4상태 전부)면 DROP(토출 0). ──
         #    claim 시 원 traceId 를 함께 영속 — 재기동 복구 보고가 원 트레이스와 상관되게.
         verdict = self.ledger.check_and_claim(job.command_id, job.trace_id)
@@ -468,6 +475,9 @@ class PumpSequencer:
             return None  # Fake/구 어댑터 — 일반 per-pump 동시 실행으로 폴백.
         addrs = [s.pump_addr for s in stage_steps]
         spec = stage_steps[0].spec
+        # 브로드캐스트는 consume 스레드에서 직접 실행 — 발사 INFO·어댑터 로그(브로드캐스트 송신 등)가
+        #   이 잡의 trace 로 엮이도록 여기서도 스레드 컨텍스트를 바인딩한다(2026-07-19).
+        self._bind_step_log_ctx()
         if self._log is not None:
             # 폴 없이 발사만 하므로, "명령이 나갔다"는 사실 자체를 관측 흔적으로 남긴다.
             self._log.info(
@@ -485,6 +495,8 @@ class PumpSequencer:
                     error=f"{type(exc).__name__}: {exc}",
                 )
             return [(False, StatusErrorCode.ENGINE_ERROR_PERMANENT) for _ in stage_steps]
+        finally:
+            self._clear_step_log_ctx()
         out: list[tuple[bool, StatusErrorCode | None]] = []
         for s in stage_steps:
             code = results.get(s.pump_addr, -1)  # 목록에 없으면(방어) 실패 처리.
@@ -510,6 +522,9 @@ class PumpSequencer:
           실패 결과로 흡수한다. future.result() 가 재-raise 하면 형제 in-flight future 를
           대기하지 않은 채 _run_job 을 뚫고 나가 동시1제조(L4)·ledger settle 이 깨진다(리뷰 P1-1).
         """
+        # 스텝 로그 상관(2026-07-19) — 이 스레드(워커/인라인)의 모든 로그(어댑터 시리얼 왕복 포함)에
+        #   현재 잡의 traceId/commandSetId 를 자동 부착. 풀 스레드는 재사용되므로 finally 로 반드시 해제.
+        self._bind_step_log_ctx()
         try:
             if isinstance(step, ResolvedOpStep):
                 # 엔진 조작(정비 버튼) — 토출이 아니라 EngineExecutor 재시도층을 타지 않는다.
@@ -567,6 +582,19 @@ class PumpSequencer:
                     error=f"{type(exc).__name__}: {exc}",
                 )
             return (False, StatusErrorCode.ENGINE_ERROR_PERMANENT)
+        finally:
+            self._clear_step_log_ctx()
+
+    def _bind_step_log_ctx(self) -> None:
+        """현재 잡의 traceId/commandSetId 를 **이 스레드** 로거 컨텍스트에 바인딩(어댑터 로그 상관)."""
+        if self._log is not None and self._job_ctx is not None:
+            self._log.bind_step_context(
+                trace_id=self._job_ctx[0], command_set_id=self._job_ctx[1]
+            )
+
+    def _clear_step_log_ctx(self) -> None:
+        if self._log is not None:
+            self._log.clear_step_context()
 
     def _engine_op(self, step: "ResolvedOpStep"):
         """엔진 조작 위임 — `run_op` 미보유 엔진(구 어댑터)은 미지원 실패로 떨어뜨린다(fail-closed)."""
@@ -575,7 +603,14 @@ class PumpSequencer:
         run_op = getattr(self._executor.engine, "run_op", None)
         if not callable(run_op):
             return EngineResult(raw_error_code=-1, detail="engine has no run_op")
-        return run_op(EngineOpCommand(pump_addr=step.pump_addr, op=step.op, spec=step.spec))
+        return run_op(
+            EngineOpCommand(
+                pump_addr=step.pump_addr,
+                op=step.op,
+                spec=step.spec,
+                valve_port=step.valve_port,
+            )
+        )
 
     def shutdown(self) -> None:
         """stage 태스크 풀 정리(멱등) — daemon 우아한 종료 경로에서 호출."""

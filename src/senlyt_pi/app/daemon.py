@@ -245,6 +245,7 @@ class SenlytDaemon:
             interpret=deps.interpret or _default_interpret,
             commandset_source=deps.commandset_source,
             commandset_sink=commandset_sink if callable(commandset_sink) else None,
+            logger=deps.logger,  # 정비 신선도 게이트 관측(2026-07-19)
         )
         self._recovery = BootRecovery(deps.ledger)
 
@@ -593,6 +594,9 @@ class SenlytDaemon:
             바이트까지 admin 에서 본다(볼륨 크면 상수만 INFO/WARN 로 올림).
           - **WARN/ERROR 는 즉시 flush**(`_trace_flush_now` set → sender 곧바로 전송), DEBUG/INFO 는
             `trace_flush_interval_s`(기본 10s) 배치. 실패는 안 밀리고 정상 흐름은 촘촘.
+          - **단절 유실 0**(2026-07-19): 전송 실패 배치는 어댑터의 TraceSpill(디스크)이 보존하고
+            재연결·재부팅 후 sender 주기 flush 가 전량 업로드한다 — 긴 단절 구간 DEBUG/INFO 도
+            서버에서 다 보인다(journalctl 불필요). 메모리 버퍼 overflow 도 드롭 대신 스풀로 배출.
           - event = ``pi.log.{severity}`` — dispense 스팬(``dispense.*``)과 구분.
           - traceId 없는 운영 로그는 ``trace_id=""`` 로 실어 admin **로그검색(service=pi)** 축에
             합류한다(타임라인 축은 traceId 있는 것만 엮인다).
@@ -621,12 +625,19 @@ class SenlytDaemon:
             device_id=record.get("deviceId"),
             detail=detail,
         )
+        overflow: "list[TraceSpan] | None" = None
+        spill_fn = getattr(self.deps.status_sink, "spill_traces", None)
         with self._trace_lock:
             if len(self._trace_buffer) >= _LOG_TRACE_BUFFER_CAP:
-                # RC5 — **심각도 인지 드롭**(2026-07-19). 버퍼가 저가치 DEBUG/INFO 로 차 있을 때 그 순간
-                #   도착한 WARN/ERROR(가장 중요한 실패 신호)가 밀려나던 결함 봉합. WARN 이상이면 가장
-                #   오래된 DEBUG/INFO 를 evict 하고 자리 확보, 저심각도만 있으면 신착을 드롭(기존 동작).
-                if _SEVERITY_RANK.get(severity, 1) >= 2:
+                # 버퍼 상한 도달 — **드롭 대신 디스크 스풀로 배출**(2026-07-19 · 유실 0 원칙).
+                #   오래된 것부터 잘라 자리만 비우고, 디스크 IO(spill_fn·fsync)는 **락 밖에서**
+                #   한다(리뷰 P1-2 — 락 쥔 채 디스크를 타면 다른 로깅 스레드=제조 스레드가 그
+                #   시간만큼 스톨). 스풀 미지원 sink(Fake 등)만 종전 RC5 심각도 인지 드롭으로
+                #   폴백(WARN 이상이 저심각도를 밀어냄·건수 계수→합성 WARN).
+                if callable(spill_fn):
+                    overflow = self._trace_buffer[: _LOG_TRACE_BUFFER_CAP // 2]
+                    del self._trace_buffer[: _LOG_TRACE_BUFFER_CAP // 2]
+                elif _SEVERITY_RANK.get(severity, 1) >= 2:
                     evict_idx = next(
                         (
                             i
@@ -646,6 +657,13 @@ class SenlytDaemon:
                     self._trace_dropped += 1
                     return
             self._trace_buffer.append(span)
+        # overflow 배출 — **락 밖 디스크 IO**(fsync 수 ms·TraceSpill 이 자체 락으로 직렬화).
+        if overflow is not None and callable(spill_fn):
+            try:
+                spill_fn(overflow)
+            except Exception:  # noqa: BLE001 — 스풀 실패가 로깅(제조)을 막으면 안 된다.
+                with self._trace_lock:
+                    self._trace_dropped += len(overflow)
         # WARN/ERROR = 실패 신호 → sender 를 깨워 즉시 전송(INFO 는 배치 주기까지 대기).
         if _SEVERITY_RANK.get(severity, 1) >= 2:
             self._trace_flush_now.set()
@@ -693,6 +711,9 @@ class SenlytDaemon:
                     return  # 큐 소진 + 정지 신호 → 종료(잔여 0·순서 보존).
                 if time.monotonic() - last_oq_flush >= oq_interval:
                     self._flush_offline_queue()
+                    # 관측 로그 스풀도 같은 결로 업로드 — 단절 중 디스크에 쌓인 배치가
+                    #   재연결 시 여기서 전량 서버 합류한다(부팅 직후 첫 주기 = 전 세션 잔여 업로드).
+                    self._flush_trace_spill()
                     last_oq_flush = time.monotonic()
                 # 관측 로그 flush — WARN/ERROR 는 _trace_flush_now 로 즉시 깨어나고,
                 #   INFO 등 일반 로그는 trace_flush_interval_s(기본 10s) 배치로 묶어 보낸다.
@@ -874,6 +895,16 @@ class SenlytDaemon:
         try:
             self.deps.status_sink.ship_trace(spans)
         except Exception:  # noqa: BLE001 — trace 유실은 제조를 막지 않는다(§10-6).
+            pass
+
+    def _flush_trace_spill(self) -> None:
+        """관측 로그 디스크 스풀 업로드(재연결·부팅) — 미지원 sink(Fake 등)는 no-op."""
+        flush = getattr(self.deps.status_sink, "flush_trace_spill", None)
+        if not callable(flush):
+            return
+        try:
+            flush()
+        except Exception:  # noqa: BLE001 — 스풀 flush 실패는 다음 주기 재시도.
             pass
 
     def _flush_offline_queue(self) -> None:

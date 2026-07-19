@@ -64,6 +64,9 @@ class EngineOpCommand:
     # "estop" | "initialize" | "plunger_full" | "plunger_home" — 서버 wire `op` 의 pi 표기.
     op: str
     spec: SyringeSpec
+    # 플런저 이동 **전** 회전할 밸브 포트(v1.1.0 시퀀스: 흡입=air/배출=output — 서버 해석값).
+    #   None = 회전 생략(구 서버 하위호환·estop/initialize).
+    valve_port: int | None = None
 
 
 # 엔진 조작 op — 서버 wire `EngineOp` 와 1:1(camelCase → snake_case).

@@ -94,6 +94,11 @@ class RecipeStep:
         raw_stage = j.get("stage")
         stage = int(raw_stage) if raw_stage is not None else None
         if kind == ENGINE_OP_STEP_KIND:
+            # `valvePort`(2026-07-19 · v1.1.0 시퀀스 복원) = 플런저 이동 **전** 회전할 밸브 구멍.
+            #   흡입(plungerFull)=air / 배출(plungerHome)=output — 포트 배치 SoT=서버가 해석해
+            #   실어 보낸다. 의미가 `I{n}` 회전 대상이라 기존 in_port 필드에 싣는다(새 필드 불요).
+            #   부재(구 서버) = None → 어댑터가 회전 생략(하위호환).
+            vp = j.get("valvePort")
             return RecipeStep(
                 idx=int(j["idx"]),
                 pump_addr=int(j["pumpAddr"]),
@@ -102,6 +107,9 @@ class RecipeStep:
                 kind=ENGINE_OP_STEP_KIND,
                 stage=stage,
                 op=str(j["op"]),
+                in_port=(
+                    int(vp) if isinstance(vp, (int, float)) and not isinstance(vp, bool) else None
+                ),
             )
         if kind == VALVE_STEP_KIND:
             base = str(j["base"])
@@ -135,7 +143,7 @@ class RecipeStep:
 
     def to_json(self) -> dict[str, Any]:
         if self.kind == ENGINE_OP_STEP_KIND:
-            return {
+            out: dict[str, Any] = {
                 "idx": self.idx,
                 "stage": self.effective_stage,
                 "kind": ENGINE_OP_STEP_KIND,
@@ -144,6 +152,9 @@ class RecipeStep:
                 "flavor": self.flavor,
                 "volume": 0,
             }
+            if self.in_port is not None:
+                out["valvePort"] = self.in_port  # 이동 전 회전 밸브(왕복 보존·from_json 대칭)
+            return out
         if self.kind == VALVE_STEP_KIND:
             return {
                 "idx": self.idx,
