@@ -201,16 +201,32 @@ class Runner:
         )
 
     def s_estop_cancel(self):
-        """estop → 대기 봉투 자동 취소(ESTOP_CANCELED) → 해제+복구."""
-        print("\n▶ [에러경로] 긴급정지 큐 정리 — 대기 봉투가 ESTOP_CANCELED 로 즉시 종단되는가")
-        if not self.confirm("estop 후 명령 2건 발행(실행되지 않아야 정상)"):
-            self.results.append(("estop 큐 정리", "SKIP", "사용자 건너뜀", 0.0))
+        """estop 중 신규 발행 → 서버 409 거부(estop_active) → 해제+복구.
+
+        2026-07-19 게이트 확정: estop = 전 펌프 TR + 초기화 캐시 무효화라 성공 가능한 명령이
+        없다 → 서버가 발행 시점에 409 로 거부한다(기기 왕복·INTERRUPTED 노이즈 제거).
+        (estop SET 시점에 이미 대기 중이던 봉투는 종전대로 ESTOP_CANCELED 로 서버가 정리.)
+        """
+        print("\n▶ [에러경로] 긴급정지 발행 게이트 — estop 중 신규 발행이 409 로 거부되는가")
+        if not self.confirm("estop 후 명령 발행(409 거부돼야 정상)"):
+            self.results.append(("estop 발행 게이트", "SKIP", "사용자 건너뜀", 0.0))
             return
         self.api.estop(self.device_id, True)
         print(f"    [{now()}] estop SET")
         time.sleep(1.0)
-        cs = self.api.issue(self.device_id, [engine_op(1, "plungerFull")], "estop 중 발행(취소 기대)")
-        self.scenario_from_issued("estop 중 발행 → 취소 기대", cs, expect="failed", expect_code="ESTOP_CANCELED", timeout_s=30)
+        t0 = time.monotonic()
+        try:
+            cs = self.api.issue(self.device_id, [engine_op(1, "plungerFull")], "estop 중 발행(409 기대)")
+            # 구 서버(게이트 이전)면 발행이 통과 — 봉투 추적으로 폴백(하위호환 판독).
+            print("    (구 서버 폴백 — 발행이 통과됨: 봉투 종단 추적)")
+            self.scenario_from_issued("estop 중 발행 → 거부 기대", cs, expect="failed", expect_code="ESTOP_CANCELED", timeout_s=30)
+        except urllib.error.HTTPError as e:
+            dur = time.monotonic() - t0
+            body = e.read().decode(errors="replace")
+            ok = e.code == 409 and "estop_active" in body
+            verdict = "PASS" if ok else "FAIL"
+            print(f"    ⇒ {verdict} — HTTP {e.code} {body[:80]} ({dur:.1f}s)  (기대 409 estop_active)")
+            self.results.append(("estop 발행 게이트", verdict, f"HTTP {e.code} estop_active", dur))
         self.api.estop(self.device_id, False)
         print(f"    [{now()}] estop CLEAR — 복구 초기화 발행")
         self.scenario("estop 해제 후 복구 초기화", init_steps([1, 2]), "복구 초기화(CLI)", confirm=False)
