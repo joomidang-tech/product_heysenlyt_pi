@@ -175,7 +175,7 @@ def ensure_registered(
 ) -> DeviceIdentity:
     """부팅 진입점 — 저장된 정체성이 유효(미만료·동일 deviceId)하면 재사용, 아니면 등록.
 
-    토큰 만료(계약 12h) 시 재등록으로 재발급. [D-A] 저장된 deviceId 가 현재 시리얼과 다르면
+    토큰 만료(계약상 장수명 10년·2026-07-19·사실상 안 만료) 시 재등록으로 재발급. [D-A] 저장된 deviceId 가 현재 시리얼과 다르면
     (기판 교체·구 dsp-<hash> 파일에서 승격 등) 저장분을 버리고 재등록(레지스트리 upsert 키 = deviceId=시리얼).
 
     **TOFU 승인 대기(2026-07-17)**: 등록이 202 pending(client.register()→None)이면 운영자가 /admin 에서

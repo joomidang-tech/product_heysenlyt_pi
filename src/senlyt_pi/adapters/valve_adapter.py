@@ -80,6 +80,10 @@ class FakeValveAdapter:
             self.dispensed.append((base, volume_ml, open_sec))
         return ValveDispenseResult(ok=True, open_sec=open_sec)
 
+    def available_bases(self) -> list[str]:
+        # Fake = 전 base 사용가능(실 GPIO 없음). 연결상태 표시용 read-only.
+        return list(VALVE_BASES)
+
     def close_all(self) -> None:
         self.close_all_calls += 1
 
@@ -148,3 +152,7 @@ class GpioValveAdapter:
     def _close_all_unlocked(self) -> None:
         for valve in self._valves.values():
             valve.off()
+
+    def available_bases(self) -> list[str]:
+        # 부팅 시 OutputDevice 클레임 성공한 base = 핀 사용가능. **dict 조회만**(on/off 없음·비-실행).
+        return sorted(self._valves.keys())

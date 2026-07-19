@@ -231,21 +231,24 @@ class HttpStatusSinkAdapter:
     # §9-4  긴급정지 신호 fast-poll — GET estop
     # ─────────────────────────────────────────────────────────────────────
 
-    def poll_estop(self, device_id: str) -> "tuple[bool, str | None]":
-        """긴급정지 신호 조회 — `(active, requestedAt)`. 실패/거부는 `(False, None)` 안전 폴백.
+    def poll_estop(self, device_id: str) -> "tuple[bool, str | None] | None":
+        """긴급정지 신호 조회 — 성공 시 `(active, requestedAt)`, **실패/거부/불확정 시 `None`**.
 
-        ⚠️ **fast-poll**(데몬 estop 감시 스레드가 ~1s 주기 호출). best-effort — 네트워크 오류/비-2xx
-           는 (False, None)로 흡수해 다음 폴에서 재시도한다(서버 불통이면 관제도 신호를 못 넣는다).
-           서버 200 응답 body = { active: bool, requestedAt: string|null }.
+        ⚠️ **fail-SAFE**(2026-07-19 안전 봉합) — 네트워크 오류·비-2xx(401 토큰만료·403·500
+           estop_query_failed)·비-dict 응답을 **(False,None)로 흡수하지 않는다**. 그건 "서버가 estop
+           비활성이라고 확인"과 구분 불가라, 폴 1회 실패만으로 데몬이 안전 래치를 풀어버리는 **fail-OPEN**
+           이었다(관제가 서버에서 여전히 estop 활성인데 언래치). 대신 **`None`(불확정)** 을 반환해 데몬이
+           **래치를 유지**하게 한다(확인불가 = 정지측). 오직 2xx 로 확인된 값만 (active, requestedAt).
+           fast-poll(~1s)이라 다음 성공 폴에서 정상 상태로 수렴한다. body = { active, requestedAt }.
         """
         url = self._config().estop_url(device_id)
         headers = bearer_headers(self.bearer_token)
         try:
             status, data = self._request("GET", url, headers=headers, timeout=self.timeout)
         except HttpTransportError:
-            return (False, None)
+            return None  # 불확정 — 데몬이 래치 유지(fail-safe·확인불가=정지측).
         if not (200 <= status < 300) or not isinstance(data, dict):
-            return (False, None)
+            return None  # 불확정(비-2xx·malformed) — 래치 유지.
         active = bool(data.get("active"))
         requested_at = data.get("requestedAt")
         return (active, requested_at if isinstance(requested_at, str) else None)

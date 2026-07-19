@@ -38,3 +38,11 @@ class ValvePort(Protocol):
     def close_all(self) -> None:
         """전 밸브 강제 닫힘 — 시작/종료/graceful/크래시 핸들러에서 호출(멱등)."""
         ...
+
+    def available_bases(self) -> list[str]:
+        """GPIO 라인이 클레임된 기주밸브 base 목록 — **비-실행 read-only**(on/off 절대 안 함).
+
+        연결상태 표시용. ⚠️ '핀 사용가능'(라인 살아있음) 판정이지 '실제 밸브 장착' 확인이 아니다
+        (GPIO 출력이라 시리얼 펌프처럼 응답 probe 가 물리적으로 불가). admin 라벨에서 구분한다.
+        """
+        ...

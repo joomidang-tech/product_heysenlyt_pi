@@ -24,8 +24,9 @@ from typing import Any
 # 디스펜서 role 상수 — SoT §7-4.
 DISPENSER_ROLE = "dispenser"
 
-# 세션 TTL(초) — 12h (§7-2). 참고용(발급은 서버).
-DISPENSER_SESSION_TTL_SECONDS = 60 * 60 * 12
+# 세션 TTL(초) — 장수명 10년 (2026-07-19 야간 오프라인 해결·서버 dispenserSession 미러).
+#   참고용(발급·서명은 서버). pi 는 만료를 이 상수가 아니라 토큰 payload 의 exp 로 판단한다.
+DISPENSER_SESSION_TTL_SECONDS = 60 * 60 * 24 * 365 * 10
 
 # 서명 도메인 prefix — SoT §7-4 / 부록A P-6. **참고 상수**(pi 는 서명 안 함).
 # 교차 재사용 차단의 근거 — 축 A(prefix 없음)·축 B(dispenser)·축 C(operator).

@@ -54,5 +54,5 @@ def test_expiry_strict():
 
 
 def test_ttl_constant():
-    """세션 TTL = 12h (§7-2, 참고 상수)."""
-    assert DISPENSER_SESSION_TTL_SECONDS == 12 * 60 * 60
+    """세션 TTL = 장수명 10년 (2026-07-19 야간 오프라인 해결·서버 dispenserSession 미러 상수)."""
+    assert DISPENSER_SESSION_TTL_SECONDS == 10 * 365 * 24 * 60 * 60

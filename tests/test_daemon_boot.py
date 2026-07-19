@@ -552,6 +552,31 @@ def test_estop_watcher_clear_releases_latch(ledger):
     assert not fake._estop.is_set()  # engine.clear_estop 호출됨
 
 
+def test_estop_watcher_unknown_poll_keeps_latch(ledger):
+    """[안전·fail-SAFE·2026-07-19] 래치 set(estop 활성) 상태에서 폴이 **None(불확정)** 반환(네트워크
+    오류·401 만료·403·500)해도 래치를 **유지**한다.
+
+    회귀 방지: 옛 코드는 poll_estop 이 실패를 (False,None)로 흡수 → 데몬이 active=False+래치set 을
+    '정상 해제'로 오인해 폴 1회 실패만으로 안전 래치를 풀었다(fail-OPEN — 관제 estop 활성 중 언래치).
+    이제 실패=None → 데몬이 래치를 건드리지 않아야 한다(확인불가=정지측).
+    """
+    fake = FakeEnginePort()
+    fake.script_all(FakeEngineOutcome.ACK)
+    signal = {"v": (True, "2026-07-19T00:00:00.000Z")}
+    d = _daemon(ledger, engine=fake, estop_source=lambda: signal["v"])
+    d.poll_estop_once()
+    assert d._estop.is_set() and fake._estop.is_set()  # estop 발동·래치 set
+    # 폴 실패(불확정) — 서버가 '비활성'이라 확인한 게 아니다.
+    signal["v"] = None
+    d.poll_estop_once()
+    assert d._estop.is_set()  # ⛔ 래치 유지(fail-safe) — 옛 코드는 여기서 풀렸다
+    assert fake._estop.is_set()  # 엔진 래치도 유지(clear_estop 미호출)
+    # 다음 성공 폴에서 진짜 해제 신호가 오면 그때 정상 풀림(수렴).
+    signal["v"] = (False, None)
+    d.poll_estop_once()
+    assert not d._estop.is_set()
+
+
 def test_estop_watcher_poll_error_is_swallowed(ledger):
     """estop 폴 소스 예외 → 삼킴(다음 폴 재시도·데몬 죽지 않음)."""
     def boom():

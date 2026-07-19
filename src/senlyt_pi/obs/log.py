@@ -82,6 +82,10 @@ class StructuredLogger:
         self._now_iso = now_iso if now_iso is not None else _default_now_iso
         # 테스트/서버전송 훅 — 방출된 레코드(dict)를 그대로 넘겨받는다(선택).
         self._sink = sink
+        # RC7(2026-07-19) — sink 결선 **전**(부팅 프로비저닝·기기등록·펌프 자동인식) 레코드를 버퍼했다가
+        #   bind_sink 시 replay 한다. 그 구간 로그가 sink=None 이라 서버 미도달하던 사각 봉합. 상한 200 으로
+        #   무한성장 방지(부팅 로그는 소수).
+        self._pending: "list[dict[str, Any]]" = []
 
     def bind_device(self, device_id: str) -> None:
         """등록 후 deviceId 바인딩 — 이후 모든 레코드에 자동 부착."""
@@ -94,6 +98,13 @@ class StructuredLogger:
         서버 trace 로 합류(admin 관측). sink 는 best-effort — 예외는 event() 가 삼킨다(제조 무영향).
         """
         self._sink = sink
+        # RC7 — 결선 전 버퍼된 부팅 로그를 새 sink 로 replay(부팅 프로비저닝·펌프인식 실패 관측 복원).
+        pending, self._pending = self._pending, []
+        for rec in pending:
+            try:
+                sink(rec)
+            except Exception:  # noqa: BLE001 — sink 예외는 삼킨다(제조/부팅 무영향).
+                pass
 
     def event(
         self,
@@ -139,6 +150,9 @@ class StructuredLogger:
                 self._sink(record)
             except Exception:
                 pass
+        elif len(self._pending) < 200:
+            # RC7 — 아직 sink 미결선(부팅 전) → 버퍼. bind_sink 가 replay 한다(상한 초과분은 버림).
+            self._pending.append(record)
         return record
 
     # ── severity 편의 메서드 — stage 는 필수(호출측이 파이프라인 단계를 명시). ──

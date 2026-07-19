@@ -205,7 +205,7 @@ class TestEnsureRegistered:
         assert t.calls == []
 
     def test_expired_token_reregisters(self, tmp_path: Path):
-        """만료(12h TTL 경과) → 재등록으로 재발급(계약 RegisterResponse)."""
+        """만료(토큰 exp 경과) → 재등록으로 재발급(계약 RegisterResponse)."""
         store = DeviceIdentityStore(tmp_path / "identity.json")
         store.save(DeviceIdentity(device_id=SERIAL, dispenser_token="tok-old", exp=999))
         t = ScriptedTransport([(200, OK_BODY)])

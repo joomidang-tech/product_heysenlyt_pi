@@ -277,9 +277,15 @@ class Heartbeat:
     last_error: StatusErrorCode | None = None  # 7종 | None
     # (선택·세척 계약 기존 설계 유지) — HeartbeatRequest.needsCleaning (2026-07-09 레지스트리 연동 확장).
     needs_cleaning: bool | None = None
+    # 기기 연결 상태(2026-07-19·연결상태 기능) — 부팅 자동인식 결과를 admin 표시용으로 보고.
+    #   pumps = 응답한 펌프 주소(시리얼 probe = 실연결 판정). valves = GPIO 라인이 클레임된 기주밸브 base
+    #   (= "핀 사용가능"·비-실행 read-only 판정 — on/off 안 함). ⚠️ 밸브는 '핀 살아있음'이지 '실제 밸브
+    #   장착'이 아니다(GPIO 출력이라 응답 없음) — admin 라벨에서 구분.
+    pumps: "list[int] | None" = None
+    valves: "list[str] | None" = None
 
     def to_json(self) -> dict[str, Any]:
-        """includeIfNull:false — engine/lastError/needsCleaning 은 부재 시 키 방출 안 함(부록A P-4)."""
+        """includeIfNull:false — 선택 필드는 부재 시 키 방출 안 함(부록A P-4)."""
         m: dict[str, Any] = {
             "deviceId": self.device_id,
             "queueDepth": self.queue_depth,
@@ -287,4 +293,6 @@ class Heartbeat:
         put_if_present(m, "engine", self.engine)
         put_if_present(m, "lastError", self.last_error.wire if self.last_error else None)
         put_if_present(m, "needsCleaning", self.needs_cleaning)
+        put_if_present(m, "pumps", self.pumps)
+        put_if_present(m, "valves", self.valves)
         return m

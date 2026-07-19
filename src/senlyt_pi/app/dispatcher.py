@@ -224,15 +224,20 @@ class Dispatcher:
         engine: str | None = None,
         last_error: StatusErrorCode | None = None,
         needs_cleaning: bool | None = None,
+        pumps: "list[int] | None" = None,
+        valves: "list[str] | None" = None,
     ) -> Heartbeat:
         """하트비트 조립(§9-3·30s 주기) — queueDepth 는 Sequencer 에서 파생(유휴=0).
-        전송(PATCH /api/dispenser/heartbeat)은 StatusSinkPort 어댑터 책임."""
+        전송(PATCH /api/dispenser/heartbeat)은 StatusSinkPort 어댑터 책임.
+        pumps/valves = 기기 연결상태(연결상태 기능) — 데몬이 자동인식 결과를 실어 준다."""
         return Heartbeat(
             device_id=self.device_id,
             queue_depth=self.sequencer.queue_depth,
             engine=engine,
             last_error=last_error,
             needs_cleaning=needs_cleaning,
+            pumps=pumps,
+            valves=valves,
         )
 
     def _report_commandset(

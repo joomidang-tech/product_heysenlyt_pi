@@ -163,7 +163,7 @@ class DaemonDeps:
     #   ⚠️ **명령 폴과 무관한 전용 스레드**가 이걸 fast-poll 한다. 제조 중엔 메인 폴이 블록되므로,
     #   estop 을 큐가 아니라 이 별도 축으로 받아야 제조 중에도 즉시 전 펌프를 멈춘다. None = 비활성
     #   (watcher 미기동 — 테스트/구성 미주입 시 안전 폴백).
-    estop_source: Callable[[], "tuple[bool, str | None]"] | None = None
+    estop_source: Callable[[], "tuple[bool, str | None] | None"] | None = None
     # estop fast-poll 주기(초). estop 은 반응성이 생명이라 heartbeat(30s)보다 훨씬 짧게.
     estop_poll_interval_s: float = 1.0
     # 긴급정지 공유 래치(§9-4) — **어댑터·시퀀서·데몬이 같은 Event 를 봐야** '공유 _estop' 설계가
@@ -747,7 +747,7 @@ class SenlytDaemon:
         if source is None:
             return
         try:
-            active, requested_at = source()
+            result = source()
         except Exception as e:  # noqa: BLE001 — 폴 오류 삼킴(다음 폴 재시도).
             self._log.warn(
                 "estop 폴 오류(삼킴·다음 폴 재시도)",
@@ -756,6 +756,13 @@ class SenlytDaemon:
                 error=str(e),
             )
             return
+        if result is None:
+            # 불확정(폴 실패·비-2xx·malformed 응답) — **안전측: 래치를 건드리지 않는다**(fail-safe·2026-07-19
+            #   안전 봉합). 서버가 estop 비활성이라고 '확인'된 게 아니라 '확인 불가'라, 여기서 clear 하면
+            #   관제 estop 활성 중에 폴 1회 실패로 안전 래치가 풀리는 fail-OPEN 이 된다. fast-poll(~1s)이라
+            #   다음 성공 폴에서 정상 상태(active True/False)로 수렴한다.
+            return
+        active, requested_at = result
         if active:
             # 상승엣지(새 requestedAt)만 처리 — 같은 신호 반복 TR 회피(TR 자체는 멱등이라 무해하나 로그 노이즈).
             if requested_at is not None and requested_at == self._last_estop_at:
@@ -823,8 +830,17 @@ class SenlytDaemon:
         self._flush_offline_queue()
 
     def _build_heartbeat(self) -> Heartbeat:
+        # 기기 연결상태(연결상태 기능·2026-07-19) — 부팅 자동인식 결과를 admin 표시용으로 실어 보낸다.
+        #   pumps = 응답한 펌프 주소(pump_map = 부팅 시리얼 probe 결과 = 실연결). valves = GPIO 라인
+        #   클레임된 기주밸브 base(available_bases = 핀 사용가능·비-실행 read-only). 미지원 더블 → None.
+        pumps = sorted(self._sequencer.resolver.pump_map)
+        avail = getattr(self.deps.valve, "available_bases", None)
+        valves = avail() if callable(avail) else None
         return self._dispatcher.build_heartbeat(
-            engine=engine_wire_name(self.deps.engine), last_error=self._last_error
+            engine=engine_wire_name(self.deps.engine),
+            last_error=self._last_error,
+            pumps=pumps,
+            valves=valves,
         )
 
     def _flush_traces(self) -> None:

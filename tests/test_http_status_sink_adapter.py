@@ -278,11 +278,14 @@ class TestPollEstop:
             assert sink.poll_estop("dev-A") == (False, None)
 
     def test_server_error_safe_fallback(self) -> None:
+        # fail-SAFE(2026-07-19) — 비-2xx(500)는 (False,None) 흡수가 아니라 **None(불확정)** 반환.
+        #   (False,None) 이면 데몬이 안전 래치를 풀어버리는 fail-OPEN 이었다(확인불가=정지측이어야 함).
         with FakeHttpServer() as srv:
             srv.set_handler(lambda req: {"status": 500, "json": {"code": "estop_query_failed"}})
             sink = HttpStatusSinkAdapter(base_url=srv.base_url, bearer_token="t")
-            assert sink.poll_estop("dev-A") == (False, None)
+            assert sink.poll_estop("dev-A") is None
 
     def test_network_failure_safe_fallback(self) -> None:
+        # fail-SAFE — 네트워크 오류도 None(불확정) 반환(데몬이 래치 유지). (False,None) 흡수 금지.
         sink = HttpStatusSinkAdapter(base_url="http://web:3000", request=_raising_request)
-        assert sink.poll_estop("dev-A") == (False, None)
+        assert sink.poll_estop("dev-A") is None
