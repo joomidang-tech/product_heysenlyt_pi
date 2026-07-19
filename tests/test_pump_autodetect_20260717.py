@@ -3,7 +3,7 @@
 핵심: **박아둔 VID/PID 로 찾지 않고, 실제 펌프 응답을 프로브해 자동 감지**한다.
   - 포트 후보: 전체 시리얼 포트(알려진 어댑터 우선·하드필터 아님).
   - 자동 감지: 후보 포트를 프로브 → 펌프 응답하는 포트/버스 확정.
-  - 펌프 id: 버스 주소 1..10 스캔(한 버스 최대 10개) → 응답분 = 장착 펌프.
+  - 펌프 id: 버스 주소 1..9 스캔(두 자리 주소=유령 응답이라 10↑ 금지) → 응답분 = 장착 펌프.
   - 자동 매핑: 발견 id → SyringeSpec pump_map 생성.
 """
 
@@ -73,11 +73,12 @@ def test_autodetect_finds_port_with_pumps():
     assert d.port == "/dev/ttyUSB1" and d.pump_ids == (1, 2, 3)
 
 
-def test_autodetect_up_to_10_pumps():
-    """한 버스 최대 10개 — 1..10 응답 전부 인식."""
+def test_autodetect_up_to_9_pumps():
+    """한 버스 최대 9개 — 1..9 응답 전부 인식. ⚠️ 10 은 스캔 금지(유령 펌프 —
+    `/10?` 이 "주소1+명령0?" 으로 오독돼 pump1 이 대답, 2026-07-19 실기기 실측)."""
     bus = {"/dev/ttyUSB0": set(range(1, 11))}
     d = autodetect_bus(["/dev/ttyUSB0"], open_probe=lambda p: (lambda a: a in bus[p]))
-    assert d.pump_ids == tuple(range(1, 11))
+    assert d.pump_ids == tuple(range(1, 10))
 
 
 def test_autodetect_skips_port_that_fails_to_open():
@@ -94,15 +95,16 @@ def test_autodetect_none_when_no_pumps_anywhere():
     assert d.port is None and d.pump_ids == ()
 
 
-# ── 버스 스캔 (최대 10) ─────────────────────────────────────────────────────
+# ── 버스 스캔 (최대 9 — 두 자리 주소는 유령 응답·pump_health.DEFAULT_SCAN_MAX 주석) ──
 
-def test_scan_default_is_1_to_10():
-    assert DEFAULT_SCAN_MAX == 10
-    assert scan_addresses() == tuple(range(1, 11))
+def test_scan_default_is_1_to_9():
+    assert DEFAULT_SCAN_MAX == 9
+    assert scan_addresses() == tuple(range(1, 10))
 
 
 def test_discover_pumps_sparse():
-    assert discover_pumps(lambda a: a in {1, 3, 7, 10}) == [1, 3, 7, 10]
+    # 10 에 응답이 있어도(=pump1 유령) 스캔 범위 밖이라 등록되지 않는다.
+    assert discover_pumps(lambda a: a in {1, 3, 7, 10}) == [1, 3, 7]
 
 
 def test_probe_exception_absent():

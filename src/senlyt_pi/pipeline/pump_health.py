@@ -36,13 +36,16 @@ PumpProbe = Callable[[int], bool]
 # 포트를 열어 그 버스용 프로브를 만드는 seam(port -> probe). 실구현=시리얼 open, 테스트=가짜.
 OpenBusProbe = Callable[[str], PumpProbe]
 
-# 한 버스 최대 시린지펌프 수 = 자동 스캔 상한(주소 1..10). (사용자 확정 2026-07-17)
-DEFAULT_SCAN_MAX = 10
+# 자동 스캔 상한 = 주소 1..9. ⚠️ 10 이상을 스캔하면 안 된다(유령 펌프 — 2026-07-19 실기기 실측):
+#   프레임이 `/{addr}` 문자열 인코딩이라 `/10?` 은 펌프에게 "주소 1 + 명령 0?" 로 읽혀 **pump1 이
+#   대답**한다 → 존재하지 않는 펌프 10 이 발견·등록된다. 한 자리 주소(1..9)만이 이 인코딩에서
+#   유일하게 안전하다(스위치 10 이상 주소는 별도 문자 체계 — 현 하드웨어 미사용).
+DEFAULT_SCAN_MAX = 9
 
 
 def scan_addresses(max_addr: int = DEFAULT_SCAN_MAX) -> tuple[int, ...]:
-    """스캔할 주소 후보 1..max_addr(포함). 펌프 개수 미상 → 넓게 훑어 발견한다(최대 10)."""
-    return tuple(range(1, max(1, max_addr) + 1))
+    """스캔할 주소 후보 1..max_addr(포함·최대 9 — 두 자리 주소는 유령 응답, 상수 주석)."""
+    return tuple(range(1, min(9, max(1, max_addr)) + 1))
 
 
 def discover_pumps(

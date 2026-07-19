@@ -220,6 +220,11 @@ class SenlytDaemon:
         self._sender_thread: threading.Thread | None = None
         # 직전 poll_once 가 오류였는지(감사 P3 — 오류에만 지수 백오프·유휴는 미적용).
         self._last_poll_errored = False
+        # 주기 HW 감시 실측(2026-07-19 "데몬이 항상 감시" 요구) — 하트비트 N주기마다 idle 시
+        # 펌프 `?` 프로브로 갱신. admin 연결 칩의 실시간 근거(부팅 스냅샷 pumps 와 별개 축).
+        self._pump_health: "dict[int, str] | None" = None
+        self._hw_checked_at: str | None = None
+        self._hb_count = 0
         self._shutdown_lock = threading.Lock()
         self._shutdown_done = False
 
@@ -340,13 +345,17 @@ class SenlytDaemon:
         return False
 
     def poll_once(self) -> int:
-        """도착분 1회 소비 — CommandSet 봉투 + Command 축. 오류는 삼켜 루프 지속(§10-6).
+        """도착분 1회 소비 — **단일 스트림**에서 봉투+Command 두 축(2026-07-19 귀머거리 봉합).
+
+        구식(poll_commandsets→poll 순차)은 축마다 무한 스트림을 따로 열어, 한 축을 듣는 동안
+        다른 축 발행분이 스트림 수명(수 분)만큼 지연됐다 — 신선도 게이트(90s) 익사의 근본.
+        poll_stream 은 스트림 1개에서 snapshot 당 두 축을 함께 소비하고, 스트림 수명 상한
+        (어댑터 MAX_STREAM_AGE_S=60s)이 좀비까지 자가 회복시킨다. 오류는 삼켜 루프 지속(§10-6).
 
         반환 = 이번 폴에서 처리(Sequencer 진입)한 건수(0 이면 유휴).
         """
         try:
-            handled = self._dispatcher.poll_commandsets()
-            handled += self._dispatcher.poll()
+            handled = self._dispatcher.poll_stream()
             self._last_poll_errored = False  # 정상 경로 — 백오프 미적용(감사 P3).
             return handled
         except Exception as e:  # noqa: BLE001 — 스트림/네트워크 오류를 삼켜 루프 지속.
@@ -711,6 +720,9 @@ class SenlytDaemon:
                     return  # 큐 소진 + 정지 신호 → 종료(잔여 0·순서 보존).
                 if time.monotonic() - last_oq_flush >= oq_interval:
                     self._flush_offline_queue()
+                    # 봉투 종단(done|failed) 전이 재시도 — 5xx·단절로 유실될 뻔한 terminal 을
+                    #   재전송(2026-07-19 P1 — terminal 유실 = delivered 잔류 큐 교착의 진입로).
+                    self._flush_commandset_retries()
                     # 관측 로그 스풀도 같은 결로 업로드 — 단절 중 디스크에 쌓인 배치가
                     #   재연결 시 여기서 전량 서버 합류한다(부팅 직후 첫 주기 = 전 세션 잔여 업로드).
                     self._flush_trace_spill()
@@ -836,8 +848,38 @@ class SenlytDaemon:
         while not self._stop.wait(interval):
             self._emit_heartbeat()
 
+    # 주기 HW 감시 주기 — 하트비트(10s) N회마다 1회 프로브(기본 3 = ~30s). 첫 비트에 즉시 1회.
+    HW_HEALTH_EVERY_N_HEARTBEATS = 3
+
+    def _refresh_hw_health(self) -> None:
+        """idle 시 펌프 `?` 프로브로 실측 갱신 — 제조·정비 중엔 스킵(버스 무간섭 원칙).
+
+        엔진이 `health_probe` 미제공(Fake 등)이면 no-op. 프로브 도중 제조가 시작되면 즉시 양보
+        (부분 결과 폐기 — 낡은 전체 결과가 부분 신선 결과보다 일관적). 결과 의미는 어댑터
+        `health_probe` 주석(ok/garbled/silent — 오늘 진단 툴과 동일 판정)."""
+        probe = getattr(self.deps.engine, "health_probe", None)
+        if not callable(probe) or self._sequencer.is_busy:
+            return
+        pumps = sorted(self._sequencer.resolver.pump_map)
+        if not pumps:
+            return
+        health: dict[int, str] = {}
+        for addr in pumps:
+            if self._sequencer.is_busy or self._stop.is_set():
+                return  # 제조 시작/종료 — 부분 결과 버리고 즉시 양보.
+            try:
+                health[addr] = str(probe(addr))
+            except Exception:  # noqa: BLE001 — 프로브 예외 = 무응답 취급(감시는 best-effort).
+                health[addr] = "silent"
+        self._pump_health = health
+        self._hw_checked_at = self._now_iso()
+
     def _emit_heartbeat(self) -> None:
         """heartbeat 전송(queueDepth 파생) + ship_trace 배치 flush + OQ flush — 전부 best-effort."""
+        # 주기 HW 감시(idle 한정) — 첫 비트에 즉시 1회(부팅 ~10s 후 admin 에 실측 도달), 이후 N주기.
+        self._hb_count += 1
+        if self._hb_count % self.HW_HEALTH_EVERY_N_HEARTBEATS == 1:
+            self._refresh_hw_health()
         hb = self._build_heartbeat()
         try:
             self.deps.status_sink.send_heartbeat(hb)
@@ -863,6 +905,9 @@ class SenlytDaemon:
             last_error=self._last_error,
             pumps=pumps,
             valves=valves,
+            # 주기 감시 실측(idle 시 ~30s 주기 갱신) — admin 연결 칩의 실시간 근거.
+            pump_health=self._pump_health,
+            hw_checked_at=self._hw_checked_at,
         )
 
     def _flush_traces(self) -> None:
@@ -916,6 +961,16 @@ class SenlytDaemon:
         except Exception:  # noqa: BLE001 — 재연결 flush 실패는 다음 주기 재시도.
             pass
 
+    def _flush_commandset_retries(self) -> None:
+        """봉투 종단 전이 재시도 큐 재전송(2026-07-19 P1) — 미지원 sink(Fake 등)는 no-op."""
+        flush = getattr(self.deps.status_sink, "flush_commandset_retries", None)
+        if not callable(flush):
+            return
+        try:
+            flush()
+        except Exception:  # noqa: BLE001 — 실패는 다음 주기 재시도.
+            pass
+
     # ─────────────────────────────────────────────────────────────────────
     # 우아한 종료 — drain → heartbeat 정지 → OQ/trace flush → 자원 정리
     # ─────────────────────────────────────────────────────────────────────
@@ -958,6 +1013,7 @@ class SenlytDaemon:
         # 4) 마지막 trace/OQ flush — 밀린 역보고를 최대한 전송(무손실 지향).
         self._flush_traces()
         self._flush_offline_queue()
+        self._flush_commandset_retries()  # 봉투 terminal 재시도분도 종료 전 최대한 전송.
         # 5) stage 태스크 풀 정리 + 밸브 강제 닫힘(§9-1 v2 — 설계 §10 "종료 시에도 전 밸브 close").
         try:
             self._sequencer.shutdown()

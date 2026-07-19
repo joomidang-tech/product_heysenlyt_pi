@@ -294,6 +294,12 @@ class Heartbeat:
     #   장착'이 아니다(GPIO 출력이라 응답 없음) — admin 라벨에서 구분.
     pumps: "list[int] | None" = None
     valves: "list[str] | None" = None
+    # 주기 HW 감시 실측(2026-07-19 "데몬이 항상 감시해야 서버에서 상황 파악" 요구) —
+    #   pumpHealth = {addr: "ok"|"garbled"|"silent"} (idle 시 ~30s 주기 `?` 프로브 실측).
+    #   pumps(부팅 스냅샷)와 달리 **지금 상태** — admin 연결 칩이 이걸로 초록/노랑/빨강 표시.
+    #   hwCheckedAt = 마지막 프로브 시각(ISO) — "N초 전 확인" 표시용.
+    pump_health: "dict[int, str] | None" = None
+    hw_checked_at: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         """includeIfNull:false — 선택 필드는 부재 시 키 방출 안 함(부록A P-4)."""
@@ -306,4 +312,10 @@ class Heartbeat:
         put_if_present(m, "needsCleaning", self.needs_cleaning)
         put_if_present(m, "pumps", self.pumps)
         put_if_present(m, "valves", self.valves)
+        put_if_present(
+            m,
+            "pumpHealth",
+            {str(a): s for a, s in self.pump_health.items()} if self.pump_health else None,
+        )
+        put_if_present(m, "hwCheckedAt", self.hw_checked_at)
         return m

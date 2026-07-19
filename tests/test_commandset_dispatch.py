@@ -241,11 +241,13 @@ class TestMaintenance:
 
 
 class TestIdempotencyAcrossRedelivery:
-    def test_manufacture_redelivery_is_silent_noop(self, harness, fake):
-        """at-least-once 재전달(성공 주문) — terminal 봉투는 완전한 조용한 no-op.
+    def test_manufacture_redelivery_rereports_terminal_only(self, harness, fake):
+        """at-least-once 재전달(성공 주문) — 실행 0 + **terminal(done)만 재보고**(2026-07-19 개정).
 
-        재토출 0(IL-02) + 재전달분은 어떤 전이 보고도(delivered/running/done/failed) 없이
-        return None. 성공 트레이스를 오염(FAILED status·dispense.failed span·422)시키지 않는다.
+        재토출 0(IL-02) 유지. 2026-07-10 의 "완전한 조용한 no-op" 은 terminal PATCH 유실 시
+        봉투가 delivered 로 영구 잔류(종단 주체 부재 = 큐 영구 교착·P0)해, 재전달분이 ledger
+        의 terminal 을 status PATCH 로 재보고하게 바뀌었다. 트레이스 오염 방지 계약은 유지 —
+        DELIVERED/RUNNING 역행 보고 0·성공 주문에 failed 0(같은 terminal 값만·서버 noop 흡수).
         """
         dispatcher, _, sink, _ = harness
         first = dispatcher.dispatch_commandset(manufacture(steps=[step(0, 1, 100)]))
@@ -258,23 +260,24 @@ class TestIdempotencyAcrossRedelivery:
             ("done", None),
         ]
 
-        # 같은 합성키(이미 DONE) 재전달 → 즉시 return None(전이 0·실행 0·span 0).
+        # 같은 합성키(이미 DONE) 재전달 → 실행 0·done 재보고 후 return None.
         again = dispatcher.dispatch_commandset(manufacture(steps=[step(0, 1, 100)]))
-        assert again is None, "terminal 재전달은 조용한 no-op — None 반환"
+        assert again is None, "terminal 재전달은 실행 없는 no-op — None 반환"
         assert fake.dispense_count == 1, "재토출 0(IL-02)"
-        # 재전달분이 추가한 전이 보고는 0(원판 delivered/running/done 그대로).
-        assert list(sink.of("o1:1")) == events_after_first
-        # 어떤 failed 전이도 남지 않는다(가짜 실패 0).
+        # 재전달분은 **done 재보고 1건만** 추가 — delivered/running 역행 보고 0.
+        assert list(sink.of("o1:1")) == events_after_first + [("done", None)]
+        # 성공 주문에 어떤 failed 전이도 남지 않는다(가짜 실패 0 — 오염 방지 계약 유지).
         assert [e for e in sink.of("o1:1") if e[0] == "failed"] == []
 
-    def test_maintenance_redelivery_is_silent_noop(self, harness, fake):
+    def test_maintenance_redelivery_rereports_terminal_only(self, harness, fake):
         dispatcher, _, sink, _ = harness
         dispatcher.dispatch_commandset(maintenance(steps=[step(0, 1, 100)]))
         events_after_first = list(sink.of("mnt-1"))
         again = dispatcher.dispatch_commandset(maintenance(steps=[step(0, 1, 100)]))
         assert again is None
         assert fake.dispense_count == 1
-        assert list(sink.of("mnt-1")) == events_after_first
+        # done 재보고 1건만 — 역행(delivered/running)·가짜 failed 0.
+        assert list(sink.of("mnt-1")) == events_after_first + [("done", None)]
         assert [e for e in sink.of("mnt-1") if e[0] == "failed"] == []
 
     def test_new_attempt_is_fresh(self, harness, fake):

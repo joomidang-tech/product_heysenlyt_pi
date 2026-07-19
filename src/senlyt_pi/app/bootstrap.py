@@ -167,9 +167,20 @@ def build_engine(
         # ⚠️ estop_event 주입 = 데몬·시퀀서와 **같은 공유 래치**(§9-4). 이게 있어야 어댑터의 in-flight
         #   모션 폴이 데몬이 세운 래치를 직접 보고 즉시 bail 한다(설계 '단일 공유 _estop').
         #   port=None(미탐지) 이면 어댑터 기본값(/dev/ttyUSB0) 유지 — None 을 넘기지 않는다.
+        from ..adapters.serial_port_discovery import list_candidate_ports
+
+        # 핫플러그 자가 회복 seam(2026-07-19) — 장치 소멸 시 어댑터가 후보 포트를 재열거해
+        #   재오픈한다(ttyUSB0→ttyUSB1 이동 실측·재시작 불필요). env override 도 그대로 존중.
+        def _resolve_ports() -> list[str]:
+            return list_candidate_ports(environ, port_lister=port_lister)
+
         if port:
-            return Sy01bEngineAdapter(port=port, estop_event=estop_event, logger=logger)
-        return Sy01bEngineAdapter(estop_event=estop_event, logger=logger)
+            return Sy01bEngineAdapter(
+                port=port, estop_event=estop_event, logger=logger, port_resolver=_resolve_ports
+            )
+        return Sy01bEngineAdapter(
+            estop_event=estop_event, logger=logger, port_resolver=_resolve_ports
+        )
     return FakeEnginePort(estop_event=estop_event)
 
 

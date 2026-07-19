@@ -191,9 +191,15 @@ def classify_engine_error_code(code: int) -> EngineErrorClass:
 
 
 class StatusErrorCode(enum.Enum):
-    """status.errorCode 7종 — SoT §6-7 / §9-2."""
+    """status.errorCode — SoT §6-7 / §9-2 7종 + CMD_STALE(2026-07-19 신설).
+
+    CMD_STALE = 정비 신선도 초과("지금 아니면 무효" 게이트가 실행 없이 종단). 종전엔
+    CMD_VALIDATION_FAILED 를 재사용해 admin 이 "명령 형식 오류"로 표시했다 — 운영자가
+    "다시 누르면 된다"를 알 수 없던 오해 소지(15:35·16:03 실기기 2회). 라벨 분리용.
+    """
 
     CMD_VALIDATION_FAILED = "CMD_VALIDATION_FAILED"
+    CMD_STALE = "CMD_STALE"
     DUPLICATE_DROPPED = "DUPLICATE_DROPPED"
     ENGINE_TIMEOUT = "ENGINE_TIMEOUT"
     ENGINE_ERROR_TRANSIENT = "ENGINE_ERROR_TRANSIENT"

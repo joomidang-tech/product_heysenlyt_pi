@@ -262,8 +262,13 @@ def test_duplicate_commandset_dispenses_once(ledger):
 
     # 1스텝 레시피 × 원판 1회 = dispense 1. 중복은 IL-02 로 추가 토출 0.
     assert fake.dispense_count == 1
-    # 봉투 terminal DONE 은 원판 1회만(중복은 DUPLICATE_DROPPED → terminal 생략).
-    assert sink.transition_statuses().count(CommandSetStatus.DONE) == 1
+    # 재전달분은 실행 0 + terminal(DONE) **재보고**만(2026-07-19 개정 — terminal PATCH 유실
+    #   교착 자가치유). 역행(delivered/running) 재보고·가짜 failed 는 없다.
+    statuses = sink.transition_statuses()
+    assert statuses.count(CommandSetStatus.DONE) == 2  # 원판 1 + 재전달 재보고 1(서버 noop 흡수).
+    assert statuses.count(CommandSetStatus.DELIVERED) == 1
+    assert statuses.count(CommandSetStatus.RUNNING) == 1
+    assert CommandSetStatus.FAILED not in statuses
     daemon.shutdown()
 
 

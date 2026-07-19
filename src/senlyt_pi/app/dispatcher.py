@@ -38,7 +38,8 @@ from typing import Callable, Mapping, Sequence
 from ..core.command_set import CommandSet, CommandSetStatus
 from ..core.pump_guard import StatusErrorCode, fragrance_ml_to_ul
 from ..core.wire_messages import Command, Heartbeat, RecipeStep
-from ..obs.log import STAGE_PI_RECEIVED, StructuredLogger
+from ..obs.log import STAGE_ERROR, STAGE_PI_RECEIVED, StructuredLogger
+from ..persistence.file_idempotency_ledger import LedgerEntryState
 from ..pipeline.pump_sequencer import JobOutcome, JobReport, PumpSequencer
 from ..ports.command_source_port import CommandSourcePort
 from ..ports.commandset_source_port import CommandSetSourcePort
@@ -63,8 +64,12 @@ RecipeInterpreter = Callable[[Command], Sequence[RecipeStep]]
 # CommandSet 상태 전이 보고 sink — (commandSet, 새 status, errorCode|None).
 # 실전송(PATCH /api/dispenser/commandsets/[id]·requestId dedup)은 어댑터 책임 —
 # best-effort: 예외는 삼킨다(관측이 제조를 막지 않는다·§10-6 결).
+# 반환(선택·2026-07-19 하드닝): 실어댑터는 서버 판정 문자열("applied"|"noop"|"rejected"|
+#   "retry")을 돌려줄 수 있다 — dispatcher 는 DELIVERED 보고의 "rejected"(422 역행/404 미존재
+#   = 서버가 이미 종단·취소한 봉투)만 claim 게이트로 소비한다. None 반환(구 sink·Fake)은
+#   "판정 미상"으로 취급해 기존 동작(실행 진행) 그대로다(하위호환).
 CommandSetStatusSink = Callable[
-    [CommandSet, CommandSetStatus, "StatusErrorCode | None"], None
+    [CommandSet, CommandSetStatus, "StatusErrorCode | None"], "str | None"
 ]
 
 
@@ -107,6 +112,57 @@ class Dispatcher:
             if self._on_command(command) is not None:
                 handled += 1
         return handled
+
+    def poll_stream(self) -> int:
+        """**단일 스트림** 소비(2026-07-19 귀머거리 창 봉합) — 봉투+command 두 축을 한 스트림에서.
+
+        기존 `poll_commandsets()` → `poll()` 순차 호출은 각자 무한 스트림을 번갈아 블로킹 소비해,
+        한 축을 듣는 동안(스트림 수명 내내) 다른 축 발행분이 **최대 스트림 수명만큼 지연**됐다
+        (실기기 191s·293s → 신선도 게이트 익사). 소스가 `poll_batches`(단일 스트림·snapshot 당
+        두 축 동시)를 제공하면 그걸 쓰고, 아니면(테스트 Fake 등) 기존 순차 소비로 폴백한다.
+
+        - 봉투 우선 처리(기존 poll_once 순서 유지 — 봉투 축이 먼저 claim).
+        - **항목 단위 예외 격리**: 봉투/command 1건의 dispatch 예외가 스트림 소비를 죽여
+          제너레이터가 버려지면(=`with` 미정리) 스트림이 누수돼 중복 연결이 쌓인다(06:32 실측
+          난사). 항목 예외는 삼키고 로그만 — 스트림 계층 오류만 위로 전파(재연결 백오프 대상).
+        - finally 에서 **제너레이터 명시 close** — 어떤 종료 경로에서도 스트림 정리.
+        """
+        src = self.commandset_source if self.commandset_source is not None else self.command_source
+        batches = getattr(src, "poll_batches", None)
+        if not callable(batches):
+            handled = self.poll_commandsets()
+            handled += self.poll()
+            return handled
+        handled = 0
+        gen = batches(self.device_id)
+        try:
+            for sets, cmds in gen:
+                for cs in sets:
+                    try:
+                        if self.dispatch_commandset(cs) is not None:
+                            handled += 1
+                    except Exception as e:  # noqa: BLE001 — 봉투 1건 실패가 스트림을 안 죽인다.
+                        self._warn_item_error("commandset", cs.command_set_id, e)
+                for command in cmds:
+                    try:
+                        if self._on_command(command) is not None:
+                            handled += 1
+                    except Exception as e:  # noqa: BLE001 — command 1건 실패 격리(동일 원칙).
+                        self._warn_item_error("command", command.id, e)
+        finally:
+            gen.close()  # 스트림 자원 정리 강제(누수 방지 — 예외·중단 공통).
+        return handled
+
+    def _warn_item_error(self, kind: str, item_id: str, e: Exception) -> None:
+        """항목 단위 dispatch 예외 관측 — 스트림은 계속(격리), 원인은 로그로 남긴다."""
+        if self._log is not None:
+            self._log.warn(
+                f"{kind} 1건 처리 예외 — 격리하고 스트림 소비 지속",
+                stage=STAGE_ERROR,
+                device_id=self.device_id,
+                item_id=item_id,
+                error=str(e),
+            )
 
     def _on_command(self, command: Command) -> JobReport | None:
         # ── CS-08: deviceId 불일치 명령은 무시(다매장 라우팅). ──
@@ -162,12 +218,23 @@ class Dispatcher:
           계약 위반 — 토출 0 으로 failed(CMD_VALIDATION_FAILED).
         - 전이 보고: delivered → running → done|failed (best-effort·단조 전진.
           중복 재전달의 늦은 보고는 서버 게이트가 noop/422 로 흡수).
-        - **중복 재전달 조용한 no-op**(2026-07-10): command_set_id 가 ledger 상 이미
-          terminal(DONE/FAILED)이면 **맨 앞에서 즉시 return None** — DELIVERED/RUNNING
-          전이 보고도, 제조 실행도, trace span 도 일절 없다. at-least-once 재전달로 성공
-          주문 봉투가 한 번 더 도착해도(pi 제조 중 서버가 아직 delivered 라 push 가 한 번
-          더 오는 창) 성공 트레이스를 오염(422 backward·dispense.failed 가짜 실패)시키지
-          않는다. ledger 이중토출 차단(재토출 0)은 check_and_claim 이 그대로 유지.
+        - **중복 재전달 = terminal 재보고 후 no-op**(2026-07-10 → 2026-07-19 개정):
+          command_set_id 가 ledger 상 이미 terminal(DONE/FAILED)이면 실행·span 없이
+          **ledger 의 terminal 상태만 status PATCH 로 재보고**하고 return None.
+          2026-07-10 의 "완전한 조용한 no-op" 은 terminal 전이 PATCH 유실(fire-once) 시
+          서버 봉투가 delivered 로 영구 잔류 → head 무한 재전달인데 종단할 주체가 없어
+          **그 기기 큐가 영구 교착**했다(P0·2026-07-19). 재보고는 같은 terminal 값이라
+          서버 게이트가 noop(applied:false)로 멱등 흡수하고, DELIVERED/RUNNING 역행
+          보고·dispense.failed 가짜 span 은 여전히 내지 않는다(트레이스 오염 재발 없음).
+          ledger 이중토출 차단(재토출 0)은 check_and_claim 이 그대로 유지.
+        - **DELIVERED claim 게이트**(2026-07-19): DELIVERED 보고에 서버가 "rejected"
+          (422 역행 = 이미 종단·estop 취소 / 404 미존재)를 답하면 **실행하지 않고** None —
+          취소된 봉투의 유령 물리 실행(estop 큐 취소 후 배치 잔여분 실행) 차단.
+          판정 미상(구 sink·네트워크 오류)은 기존대로 진행(가용성 우선).
+        - **delivered 후 예외 = 반드시 terminal 종단**(2026-07-19): steps 해석(interpret
+          폴백 등)·submit 이 예외로 죽어도 FAILED(CMD_VALIDATION_FAILED)로 종단 보고한다.
+          안 하면 봉투가 delivered 로 잔류(reclaim 대상 아님) → 재전달마다 같은 예외 반복
+          + 큐 영구 교착(P0). poll_stream 의 항목 격리는 최후 방어로만 남는다.
         - DUPLICATE_DROPPED(선조회로 못 걸러진 잔여 케이스·비-terminal 중복)는 terminal
           보고 생략 — 원판 실행이 이미 terminal 을 보고했(거나 곧 한)다. sequencer 도
           이 경로에서 FAILED status/span 을 내지 않는다(무해 no-op).
@@ -176,10 +243,11 @@ class Dispatcher:
         if cs.device_id != self.device_id:
             return None
 
-        # ── 중복 재전달 선조회(2026-07-10): 이미 terminal(DONE/FAILED) 소유 봉투는
-        #    완전한 조용한 no-op — 전이 보고·실행·span 없이 즉시 반환. 순수 read 라
-        #    check_and_claim 의 원자성(재토출 0)은 훼손하지 않는다. ──
+        # ── 중복 재전달 선조회(2026-07-10·개정 2026-07-19): 이미 terminal(DONE/FAILED)
+        #    소유 봉투는 실행·span 없이 ledger 의 terminal 만 재보고(교착 자가치유) 후 반환.
+        #    순수 read 라 check_and_claim 의 원자성(재토출 0)은 훼손하지 않는다. ──
         if self.sequencer.ledger.is_settled(cs.command_set_id):
+            self._re_report_settled_terminal(cs)
             return None
 
         # ── 정비 신선도 게이트(2026-07-19) — 묵은 정비는 **물리 실행 없이** 종단. ──
@@ -198,6 +266,57 @@ class Dispatcher:
                         ageS=round(age_s, 1),
                         staleLimitS=MAINTENANCE_STALE_S,
                     )
+                # CMD_STALE(2026-07-19) — "형식 오류"가 아니라 "시효 만료(다시 시도)"임을
+                #   admin 이 구분 표시하도록 전용 코드로 보고(구 서버는 미지 코드도 문자열
+                #   패스스루라 하위호환 무해).
+                report = JobReport(
+                    command_id=cs.command_set_id,
+                    outcome=JobOutcome.VALIDATION_FAILED,
+                    steps_done=0,
+                    step_n=0,
+                    error_code=StatusErrorCode.CMD_STALE,
+                )
+                self._report_commandset(cs, CommandSetStatus.FAILED, StatusErrorCode.CMD_STALE)
+                self.reports.append(report)
+                return report
+
+        delivered_verdict = self._report_commandset(cs, CommandSetStatus.DELIVERED, None)
+        if delivered_verdict == "rejected":
+            # ── claim 게이트(2026-07-19): 서버가 이 봉투를 이미 종단/취소(422 역행·404) —
+            #    실행하면 "긴급정지로 취소됨" 표시 뒤에서 액체가 실제 토출되는 유령 실행이 된다
+            #    (estop 큐 취소 레이스). ledger 미점유·실행 0 으로 조용히 반환한다. ──
+            if self._log is not None:
+                self._log.warn(
+                    "봉투 DELIVERED 를 서버가 거부(이미 종단/취소) — 실행 없이 skip(유령 실행 차단)",
+                    stage=STAGE_PI_RECEIVED,
+                    trace_id=cs.trace_id,
+                    command_set_id=cs.command_set_id,
+                )
+            return None
+
+        trace_id = cs.trace_id if cs.trace_id is not None else ""
+
+        # ── delivered 보고 이후 = 종단 책임 구간(2026-07-19 P0) — 어떤 예외도 봉투를
+        #    delivered 로 방치하지 않는다(방치 = reclaim 불가·재전달 예외 무한 반복·큐 교착). ──
+        try:
+            if cs.steps is not None:
+                # 서버 두뇌(buildCommandRecipe)가 완성한 스텝 — 직소비(폴백 해석 우회).
+                steps: Sequence[RecipeStep] = cs.steps
+            elif cs.kind == "manufacture":
+                # 레거시 폴백 신호 — 봉투 메타로 합성 Command 를 재구성해 기존 해석기로.
+                legacy = Command(
+                    id=cs.command_set_id,
+                    order_id=cs.source_order_id or "",
+                    attempt=cs.attempt if cs.attempt is not None else 1,
+                    device_id=cs.device_id,
+                    recipe=None,
+                    trace_id=trace_id,
+                    created_at=cs.created_at,
+                )
+                steps = self.interpret(legacy)
+            else:
+                # maintenance + steps=None = 계약 위반(oneOf null 은 manufacture 전용) —
+                # 토출 0 으로 즉시 failed(Sequencer 진입 없음·ledger 미점유).
                 report = JobReport(
                     command_id=cs.command_set_id,
                     outcome=JobOutcome.VALIDATION_FAILED,
@@ -211,28 +330,22 @@ class Dispatcher:
                 self.reports.append(report)
                 return report
 
-        self._report_commandset(cs, CommandSetStatus.DELIVERED, None)
+            self._report_commandset(cs, CommandSetStatus.RUNNING, None)
 
-        trace_id = cs.trace_id if cs.trace_id is not None else ""
-
-        if cs.steps is not None:
-            # 서버 두뇌(buildCommandRecipe)가 완성한 스텝 — 직소비(폴백 해석 우회).
-            steps: Sequence[RecipeStep] = cs.steps
-        elif cs.kind == "manufacture":
-            # 레거시 폴백 신호 — 봉투 메타로 합성 Command 를 재구성해 기존 해석기로.
-            legacy = Command(
-                id=cs.command_set_id,
-                order_id=cs.source_order_id or "",
-                attempt=cs.attempt if cs.attempt is not None else 1,
-                device_id=cs.device_id,
-                recipe=None,
+            report = self.sequencer.submit(
+                command_id=cs.command_set_id,
                 trace_id=trace_id,
-                created_at=cs.created_at,
+                steps=steps,
             )
-            steps = self.interpret(legacy)
-        else:
-            # maintenance + steps=None = 계약 위반(oneOf null 은 manufacture 전용) —
-            # 토출 0 으로 즉시 failed(Sequencer 진입 없음·ledger 미점유).
+        except Exception as e:  # noqa: BLE001 — 종단 불변식: delivered 봉투는 반드시 terminal 로.
+            if self._log is not None:
+                self._log.error(
+                    "봉투 처리 예외 — FAILED 로 종단(delivered 방치 = 큐 영구 교착 방지)",
+                    stage=STAGE_ERROR,
+                    trace_id=cs.trace_id,
+                    command_set_id=cs.command_set_id,
+                    error=f"{type(e).__name__}: {e}",
+                )
             report = JobReport(
                 command_id=cs.command_set_id,
                 outcome=JobOutcome.VALIDATION_FAILED,
@@ -245,14 +358,6 @@ class Dispatcher:
             )
             self.reports.append(report)
             return report
-
-        self._report_commandset(cs, CommandSetStatus.RUNNING, None)
-
-        report = self.sequencer.submit(
-            command_id=cs.command_set_id,
-            trace_id=trace_id,
-            steps=steps,
-        )
         self.reports.append(report)
 
         if report.outcome is JobOutcome.COMPLETED:
@@ -288,10 +393,12 @@ class Dispatcher:
         needs_cleaning: bool | None = None,
         pumps: "list[int] | None" = None,
         valves: "list[str] | None" = None,
+        pump_health: "dict[int, str] | None" = None,
+        hw_checked_at: str | None = None,
     ) -> Heartbeat:
         """하트비트 조립(§9-3·10s 주기) — queueDepth 는 Sequencer 에서 파생(유휴=0).
         전송(PATCH /api/dispenser/heartbeat)은 StatusSinkPort 어댑터 책임.
-        pumps/valves = 기기 연결상태(연결상태 기능) — 데몬이 자동인식 결과를 실어 준다."""
+        pumps/valves = 기기 연결상태(부팅 자동인식) · pump_health/hw_checked_at = 주기 감시 실측."""
         return Heartbeat(
             device_id=self.device_id,
             queue_depth=self.sequencer.queue_depth,
@@ -300,22 +407,56 @@ class Dispatcher:
             needs_cleaning=needs_cleaning,
             pumps=pumps,
             valves=valves,
+            pump_health=pump_health,
+            hw_checked_at=hw_checked_at,
         )
+
+    def _re_report_settled_terminal(self, cs: CommandSet) -> None:
+        """settled(종단) 봉투 재전달 → ledger 의 terminal 상태를 status PATCH 로 **재보고**.
+
+        2026-07-19 P0(교착 자가치유): terminal 전이 보고가 fire-once 로 유실되면 서버 봉투가
+        delivered 로 영구 잔류하고(reclaim 은 running 전용), head 재전달을 종단할 주체가
+        어디에도 없어 그 기기 큐가 영구 교착했다. 여기서 재전달분을 계기로 terminal 을
+        재보고해 at-least-once 를 성립시킨다.
+
+        트레이스 오염(2026-07-10 우려) 회피: **status PATCH 만** 보낸다(dispense span 0·
+        DELIVERED/RUNNING 역행 보고 0). 서버가 이미 terminal 이면 동일값 noop(applied:false)
+        로 멱등 흡수된다. ledger 상태를 모르는 구/테스트 ledger(state_of 미제공)는 종전
+        조용한 no-op 그대로(하위호환).
+        """
+        state_of = getattr(self.sequencer.ledger, "state_of", None)
+        if not callable(state_of):
+            return
+        try:
+            state = state_of(cs.command_set_id)
+        except Exception:  # noqa: BLE001 — 조회 실패는 종전 no-op(관측이 소비를 막지 않는다).
+            return
+        if state is LedgerEntryState.DONE:
+            self._report_commandset(cs, CommandSetStatus.DONE, None)
+        elif state is LedgerEntryState.FAILED:
+            # 원 errorCode 는 원장에 없다 — 코드 없는 failed 로 종단만 성립시킨다
+            # (서버가 이미 failed 면 noop·원판 보고가 살아 있으면 이 재보고는 도달 전 흡수).
+            self._report_commandset(cs, CommandSetStatus.FAILED, None)
 
     def _report_commandset(
         self,
         cs: CommandSet,
         status: CommandSetStatus,
         error_code: StatusErrorCode | None,
-    ) -> None:
+    ) -> "str | None":
+        """전이 보고 위임 — sink 의 서버 판정(문자열)을 그대로 올린다(None = 판정 미상).
+
+        best-effort — 관측이 제조를 막지 않는다(§10-6). 예외는 삼킨다(재전송은 어댑터 책임).
+        반환값은 DELIVERED claim 게이트("rejected" 시 실행 skip)에만 소비된다.
+        """
         sink = self.commandset_sink
         if sink is None:
-            return
-        # best-effort — 관측이 제조를 막지 않는다(§10-6). 예외는 삼킨다(재전송은 어댑터/OQ 책임).
+            return None
         try:
-            sink(cs, status, error_code)
+            verdict = sink(cs, status, error_code)
         except Exception:
-            pass
+            return None
+        return verdict if isinstance(verdict, str) else None
 
 
 def fragrance_notes_to_steps(

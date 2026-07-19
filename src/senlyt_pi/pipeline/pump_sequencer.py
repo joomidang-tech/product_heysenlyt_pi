@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import enum
 import threading
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -56,6 +57,16 @@ from .recipe_resolver import (
     ResolvedValveStep,
 )
 from .status_reporter import RequestIdGen, StatusReporter
+
+
+# ── estop 해제 레이스 유예(초 · 2026-07-19 P1) ─────────────────────────────────
+#   관제가 estop 해제(active:false) 직후 복구 정비(초기화·세척)를 발행하면, SSE 봉투는 즉시
+#   도착하는데 pi 래치 해제는 전용 estop 폴(기본 1s 주기)이 서버 확인을 해야만 일어난다 —
+#   그 창에서 첫 stage 진입 게이트가 즉시 ESTOP_ABORTED 로 죽이면 "복구 눌렀는데 즉시 실패
+#   + (D32) 큐 소멸"이 된다. **물리 시작 전(steps_done==0)에 한해** 이 유예 동안 래치 해제를
+#   재확인한다 — 진짜 estop 이면 유예 후 기존과 동일하게 중단(그동안 모션 0 이라 안전 불변).
+#   2.5s = estop 폴 주기(1s)×2 + 네트워크 여유.
+ESTOP_CLEAR_GRACE_S = 2.5
 
 
 class JobOutcome(enum.Enum):
@@ -162,6 +173,8 @@ class PumpSequencer:
         #   (in-flight 스텝은 어댑터가 _estop 로 즉시 실패시키고, 시퀀서는 다음 stage 를 시작하지 않는다).
         #   drain(우아한 종료·현재 step 완주)과 달리 estop 은 "지금 당장 멈춤"이라 별도 축이다.
         self._estop = estop_event if estop_event is not None else threading.Event()
+        # estop 해제 레이스 유예(모듈 상수 기본·테스트 오버라이드 가능) — 물리 시작 전 한정.
+        self.estop_clear_grace_s = ESTOP_CLEAR_GRACE_S
 
     @property
     def is_busy(self) -> bool:
@@ -319,8 +332,10 @@ class PumpSequencer:
         for stage_steps in resolved.stages:
             # ── 긴급정지(§9-4): 다음 stage 미시작 + FAILED(INTERRUPTED). 물리 TR 은 어댑터가 이미
             #    걸었고(emergency_stop_all), in-flight 스텝은 어댑터 _estop 로 즉시 실패했다. 여기선
-            #    "다음 stage 를 시작하지 않음"을 보장한다(drain 보다 우선 — 즉시 하드 중단). ──
-            if self._estop.is_set():
+            #    "다음 stage 를 시작하지 않음"을 보장한다(drain 보다 우선 — 즉시 하드 중단).
+            #    단, **물리 시작 전(steps_done==0)** 이면 짧은 유예 동안 래치 해제를 재확인한다
+            #    (estop 해제 직후 복구 봉투가 estop 폴(≤1s)보다 먼저 도착하는 레이스·2026-07-19 P1). ──
+            if self._estop.is_set() and not (steps_done == 0 and self._await_estop_clear()):
                 self.ledger.mark_settled(job.command_id, success=False)
                 self._publish_via(
                     reporter, DispensePhase.FAILED, steps_done, step_n,
@@ -405,6 +420,22 @@ class PumpSequencer:
             steps_done=steps_done,
             step_n=step_n,
         )
+
+    def _await_estop_clear(self) -> bool:
+        """estop 래치 해제를 짧게 대기(해제 레이스 유예) — True = 해제 확인(정상 진행).
+
+        해제는 데몬 estop 감시 스레드(서버 active:false 확정 시)만 한다 — 이 대기는 그 폴
+        주기(≤1s)를 넘겨주는 것뿐, 자체로 래치를 풀지 않는다(fail-safe 불변). drain(종료)
+        중이면 기다리지 않는다.
+        """
+        deadline = time.monotonic() + self.estop_clear_grace_s
+        while time.monotonic() < deadline:
+            if not self._estop.is_set():
+                return True
+            if self._draining:
+                return False
+            time.sleep(0.05)
+        return not self._estop.is_set()
 
     # ─────────────────────────────────────────────────────────────────────
     # stage 실행 — v1.1.0 Future.wait ↔ ThreadPoolExecutor 이식(설계 §3·§5)

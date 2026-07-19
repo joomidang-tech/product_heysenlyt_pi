@@ -283,12 +283,15 @@ class TestMaintenanceStaleGate:
             stale = _mnt("mnt-old", "2026-07-08T23:58:00.000Z")  # 120s 전 발행.
             report = d.dispatch_commandset(stale)
             assert report is not None and report.outcome is JobOutcome.VALIDATION_FAILED
-            assert report.error_code is StatusErrorCode.CMD_VALIDATION_FAILED
+            # CMD_STALE(2026-07-19 신설) — "형식 오류" 위장이 아니라 "시효 만료(다시 시도)"로
+            #   정직하게 보고한다(결함 6 봉합·admin 구분 표시). 구 라벨 CMD_VALIDATION_FAILED 는
+            #   D32 purge 트리거이기도 해서, 위장 보고가 큐 전멸 연쇄까지 불렀다.
+            assert report.error_code is StatusErrorCode.CMD_STALE
             assert engine.op_calls == [], "묵은 정비가 펌프를 움직이면 유령 실행"
             assert engine.dispense_calls == []
             # 서버 종단 보고 — delivered/running 없이 곧장 failed(실행 자체가 없었음).
             assert sink.events == [
-                ("mnt-old", CommandSetStatus.FAILED, StatusErrorCode.CMD_VALIDATION_FAILED)
+                ("mnt-old", CommandSetStatus.FAILED, StatusErrorCode.CMD_STALE)
             ]
         finally:
             ledger.close()

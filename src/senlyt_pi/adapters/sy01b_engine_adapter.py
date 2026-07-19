@@ -83,6 +83,14 @@ STATUS_ERROR_MASK = 0x0F  # 상태바이트 하위 4비트 = 에러코드
 STATUS_READY_BIT = 0x20  # bit5 = Ready(모터 정지·명령 수락 가능)
 STATUS_QUERY = "?"  # 상태 조회(모터 회전 중에도 수락되는 몇 안 되는 명령)
 TERMINATE = "TR"  # in-flight 이동 중단 + 포트 클린
+# OSError(핫플러그) 재연결 후 **같은 프레임 재전송이 허용되는 명령** — 멱등(모션 무발생)만
+#   (2026-07-19 P1 · 물리 이중 토출 방어). OSError 는 write 성공 후 read 대기(최대 5s — 이 링크는
+#   무응답이 잦아 창이 넓다) 중에도 난다 — 그 시점 펌프는 이미 명령을 받아 모션을 시작했을 수
+#   있다. 모션 명령(`…R` 실행: I/O 회전·P/D/A 이동·Z 홈)을 재전송하면 이중 모션(이중 토출·
+#   busy NAK→Ready 대기 후 3번째 전송)이 된다 — EP-03(오성공 금지) 정신과 정면 충돌. 그래서
+#   상태조회(?)·중단(TR — 두 번 걸어도 정지)만 재전송하고, 나머지는 재연결만 해 두고(다음
+#   트랜잭션 회복) 이번 트랜잭션은 정직한 실패로 올린다(상위 재시도·폴 판정 몫).
+_RECONNECT_RESEND_SAFE = frozenset({STATUS_QUERY, TERMINATE})
 # ── 브로드캐스트(전 펌프 동시) — v1.1.0 RealPumpService._sendBroadcast 미러 ──────────────
 #   `/_{cmd}` = 전 펌프가 같은 명령을 동시에 수신(명령 1발 → 반이중 RS485 경합 없음 = D38 stage:0
 #   실패의 근본 회피). ⚠️ SY-01B 매뉴얼 §3.4 는 "_"(0x5F)를 스위치47 주소로만 적고 "브로드캐스트"로
@@ -223,6 +231,7 @@ class Sy01bEngineAdapter:
         stop_event: threading.Event | None = None,
         estop_event: threading.Event | None = None,
         logger: StructuredLogger | None = None,
+        port_resolver: "Callable[[], list[str]] | None" = None,
     ) -> None:
         # 시리얼 관측 로거(RC4·2026-07-19) — 매 프레임 송신/응답·estop TR·홈상실·오버로드·브로드캐스트
         #   수신확인을 서버 trace 로 흘린다("실기기서 무슨 바이트가 오갔나"를 admin 에서). None 이면 무계측.
@@ -240,6 +249,9 @@ class Sy01bEngineAdapter:
         # 속도·스톨코드 상한의 정본. 미지정 = sy01b 빌트인(입력 무시·표값 강제).
         self.preset = preset if preset is not None else clamp_pump_preset(None)
         self._factory = serial_factory if serial_factory is not None else _pyserial_factory
+        # 핫플러그 자가 회복(2026-07-19) — 장치 소멸 시 후보 포트를 재열거하는 seam(bootstrap 주입).
+        #   미주입이면 현재 포트로만 재오픈 시도(구 동작 초과 금지·테스트 무영향).
+        self._port_resolver = port_resolver
         # ⚠️ **버스 락** — 한 트랜잭션(송신+수신)만 감싼다. 모션 대기엔 절대 걸치지 않는다.
         self._bus = threading.Lock()
         self._serial: SerialLike | None = None
@@ -306,14 +318,72 @@ class Sy01bEngineAdapter:
         """긴급정지 래치 해제 — 복구(초기화) 경로가 부른다. 이후 모션 폴이 정상 대기한다."""
         self._estop.clear()
 
+    # ── 핫플러그 자가 회복(2026-07-19 실측 ttyUSB0→ttyUSB1) ────────────────────
+    def _reconnect_serial(self, *, reason: str) -> bool:
+        """죽은 시리얼 핸들 폐기 + 후보 포트 재탐색 + 재오픈 — 데몬 재시작 없이 자가 회복.
+
+        USB 를 뽑았다 꽂으면 장치 노드가 **옮겨 붙는다**(15:31 실측: ttyUSB0→ttyUSB1). 기존엔
+        최초 open 핸들을 영구 캐시해, 재연결 후에도 죽은 FD 로 전 트랜잭션이 실패했고 복구는
+        `systemctl restart` 뿐이었다("자동 인식해야지" — 사용자 요구 2026-07-19). 여기서:
+          ① 캐시 close/폐기 → ② 후보 포트(`port_resolver` 재열거 + 현재 포트) 순서대로 재오픈
+          → ③ 성공 포트로 `self.port` 갱신 + WARN 관측.
+        반환 = 성공 여부. 실패면 호출자가 원 예외를 그대로 올린다(정직한 실패 — 다음
+        트랜잭션이 다시 시도하므로 어댑터를 못 찾는 동안에도 데몬은 계속 산다).
+        """
+        self.close()
+        cands: list[str] = []
+        if self._port_resolver is not None:
+            try:
+                cands = [c for c in self._port_resolver() if isinstance(c, str) and c]
+            except Exception:  # noqa: BLE001 — 재열거 실패는 현재 포트 재시도로 폴백.
+                cands = []
+        if self.port not in cands:
+            cands.append(self.port)
+        for cand in cands:
+            try:
+                with self._open_lock:
+                    self._serial = self._factory(cand, self.baudrate, self.read_timeout_s)
+                self.port = cand
+                if self._log is not None:
+                    self._log.warn(
+                        "시리얼 자가 재연결 — 장치 소멸/핫플러그 복구",
+                        stage=STAGE_STEP_EXEC,
+                        port=cand,
+                        reason=reason[:120],
+                    )
+                return True
+            except Exception:  # noqa: BLE001 — 이 후보 실패 → 다음 후보.
+                continue
+        if self._log is not None:
+            self._log.warn(
+                "시리얼 재연결 실패 — 후보 포트 전멸(다음 트랜잭션에서 재시도)",
+                stage=STAGE_STEP_EXEC,
+                reason=reason[:120],
+            )
+        return False
+
     # ── 트랜잭션 (버스 락은 여기서만·짧게) ──────────────────────────────────
     def _txn(self, addr: int, command: str, *, read_timeout_s: float | None = None) -> str:
         """`/{addr}{command}[CR]` 송신 → ETX 까지 수신. **락은 이 함수 안에서만** 잡힌다.
 
         반환 = raw 응답(빈 문자열 = 무응답). 여기서 판정하지 않는다 — 판정은 호출자 몫.
+        장치 소멸(OSError·핫플러그)이면 자가 재연결 후, **멱등 명령(`?`·TR)에 한해 1회 재시도**
+        (위 `_reconnect_serial` + `_RECONNECT_RESEND_SAFE` — 모션 명령 재전송은 이중 토출 위험).
         """
         timeout_s = read_timeout_s if read_timeout_s is not None else self.read_timeout_s
         frame = f"{FRAME_START}{addr}{command}{FRAME_END}".encode("ascii")
+        try:
+            return self._txn_io(frame, addr, command, timeout_s)
+        except OSError as e:
+            # pyserial SerialException ⊂ OSError — 장치 소멸/IO 사망. 재연결은 항상 시도(다음
+            # 트랜잭션 회복)하되, 재전송은 멱등 명령만(모션 이중 실행 방어·2026-07-19 P1).
+            reconnected = self._reconnect_serial(reason=str(e))
+            if not reconnected or command not in _RECONNECT_RESEND_SAFE:
+                raise
+            return self._txn_io(frame, addr, command, timeout_s)
+
+    def _txn_io(self, frame: bytes, addr: int, command: str, timeout_s: float) -> str:
+        """트랜잭션 I/O 본체 — 시리얼 예외는 그대로 올린다(재연결 판단은 `_txn`)."""
         conn = self._conn()
         t0 = time.monotonic()
         with self._bus:  # ← 수 ms. 모터가 도는 동안엔 절대 잡고 있지 않는다.
@@ -401,8 +471,10 @@ class Sy01bEngineAdapter:
             if self._stop.is_set() or self._estop.is_set():
                 return _NO_RESPONSE
             code, ready = self._query_status(addr)
-            if code == _NO_RESPONSE or code == 7:
-                # 무응답·미초기화 = 아직 준비 안 됨(계속 폴링). 단 7 은 셋업 캐시 무효화(재초기화 신호).
+            if code == _NO_RESPONSE or code == 7 or code == 15:
+                # 무응답·미초기화·Busy(15) = 아직 준비 안 됨(계속 폴링). v1.1.0 _pollUntilReady 의
+                #   isBusyError(Code 15) → continue 미러 — 15 를 "그 외 에러 즉시 반환"에 태우면
+                #   바쁜 펌프가 영구 고장으로 오판된다(2026-07-19 15:54 실기기). 7 만 캐시 무효화.
                 if code == 7:
                     self._initialized.discard(addr)
                     if self._log is not None:
@@ -462,6 +534,7 @@ class Sy01bEngineAdapter:
         *,
         poll: bool = False,
         ack_tolerant: bool = False,
+        _busy_retry: bool = True,
     ) -> int:
         """명령 송신 → 즉답 판정 → (poll 이면) 완료까지 폴링. 반환 = error_code.
 
@@ -474,7 +547,16 @@ class Sy01bEngineAdapter:
           - 즉 "즉답 1회 읽기"가 유일한 단일 실패 지점이라 깨진 링크에서 복권이 됐다.
         silent-success 아님 — 성공 판정은 언제나 폴의 실제 완료 확인이다. 진짜 죽은 펌프
         (전 왕복 무응답)는 폴 타임아웃(_NO_RESPONSE)으로 여전히 정직하게 실패한다.
-        ⚠️ 즉답이 **명시적 에러 코드**(1~15)면 tolerant 여도 기존대로 즉시 실패(진짜 에러).
+        ⚠️ 즉답이 **명시적 에러 코드**(1~14)면 tolerant 여도 기존대로 즉시 실패(진짜 에러).
+
+        **Code 15(Busy NAK) 은 에러가 아니다**(poll=True 한정·2026-07-19 15:54 실기기 실측):
+        선행 모션(예: fire-and-forget 초기화의 홈) 실행 중 새 명령이 오면 펌프는 유효 프레임
+        `/0O`(err 15)로 "지금 바쁨"을 답하고 **그 명령을 수행하지 않는다**(NAK). v1.1.0 은 15 를
+        "기다려라"로 처리했는데(_validateResponse 통과 + 폴 continue) v1.2.0 이 이 미러를 빠뜨려
+        초기화 done 12초 뒤 흡입이 PERMANENT 로 오판됐다. 처리 = **Ready 대기 후 명령 1회
+        재전송**: 그냥 폴만 하고 진행하면 밸브 회전이 유실된 채 플런저를 밀어(엉뚱한 포트 흡입 —
+        어제 QA 의 그 위험) 물리 사고가 되므로, NAK 로 버려진 명령을 반드시 다시 보낸다.
+        재전송은 1회 한정(`_busy_retry`) — 재전송마저 Busy 면 15 를 정직하게 반환.
         """
         raw = self._txn(addr, command)
         code, _ready = parse_status(raw) if raw else (_NO_RESPONSE, False)
@@ -482,6 +564,29 @@ class Sy01bEngineAdapter:
         if garbled and not (poll and ack_tolerant):
             # 빈 응답 = 실패(silent-success 금지·v1.0 콸콸콸 교훈) / 프레임 아님 = 실패측.
             return _NO_RESPONSE if not raw else _MALFORMED
+        if not garbled and code == 15 and poll:
+            # Busy NAK — 선행 모션 완료(Ready)까지 기다렸다가 유실된 명령을 재전송한다(위 docstring).
+            if self._log is not None:
+                self._log.info(
+                    "명령 즉답 Busy(Code 15) — 선행 모션 Ready 대기 후 1회 재전송(v1.1.0 busy 의미론)",
+                    stage=STAGE_STEP_EXEC,
+                    pumpAddr=addr,
+                    command=command,
+                    retry=_busy_retry,
+                )
+            #   ⚠️ 대기 예산은 **선행 모션 기준**(2026-07-19 P1) — busy 의 원인은 "지금 명령"이
+            #   아니라 **앞서 도는 모션**(대개 fire-and-forget 초기화의 홈 — 실측상 done 보고
+            #   12s 뒤에도 진행·풀스트로크 홈은 수십 초)이다. 밸브 회전(I{p}R)의 read_timeout
+            #   5s 를 그대로 쓰면 잔여 홈 >5s 에서 _NO_RESPONSE 로 실패해 원 사고("건강한
+            #   펌프인데 실패")가 재발한다. 정비 op(run_op)는 단일 시도라 재시도 커버도 없다.
+            wait_code = self._poll_until_ready(addr, max(timeout_s, self.init_timeout_s))
+            if wait_code != 0:
+                return wait_code
+            if not _busy_retry:
+                return 15  # 재전송 후에도 Busy — 비정상 지속, 정직하게 보고(무한 재귀 방지).
+            return self._settle(
+                addr, command, timeout_s, poll=poll, ack_tolerant=ack_tolerant, _busy_retry=False
+            )
         if not garbled and code != 0:
             # ⚠️ **즉답 재초기화-필수 에러(7 미초기화·9/10 오버로드)는 셋업 캐시를 무효화**한다
             #   (2026-07-18·브릭 회귀 봉합). 폴링을 안 타는 즉답 경로라 여기서 discard 하지 않으면
@@ -560,16 +665,13 @@ class Sy01bEngineAdapter:
         flush 하므로 충돌 잔여 프레임은 정리된다.
         """
         frame = f"{FRAME_START}{BROADCAST_ADDR}{command}{FRAME_END}".encode("ascii")
-        conn = self._conn()
-        with self._bus:
-            _reset = getattr(conn, "reset_input_buffer", None)
-            if callable(_reset):
-                try:
-                    _reset()
-                except Exception:  # noqa: BLE001 — flush 실패는 무시(최선노력).
-                    pass
-            conn.write(frame)
-            time.sleep(WRITE_SETTLE_S)
+        try:
+            self._broadcast_io(frame)
+        except OSError as e:
+            # 장치 소멸/핫플러그 — 자가 재연결 후 1회 재송신(`_reconnect_serial` 주석).
+            if not self._reconnect_serial(reason=str(e)):
+                raise
+            self._broadcast_io(frame)
         time.sleep(BROADCAST_SETTLE_S)  # 무응답이라 이 대기(+호출자의 고정 대기)로만 보장.
         # 브로드캐스트 송신 관측(RC4·검증 갭 봉합) — `_txn` 을 안 거치므로 여기서 별도 DEBUG.
         #   pumpAddr=0 = 전 펌프(브로드캐스트) 표식. fire-and-forget 이라 응답 로그는 없다 —
@@ -581,6 +683,19 @@ class Sy01bEngineAdapter:
                 pumpAddr=0,
                 command=f"/{BROADCAST_ADDR}{command}",
             )
+
+    def _broadcast_io(self, frame: bytes) -> None:
+        """브로드캐스트 I/O 본체(write-only) — 시리얼 예외는 그대로 올린다(재연결은 `_broadcast`)."""
+        conn = self._conn()
+        with self._bus:
+            _reset = getattr(conn, "reset_input_buffer", None)
+            if callable(_reset):
+                try:
+                    _reset()
+                except Exception:  # noqa: BLE001 — flush 실패는 무시(최선노력).
+                    pass
+            conn.write(frame)
+            time.sleep(WRITE_SETTLE_S)
 
     def initialize_broadcast(self, addrs: "Sequence[int]", spec: SyringeSpec) -> "dict[int, int]":
         """전 펌프 **동시** 초기화 — **fire-and-forget**(open-loop·응답 무시, 2026-07-19 확정).
@@ -804,6 +919,25 @@ class Sy01bEngineAdapter:
         하나의 물리 사이클이라, 이 한 번이 "한 스텝"의 전부다(Fake 어댑터와 동일 전제).
         """
         return self._cycle(cmd, aspirate_only=False)
+
+    # ── 건강 프로브 (주기 HW 감시·2026-07-19 "데몬이 항상 감시해야" 요구) ────────
+    def health_probe(self, addr: int) -> str:
+        """1발 `?` 건강 판정 — `"ok"`(유효 프레임) / `"garbled"`(깨진 프레임) / `"silent"`(무응답).
+
+        하트비트 주기 감시용 read-only 프로브. 짧은 타임아웃(PROBE_READ_TIMEOUT_S) 1회라
+        비용이 ms 단위이고, 버스 락은 트랜잭션 단위라 형제 작업과 시분할된다 — 단 호출측
+        (daemon)이 **idle 게이트**(제조·정비 중 스킵)를 걸어 모션 중 버스 잡음을 원천 회피한다.
+        판정 의미는 오늘 진단 툴(pump_link_diag)과 동일: ok=응답 정상 · garbled=살아있는데
+        링크 품질 문제(오늘 오전의 그 상태) · silent=전기적 침묵(결선/전원/주소).
+        """
+        try:
+            raw = self._txn(addr, STATUS_QUERY, read_timeout_s=PROBE_READ_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 — 프로브 실패(포트 소멸 등) = 무응답 취급.
+            return "silent"
+        if not raw.strip():
+            return "silent"
+        code, _ready = parse_status(raw)
+        return "garbled" if code == _NO_RESPONSE else "ok"
 
     # ── 프로브 (부팅 자동인식) ──────────────────────────────────────────────
     def probe(self, addr: int) -> bool:

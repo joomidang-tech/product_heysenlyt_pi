@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import uuid
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
@@ -48,6 +49,10 @@ from .http_client import (
 
 # trace 배치 상한 — 서버 계약 TRACE_BATCH_MAX(§10-4/O-19).
 TRACE_BATCH_MAX = 100
+
+# 종단(done|failed) 전이 재시도 큐 상한 — 정상 운영에선 수 건, 장기 단절에도 유계
+#   (초과 시 가장 오래된 것부터 밀림 — 서버 게이트가 어차피 멱등 흡수·재전달 재보고가 이중 방어).
+COMMANDSET_RETRY_MAX = 64
 
 # 전송 seam 타입 — (method, url, body, headers, timeout) → (status, body|None).
 RequestFn = Callable[..., "tuple[int, Mapping[str, Any] | None]"]
@@ -121,6 +126,12 @@ class HttpStatusSinkAdapter:
         self._oq = offline_queue if offline_queue is not None else OfflineQueue()
         # 관측 로그 디스크 스풀(단절 유실 0) — None 이면 구 best-effort 동작(테스트·하위호환).
         self._spill = trace_spill
+        # 봉투 **종단(done|failed) 전이** 재시도 큐(2026-07-19 P1) — 5xx·네트워크 실패 시 적재,
+        #   sender 주기(flush_commandset_retries)가 재전송. 종전엔 fire-once 라 Cloud Run 콜드
+        #   스타트 5xx 한 번에 terminal 이 영구 유실 → delivered 잔류 교착의 진입로였다.
+        self._cs_retry: "deque[tuple[CommandSet, CommandSetStatus, StatusErrorCode | None]]" = (
+            deque(maxlen=COMMANDSET_RETRY_MAX)
+        )
 
     def _config(self) -> ServerConfig:
         return self.server_config or ServerConfig(base_url=self.base_url)
@@ -374,12 +385,60 @@ class HttpStatusSinkAdapter:
         cs: CommandSet,
         status: CommandSetStatus,
         error_code: StatusErrorCode | None,
-    ) -> None:
+    ) -> str:
         """봉투 전이 보고(delivered→running→done|failed) — Dispatcher.commandset_sink 시그니처.
 
         best-effort: 예외는 삼킨다(관측이 제조를 막지 않는다·§10-6). requestId dedup(at-least-once).
         서버 게이트가 역행 422·동일값 noop 를 흡수하므로 늦은 재보고도 무해.
+
+        2026-07-19 하드닝(P1 2건):
+          - **서버 판정을 분류해 반환** — "applied"(2xx) / "rejected"(422 역행·404 미존재 =
+            서버가 이미 종단/취소, dispatcher 의 DELIVERED claim 게이트가 소비) / "retry"
+            (5xx·네트워크 = 일시 실패). 종전엔 http_status 를 로그에만 찍고 버렸다.
+          - **종단(done|failed) 전이의 일시 실패는 재시도 큐 적재** — sender 주기
+            (flush_commandset_retries)가 재전송해 terminal at-least-once 를 보장한다.
+            (구 로그 문구 "무해 재보고 가능"은 dispatcher settled 선조회 때문에 재보고
+            주체가 없어 허구였다 — 이제 이 큐 + dispatcher terminal 재보고가 실제 주체.)
         """
+        verdict = self._send_commandset_transition_once(cs, status, error_code)
+        if verdict == "retry" and status.is_terminal:
+            self._cs_retry.append((cs, status, error_code))
+            if self._log is not None:
+                self._log.warn(
+                    "봉투 종단 전이 보고 일시 실패 — 재시도 큐 적재(sender 주기 재전송)",
+                    stage=STAGE_ERROR,
+                    trace_id=cs.trace_id,
+                    order_id=cs.source_order_id,
+                    command_set_id=cs.command_set_id,
+                    to=status.wire,
+                    queueDepth=len(self._cs_retry),
+                )
+        return verdict
+
+    def flush_commandset_retries(self) -> int:
+        """적재된 종단 전이 재전송(sender 주기·재연결) — 서버 확정 판정까지 보낸 건수 반환.
+
+        일시 실패("retry")를 다시 만나면 그 항목을 되돌려 놓고 중단(링크 여전히 죽음 —
+        다음 주기에). applied/rejected(2xx·4xx 확정)는 종결로 보고 제거한다(멱등 — 서버
+        게이트가 noop/422 흡수).
+        """
+        sent = 0
+        for _ in range(len(self._cs_retry)):
+            item = self._cs_retry.popleft()
+            verdict = self._send_commandset_transition_once(*item)
+            if verdict == "retry":
+                self._cs_retry.appendleft(item)
+                break
+            sent += 1
+        return sent
+
+    def _send_commandset_transition_once(
+        self,
+        cs: CommandSet,
+        status: CommandSetStatus,
+        error_code: StatusErrorCode | None,
+    ) -> str:
+        """전이 PATCH 1회 — "applied" | "rejected"(422/404 확정 거부) | "retry"(5xx·네트워크)."""
         url = self._config().commandset_url(cs.command_set_id)
         body: dict[str, Any] = {
             "status": status.wire,
@@ -397,14 +456,14 @@ class HttpStatusSinkAdapter:
         except HttpTransportError:
             if self._log is not None:
                 self._log.warn(
-                    "봉투 전이 보고 실패(단절·무해 재보고 가능)",
+                    "봉투 전이 보고 실패(단절)",
                     stage=STAGE_ERROR,
                     trace_id=cs.trace_id,
                     order_id=cs.source_order_id,
                     command_set_id=cs.command_set_id,
                     to=status.wire,
                 )
-            return
+            return "retry"
         if self._log is not None:
             self._log.info(
                 "봉투 전이 보고",
@@ -416,3 +475,11 @@ class HttpStatusSinkAdapter:
                 to=status.wire,
                 httpStatus=http_status,
             )
+        if 200 <= http_status < 300:
+            return "applied"
+        if http_status in (404, 422):
+            # 서버 확정: 봉투 미존재(404) 또는 역행 illegal(422 = 이미 종단/취소) — 재시도 무의미.
+            return "rejected"
+        if 400 <= http_status < 500:
+            return "dropped"  # 그 외 4xx(400/401/403) — 확정 거부지만 봉투 종단 신호는 아님·드롭.
+        return "retry"  # 5xx — 서버 일시 오류.

@@ -44,6 +44,16 @@ DEFAULT_SSE_CONNECT_TIMEOUT_SECONDS = 20.0
 WATCHDOG_CHECK_INTERVAL_S = 15.0
 WATCHDOG_STALE_LIMIT_S = 90.0
 
+# ⛔ 스트림 수명 상한(강제 로테이션·2026-07-19 실기기 2회 실측) — **좀비 스트림 방어**.
+#   서버 SSE 가 하트비트는 계속 보내는데 데이터 push 만 죽는 상태(좀비)가 실재한다:
+#   06:32~06:35(191s)·06:58~07:03(293s) 두 번, 발행된 봉투가 스트림 종료(서버 ~5분 로테이션)
+#   후의 재연결 snapshot 에서야 도착 → 정비 신선도 게이트(90s)에 익사했다. 트리클 워치독은
+#   하트비트 **라인**도 수신으로 치므로 좀비를 못 잡는다(설계 한계 — 유휴와 좀비는 구분 불가).
+#   대책 = 수명 상한: 스트림을 60s 마다 스스로 닫고 재연결한다. 재연결 즉시 서버가 전체
+#   snapshot 을 push 하므로 어떤 유실·좀비도 **최대 60s 안에 자가 회복**된다(신선도 90s 안쪽).
+#   비용 = 60s 당 핸드셰이크 1회(무시 가능).
+MAX_STREAM_AGE_S = 60.0
+
 # open_sse seam — (url, headers, timeout[, connect_timeout]) → SseStream. 테스트가 fake 주입.
 OpenStream = Callable[..., SseStream]
 
@@ -163,10 +173,24 @@ class SseCommandSourceAdapter:
         ⚠️ 종료 신호(감사 P3): 각 SSE 이벤트(서버 heartbeat 코멘트 포함·주기 ≤15s) 처리 전에
           stop 을 검사해 SIGTERM 시 제너레이터를 즉시 종료 → boot 루프가 while 조건 재검사.
           소켓 read 자체가 블록돼도 서버 주기 heartbeat 가 루프를 돌려 최대 그 주기 내 반응한다.
+
+        ⚠️ 수명 상한(MAX_STREAM_AGE_S·좀비 방어): 상한을 넘기면 제너레이터를 종료해 소비 루프가
+          재연결하게 한다 — 하트비트만 살아있는 좀비 스트림도 최대 60s 안에 fresh snapshot 으로
+          회복된다(상수 주석의 2026-07-19 실기기 근거). 검사도 이벤트 단위(하트비트 ≤15s)라
+          유휴 스트림도 상한+15s 안에 로테이션된다.
         """
+        opened_at = time.monotonic()
         for event, data in stream.events():
             if self._stop is not None and self._stop.is_set():
                 return
+            if time.monotonic() - opened_at > MAX_STREAM_AGE_S:
+                if self._log is not None:
+                    self._log.debug(
+                        "SSE 스트림 수명 상한 — 강제 로테이션(좀비 방어·재연결 snapshot 재동기)",
+                        stage=STAGE_PI_RECEIVED,
+                        ageS=round(time.monotonic() - opened_at, 1),
+                    )
+                return  # 소비 루프가 재연결(연결 시 서버가 전체 snapshot push = 재동기).
             if event != "snapshot":
                 continue  # error/기타 이벤트는 이 축에서 무시(재연결은 daemon 책임).
             try:
@@ -199,6 +223,52 @@ class SseCommandSourceAdapter:
                         attempt=cmd.attempt,
                     )
                 yield cmd
+
+    def poll_batches(
+        self, device_id: str
+    ) -> "Iterator[tuple[list[CommandSet], list[Command]]]":
+        """**단일 스트림**에서 두 축(봉투+command)을 snapshot 단위로 함께 방출 — 귀머거리 창 제거.
+
+        ⛔ 기존 `command_sets()`/`commands()` 를 번갈아 소비하면 **각자 스트림을 따로 열어**
+        한 축을 듣는 동안(스트림 수명 내내) 다른 축에 귀머거리가 된다 — 2026-07-19 실기기에서
+        봉투 발행이 최대 293s 뒤에야 수신돼 신선도 게이트(90s)에 익사한 근본 구조.
+        snapshot 하나에 orders/commands/commandSets 가 **전부 실려 오므로** 스트림은 1개면 된다.
+
+        yield = snapshot 당 `(command_sets, commands)` (각각 CS-08 자기 deviceId 필터 완료).
+        스트림 종료(수명 상한 로테이션·서버 로테이션·오류) 시 순회가 끝난다 — 재연결은 소비
+        루프(dispatcher/daemon) 책임. 항목 단위 로그는 기존 두 메서드와 동일하게 남긴다.
+        """
+        with self._open(device_id) as stream:
+            watchdog_stop = self._start_watchdog(stream)  # 트리클 워치독(감사 P3).
+            try:
+                for snapshot in self._snapshots(stream):
+                    sets = command_sets_from_snapshot(snapshot, device_id)
+                    cmds = commands_from_snapshot(snapshot, device_id)
+                    if self._log is not None:
+                        for cs in sets:
+                            self._log.info(
+                                "SSE snapshot 에서 CommandSet 봉투 수신",
+                                stage=STAGE_PI_RECEIVED,
+                                trace_id=cs.trace_id,
+                                order_id=cs.source_order_id,
+                                device_id=device_id,
+                                command_set_id=cs.command_set_id,
+                                kind=cs.kind,
+                                status=cs.status.wire,
+                            )
+                        for cmd in cmds:
+                            self._log.info(
+                                "SSE snapshot 에서 command 수신",
+                                stage=STAGE_PI_RECEIVED,
+                                trace_id=cmd.trace_id,
+                                order_id=cmd.order_id,
+                                device_id=device_id,
+                                command_id=cmd.id,
+                                attempt=cmd.attempt,
+                            )
+                    yield (sets, cmds)
+            finally:
+                watchdog_stop.set()  # 정상/예외 종료 공통 — 워치독 정리(스트림 누수 방지).
 
     def command_sets(self, device_id: str) -> Iterator[CommandSet]:
         """자기 deviceId CommandSet 봉투 스트림(queued|delivered·CS-08). snapshot 순차 방출."""

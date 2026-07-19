@@ -230,8 +230,9 @@ class TestClassifyEngineErrorCode:
 
 class TestStatusErrorCode:
     def test_wire_roundtrip(self):
-        """status.errorCode 7종 wire 문자열 왕복(§6-7/§9-2)."""
-        assert len(StatusErrorCode) == 7
+        """status.errorCode 7종+CMD_STALE(2026-07-19 신설) wire 문자열 왕복(§6-7/§9-2)."""
+        assert len(StatusErrorCode) == 8
+        assert StatusErrorCode.CMD_STALE.wire == "CMD_STALE"  # 신선도 시효(형식 오류 위장 봉합).
         for e in StatusErrorCode:
             assert StatusErrorCode.from_wire(e.wire) is e
         assert StatusErrorCode.from_wire("NOPE") is None
