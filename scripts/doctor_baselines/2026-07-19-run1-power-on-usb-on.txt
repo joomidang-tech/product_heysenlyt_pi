@@ -1,0 +1,87 @@
+# ═══════════════════════════════════════════════════════════════════
+# 베이스라인 run1 — 전원 O · USB O (정상 연결)
+# 일시: 2026-07-19 19:33~19:35 KST · 기기: 10000000b9166a1c
+# 데몬 커밋: 미확인 (확인된 직전 반영 = a1e661a 2차분 — 재시작은 pull 안 함)
+# 도구: dispensor_doctor.py (당시 파일명 senlyt_test_cli.py)
+# 요약: 물리 5/5 PASS(3.1~7.0s) + 복구 초기화 PASS · FAIL 2건(Busy 연타 30.9s / estop 취소 라벨)
+# ═══════════════════════════════════════════════════════════════════
+
+heysenlyt@heysenlyt-dispensor:~ $ python senlyt_test_cli.py --operator "***MASKED***"
+기기: 10000000b9166a1c · online=True · engine=sy01b
+
+선택> 8
+
+▶ 약한 초기화(전 펌프)
+    발행됨: mnt-8a872e82-5ac9-41…
+    [19:33:57.684] 발행 → queued  (+0.3s)
+    [19:33:58.288] queued → running  (+0.9s)
+    [19:34:04.433] running → done  (+7.0s)
+    ⇒ PASS — done (7.0s)
+
+▶ 1펌프 전량 흡입
+    발행됨: mnt-b056f284-a46c-4a…
+    [19:34:11.837] 발행 → queued  (+0.1s)
+    [19:34:12.443] queued → running  (+0.7s)
+    [19:34:14.856] running → done  (+3.1s)
+    ⇒ PASS — done (3.1s)
+
+▶ 1펌프 전량 배출
+    발행됨: mnt-3571b51b-2c7e-4a…
+    [19:34:18.882] 발행 → queued  (+0.1s)
+    [19:34:19.489] queued → running  (+0.7s)
+    [19:34:21.935] running → done  (+3.2s)
+    ⇒ PASS — done (3.2s)
+
+▶ 2펌프 전량 흡입
+    발행됨: mnt-f2130b82-c994-4f…
+    [19:34:24.824] 발행 → queued  (+0.3s)
+    [19:34:25.427] queued → running  (+0.9s)
+    [19:34:27.849] running → done  (+3.3s)
+    ⇒ PASS — done (3.3s)
+
+▶ 2펌프 전량 배출
+    발행됨: mnt-37f263f6-18e5-44…
+    [19:34:29.723] 발행 → queued  (+0.1s)
+    [19:34:30.326] queued → running  (+0.7s)
+    [19:34:32.736] running → done  (+3.1s)
+    ⇒ PASS — done (3.1s)
+
+▶ [에러경로] 초기화 직후 연타 — Busy(Code 15) 자동 처리 검증
+    초기화 발행: mnt-d992ab28-be4… — done 표시 즉시 흡입을 쏜다(홈 모션은 계속 중)
+    [19:34:42.276] 발행 → queued  (+0.2s)
+    [19:34:42.889] queued → running  (+0.8s)
+    [19:34:49.037] running → done  (+7.0s)
+
+▶ Busy 연타: done 직후 1펌프 흡입
+    발행됨: mnt-ef7060de-308a-48…
+    [19:34:49.289] 발행 → queued  (+0.1s)
+    [19:34:49.894] queued → running  (+0.7s)
+    [19:35:20.061] running → failed errorCode=ENGINE_ERROR_PERMANENT  (+30.9s)
+    ⇒ FAIL — failed [ENGINE_ERROR_PERMANENT] (30.9s)  기대: done
+
+▶ [에러경로] 긴급정지 큐 정리 — 대기 봉투가 ESTOP_CANCELED 로 즉시 종단되는가
+    [19:35:23.931] estop SET
+    [19:35:25.180] 발행 → queued  (+0.1s)
+    [19:35:25.788] queued → running  (+0.7s)
+    [19:35:28.207] running → failed errorCode=INTERRUPTED  (+3.1s)
+    ⇒ FAIL — failed [INTERRUPTED] (3.1s)  (기대 failed [ESTOP_CANCELED])
+    [19:35:28.318] estop CLEAR — 복구 초기화 발행
+
+▶ estop 해제 후 복구 초기화
+    발행됨: mnt-9f823797-c2ef-49…
+    [19:35:28.560] 발행 → queued  (+0.1s)
+    [19:35:29.164] queued → running  (+0.7s)
+    [19:35:37.131] running → done  (+8.7s)
+    ⇒ PASS — done (8.7s)
+
+══════════════════════════════════════════════════════════════════════════════
+결과 요약
+══════════════════════════════════════════════════════════════════════════════
+  ✅ 약한 초기화(전 펌프)                       done                           7.0s
+  ✅ 1펌프 전량 흡입                          done                           3.1s
+  ✅ 1펌프 전량 배출                          done                           3.2s
+  ✅ 2펌프 전량 흡입                          done                           3.3s
+  ✅ 2펌프 전량 배출                          done                           3.1s
+  ❌ Busy 연타: done 직후 1펌프 흡입            failed [ENGINE_ERROR_PERMANENT]  30.9s
+  ❌ estop 중 발행 → 취소 기대                 failed [INTERRUPTED]           3.1s
+  ✅ estop 해제 후 복구 초기화                  done                           8.7s

@@ -9,9 +9,9 @@
   로그 스캔)와 짝 — 이쪽은 **능동 시나리오 실행기**다.
 
 사용:
-  python3 senlyt_test_cli.py --operator 아이디:비번            # 메뉴 모드
-  python3 senlyt_test_cli.py --operator 아이디:비번 run        # 전체 시나리오 자동(각 동작 확인 물음)
-  python3 senlyt_test_cli.py --operator 아이디:비번 run --yes  # 확인 없이 전부
+  python3 dispensor_doctor.py --operator 아이디:비번            # 메뉴 모드
+  python3 dispensor_doctor.py --operator 아이디:비번 run        # 전체 시나리오 자동(각 동작 확인 물음)
+  python3 dispensor_doctor.py --operator 아이디:비번 run --yes  # 확인 없이 전부
 """
 
 from __future__ import annotations
