@@ -105,15 +105,16 @@ class TestDispenseCycle:
         res = a.dispense(cmd(pump_addr=2, in_port=3, out_port=2, steps=2400))
         assert res.raw_error_code == 0
 
-        # 셋업(TR·U200·Z) 이후의 토출 프레임만 추린다.
-        moves = [w for w in fake.written if any(c in w for c in ("I3", "P2400", "O2", "D2400"))]
+        # 셋업(TR·U200·Z) 이후의 토출 프레임만 추린다. 흡입=절대 `A{steps}` · 배출=절대 홈 `A0`
+        #   (v1.1.0 movePlungerAbs 복원 — 상대 P/D 회귀 봉합, 2026-07-20 "용량 조절 X").
+        moves = [w for w in fake.written if any(c in w for c in ("I3", "A2400", "O2", "A0R"))]
         # 프레임 문법 — 전부 `/{addr}…\r`
         for w in moves:
             assert w.startswith("/2"), w
             assert w.endswith("\r"), w
-        # 순서 — 흡입포트 회전 → 흡입 → 배출포트 회전 → 배출
-        seq = [next(t for t in ("I3", "P2400", "O2", "D2400") if t in w) for w in moves]
-        assert seq == ["I3", "P2400", "O2", "D2400"]
+        # 순서 — 흡입포트 회전 → 흡입(절대) → 배출포트 회전 → 배출(절대 홈)
+        seq = [next(t for t in ("I3", "A2400", "O2", "A0R") if t in w) for w in moves]
+        assert seq == ["I3", "A2400", "O2", "A0R"]
 
     def test_setup_derives_from_capacity_not_mode(self):
         # 0.5mL → 스톨 5 · 초기화힘 **Z1R(반력)**. v1.1.0 사고 = 모드 기본으로 유도해 ZR(전력).
@@ -144,8 +145,8 @@ class TestDispenseCycle:
         a = adapter_with(fake)
         a.aspirate(cmd(in_port=3, out_port=2, steps=1200))
         joined = "".join(fake.written)
-        assert "I3" in joined and "P1200" in joined
-        assert "D1200" not in joined  # 배출은 안 한다
+        assert "I3" in joined and "A1200" in joined  # 흡입=절대 이동 A{steps}
+        assert "A0R" not in joined  # 배출(절대 홈 A0)은 안 한다
 
     def test_missing_ports_skip_valve_rotation(self):
         # 구계약(포트 미보유) 스텝 — 밸브를 돌리지 않고 현 위치에서 흡입·배출만.
@@ -154,7 +155,7 @@ class TestDispenseCycle:
         res = a.dispense(cmd(in_port=None, out_port=None, steps=500))
         assert res.raw_error_code == 0
         joined = "".join(fake.written)
-        assert "P500" in joined and "D500" in joined
+        assert "A500" in joined and "A0R" in joined  # 흡입 A{steps} · 배출 절대 홈 A0
         assert "I" not in joined.replace("/1", "")  # 밸브 회전 프레임 없음
 
 
@@ -759,11 +760,10 @@ class TestCode7BrickRegression:
                 # Z 초기화 재실행 → 홈 복구.
                 if txt.endswith("Z1R") or txt.endswith("ZR") or txt.endswith("Z2R"):
                     self.de_inited = False
-                # 이동 명령(…P{n}R / …D{n}R) 이고 de_inited 면 Code 7 즉답.
-                is_move = (txt.endswith("R")) and ("P" in txt.split("V")[-1] or txt[-2:-1] == "D" or "D" in txt.rstrip("R")[-6:])
-                # 더 단순·확실하게: P{digits}R 또는 D{digits}R 로 끝나는가.
+                # 이동 명령(흡입=절대 `…A{n}R` / 배출=절대 홈 `A0R`) 이고 de_inited 면 Code 7 즉답.
+                #   (v1.1.0 movePlungerAbs 복원 — 흡입/배출 모두 절대 `A…R`.)
                 import re as _re
-                is_move = bool(_re.search(r"[PD]\d+R$", txt))
+                is_move = bool(_re.search(r"A\d+R$", txt.rstrip("\r")))
                 if is_move and self.de_inited:
                     self._buf.extend(status_frame(7, ready=False))
                     return len(data)
@@ -861,3 +861,81 @@ class TestEstopPreemption:
         a._estop.set()
         a.run_op(EngineOpCommand(pump_addr=1, op="initialize", spec=SPEC_05))
         assert not a._estop.is_set()
+
+
+# ── 8. 스톨 감지·근접완료 (2026-07-20 "점검시 용량 조절 X" 실기기 봉합) ──────────
+#   실기기: 흡입 A9600 이 위치 9583(99.8%)에서 멈췄는데 폴이 40s 매달리다 실패 → 배출 못 감.
+#   수정: 멈춤 즉시 감지(위치 무변) + 근접완료 인정 + 미달 스톨은 정직한 실패(거짓 성공 금지).
+
+
+def status_pos_frame(code: int, ready: bool, position: int | None) -> bytes:
+    """`/0{상태바이트}{위치}` + ETX — `?` 응답 모사(위치 포함)."""
+    b = (0x20 if ready else 0x00) | (code & 0x0F)
+    tail = str(position).encode() if position is not None else b""
+    return b"/0" + bytes([b]) + tail + b"\x03"
+
+
+class ScriptedPollSerial(FakeSerial):
+    """`?` 호출마다 스크립트된 (code, ready, position) 프레임을 순서대로 반환(마지막은 반복)."""
+
+    def __init__(self, frames: list[bytes]):
+        super().__init__()
+        self._frames = list(frames)
+        self._i = 0
+
+    def write(self, data: bytes) -> int:
+        self.written.append(data.decode("ascii"))
+        f = self._frames[min(self._i, len(self._frames) - 1)]
+        self._i += 1
+        self._buf.extend(f)
+        return len(data)
+
+
+class TestStallDetection:
+    def test_near_complete_stall_is_success(self):
+        # 목표 9600 인데 9583(99.8%)에서 정지 → 완료로 인정(끝까지 갔으면 끝낸다) → 0 반환.
+        frames = [
+            status_pos_frame(0, False, 0),
+            status_pos_frame(0, False, 4800),
+            status_pos_frame(0, False, 9000),
+            status_pos_frame(15, True, 9583),  # 이후 반복(정지) → 스톨 감지 → 근접완료.
+        ]
+        a = adapter_with(ScriptedPollSerial(frames))
+        t0 = time.monotonic()
+        code = a._poll_until_ready(1, 40.0, target_steps=9600)
+        assert code == 0  # 근접완료 → 성공
+        assert time.monotonic() - t0 < 5.0  # 40s 안 매달림(무한 대기 금지)
+
+    def test_short_stall_is_honest_failure(self):
+        # 목표 9600 인데 3000(31%)에서 정지 → 진짜 스톨 → 실패(거짓 성공 금지) + 빨리 반환.
+        frames = [
+            status_pos_frame(0, False, 0),
+            status_pos_frame(0, False, 2000),
+            status_pos_frame(15, True, 3000),  # 이후 반복(정지) → 미달 스톨.
+        ]
+        fake = ScriptedPollSerial(frames)
+        a = adapter_with(fake)
+        t0 = time.monotonic()
+        code = a._poll_until_ready(1, 40.0, target_steps=9600)
+        assert code != 0  # 미달 → 정직한 실패
+        assert time.monotonic() - t0 < 5.0  # 무한 대기 금지
+        assert 1 not in a._initialized  # 재초기화 예약(캐시 무효화)
+        assert any("TR" in w for w in fake.written)  # latched 에러 해제(안전 복구)
+
+    def test_no_target_stall_breaks_hang(self):
+        # 목표 미지정(선행 모션 대기 등)이라도 위치가 멈추면 40s 안 매달리고 코드 반환.
+        frames = [
+            status_pos_frame(0, False, 5000),
+            status_pos_frame(15, True, 5000),  # 반복(정지).
+        ]
+        a = adapter_with(ScriptedPollSerial(frames))
+        t0 = time.monotonic()
+        code = a._poll_until_ready(1, 40.0, target_steps=None)
+        assert code != 0
+        assert time.monotonic() - t0 < 5.0
+
+    def test_normal_completion_still_works(self):
+        # 정상 완료(code 0 + ready) 는 위치 스크립트와 무관하게 즉시 0(하위호환).
+        frames = [status_pos_frame(0, False, 3000), status_pos_frame(0, True, 9600)]
+        a = adapter_with(ScriptedPollSerial(frames))
+        assert a._poll_until_ready(1, 40.0, target_steps=9600) == 0

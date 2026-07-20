@@ -134,6 +134,19 @@ PROBE_MAX_ATTEMPTS = 5
 PROBE_DEADLINE_S = 6.0
 PROBE_RETRY_GAP_S = 0.1
 
+# ── 스톨 감지·근접완료 (2026-07-20 "점검시 용량 조절 X" 실기기 실측) ──────────────
+# 실기기 로그: 흡입 A9600 이 위치 9583(99.8%)에서 멈췄는데 펌프가 Busy(15)/오버로드(11)를
+#   물자, 폴이 "15=계속 대기"만 보고 **40s 모션 timeout 까지 매달리다** transient 실패 →
+#   배출조차 못 감. **하드웨어를 안전하게 쓸 책임은 SW 에 있다(CLAUDE.md 제1원칙)** — 멈춤을
+#   즉시 감지하고, 끝까지 갔으면 끝내고, 크게 미달이면 정직히 실패한다. 무한/과도 대기 금지.
+# 플런저 위치가 N폴 연속 무변 = 모터 정지. 이동 중엔 매 폴 위치가 바뀌므로(최소 1000Hz=1000스텝/s),
+#   무변은 "도는 중"이 아니라 스톨이다.
+_STALL_STABLE_POLLS = 8  # ≈0.4s(@POLL_INTERVAL_S 0.05) 위치 무변 → 정지 확정.
+# 멈춘 위치가 목표의 이 비율 이상이면 **완료로 인정**(끝까지 갔으면 끝낸다). 미달이면 정직한 실패.
+_MOVE_COMPLETE_RATIO = 0.98
+# 절대 홈(A0·배출) 근접 판정 — 홈에서 이 스텝 이내면 배출 완료로 본다(≈풀스트로크 12000 × 2%).
+_HOME_COMPLETE_STEPS = 240
+
 # 에러코드 도메인 **밖**의 사건 — 프레임을 못 받음(무응답) vs 받았는데 상태프레임이 아님.
 #   둘 다 실패로 흐른다(EP-03 silent-success 금지). 공유 sentinel 을 쓰는 이유는 상위
 #   EngineExecutor 가 Fake 와 **동일 상수**로 판정하기 때문(어댑터가 바뀌어도 판정은 그대로).
@@ -190,6 +203,34 @@ def _printable(raw: str) -> str:
     return "".join(ch if 32 <= ord(ch) < 127 else f"\\x{ord(ch):02x}" for ch in raw)
 
 
+def parse_status_pos(response: str) -> tuple[int, bool, "int | None"]:
+    """상태 프레임 → `(error_code, ready, position)`. `parse_status` + 플런저 절대 위치.
+
+    `?` 응답은 `/0{상태바이트}{위치}` 형태라, 상태바이트 뒤 숫자가 플런저 절대 위치(스텝)다.
+    스톨 감지(위치 무변)·근접완료 판정(목표 대비 도달률)에 쓴다. 위치가 없거나(이동 ACK·밸브
+    응답 `/0{status}` 뿐) 파싱 실패면 position=None. 상태바이트/Ready/에코 방어 규칙은 아래
+    `parse_status` 와 동일(이 함수가 정본, parse_status 는 위임).
+    """
+    i = response.find(_RESPONSE_PREFIX)
+    if i == -1 or len(response) <= i + 2:
+        return (_NO_RESPONSE, False, None)
+    status_byte = ord(response[i + 2])
+    error_code = status_byte & STATUS_ERROR_MASK
+    ready = bool(status_byte & STATUS_READY_BIT) and error_code == 0
+    data = response[i + 3 :]
+    etx_at = data.find(chr(ETX))
+    if etx_at != -1:
+        data = data[:etx_at]
+    position: int | None = None
+    ds = data.strip()
+    if ds:
+        try:
+            position = int(ds)
+        except ValueError:
+            position = None
+    return (error_code, ready, position)
+
+
 def parse_status(response: str) -> tuple[int, bool]:
     """상태 프레임 → `(error_code, ready)`. 프레임이 없으면 `(_NO_RESPONSE, False)`.
 
@@ -201,14 +242,11 @@ def parse_status(response: str) -> tuple[int, bool]:
     `에코(/1I3R\\r) + 실응답(/0{status})` 이 되는데, 단순 `find("/")` 는 에코의 `/` 를 잡아
     명령 문자(예: I=0x49)를 상태바이트로 오독한다(거짓 Code 9·거짓 성공). 그래서 **응답 접두
     `/0` 에 앵커**한다 — 우리가 보낸 프레임 주소는 1..10 이라 `/0` 은 응답에만 나온다.
+
+    (위치까지 필요하면 `parse_status_pos` — 이 함수는 그 앞 2튜플만 반환하는 얇은 래퍼.)
     """
-    i = response.find(_RESPONSE_PREFIX)
-    if i == -1 or len(response) <= i + 2:
-        return (_NO_RESPONSE, False)
-    status_byte = ord(response[i + 2])
-    error_code = status_byte & STATUS_ERROR_MASK
-    ready = bool(status_byte & STATUS_READY_BIT) and error_code == 0
-    return (error_code, ready)
+    code, ready, _pos = parse_status_pos(response)
+    return (code, ready)
 
 
 class Sy01bEngineAdapter:
@@ -438,7 +476,58 @@ class Sy01bEngineAdapter:
         """`?` 한 번 — `(error_code, ready)`. 모터 회전 중에도 수락되는 명령이다."""
         return parse_status(self._txn(addr, STATUS_QUERY, read_timeout_s=read_timeout_s))
 
-    def _poll_until_ready(self, addr: int, timeout_s: float) -> int:
+    def _query_status_pos(
+        self, addr: int, *, read_timeout_s: float | None = None
+    ) -> "tuple[int, bool, int | None]":
+        """`?` 한 번 — `(error_code, ready, position)`. 위치 포함(스톨 감지·근접완료 판정용)."""
+        return parse_status_pos(self._txn(addr, STATUS_QUERY, read_timeout_s=read_timeout_s))
+
+    @staticmethod
+    def _is_move_complete(position: "int | None", target_steps: "int | None") -> bool:
+        """멈춘 위치가 목표에 충분히 도달했나 — 근접완료 판정(끝까지 갔으면 끝낸다).
+
+        흡입(target>0): 목표의 `_MOVE_COMPLETE_RATIO`(98%) 이상. 배출/홈(target=0): 홈에서
+        `_HOME_COMPLETE_STEPS` 이내. 위치·목표를 모르면 판정 불가(False → 기존 경로).
+        """
+        if position is None or target_steps is None:
+            return False
+        if target_steps <= 0:
+            return position <= _HOME_COMPLETE_STEPS
+        return position >= target_steps * _MOVE_COMPLETE_RATIO
+
+    def _terminate_and_flag_reinit(
+        self,
+        addr: int,
+        code: int,
+        message: str,
+        *,
+        position: "int | None" = None,
+        target: "int | None" = None,
+    ) -> None:
+        """오버로드/스톨 공통 처리 — `TR` 로 latched 에러를 지우고 셋업 캐시를 무효화한다.
+
+        안 그러면 `_ensure_ready` 가 `_initialized` 를 보고 재초기화를 skip 해, 다음 스텝이 스톨
+        위치에서 계속 밀어붙인다(씰/모터 손상). 무효화하면 상위 재시도의 `_ensure_ready` 가
+        TR+U200+Z 로 홈을 되찾은 뒤 절대 이동으로 재시도한다(안전 복구).
+        """
+        try:
+            self._txn(addr, TERMINATE)
+        except Exception:  # noqa: BLE001 — TR 실패가 에러 보고를 막지 않는다.
+            pass
+        self._initialized.discard(addr)
+        if self._log is not None:
+            self._log.warn(
+                message,
+                stage=STAGE_STEP_EXEC,
+                pumpAddr=addr,
+                engineCode=code,
+                position=position,
+                target=target,
+            )
+
+    def _poll_until_ready(
+        self, addr: int, timeout_s: float, target_steps: "int | None" = None
+    ) -> int:
         """Busy → Ready 를 **폴링**으로 기다린다. 반환 = 최종 error_code(0=정상).
 
         ⚠️ **락을 쥐지 않은 채 돈다** — 폴링 한 번(`?`)이 짧게 잡았다 놓을 뿐이라, 이 대기 동안
@@ -464,48 +553,72 @@ class Sy01bEngineAdapter:
           v1.1.0 도 같은 구조로 필드 검증됐다(Busy-먼저 가드 없음).
         """
         deadline = time.monotonic() + timeout_s
+        last_pos: int | None = None
+        stable = 0  # 위치 무변 연속 횟수 — 모터 정지(스톨) 감지용.
         while time.monotonic() < deadline:
             # shutdown(_stop) 또는 긴급정지(_estop) → in-flight 모션 대기를 즉시 중단(협조적 abort).
             #   emergency_stop_all 이 이미 TR 로 물리 정지를 걸었으니, 여기선 그 모션의 완료를 기다리지
             #   않고 실패(무응답)로 빠져나와 상위가 제조를 종단하게 한다(v1.1.0 _isEmergencyStopped 체크).
             if self._stop.is_set() or self._estop.is_set():
                 return _NO_RESPONSE
-            code, ready = self._query_status(addr)
-            if code == _NO_RESPONSE or code == 7 or code == 15:
-                # 무응답·미초기화·Busy(15) = 아직 준비 안 됨(계속 폴링). v1.1.0 _pollUntilReady 의
-                #   isBusyError(Code 15) → continue 미러 — 15 를 "그 외 에러 즉시 반환"에 태우면
-                #   바쁜 펌프가 영구 고장으로 오판된다(2026-07-19 15:54 실기기). 7 만 캐시 무효화.
-                if code == 7:
-                    self._initialized.discard(addr)
-                    if self._log is not None:
-                        self._log.warn(
-                            "펌프 홈 상실(Code 7) — 재초기화 예약",
-                            stage=STAGE_STEP_EXEC,
-                            pumpAddr=addr,
-                            engineCode=7,
-                        )
+            code, ready, pos = self._query_status_pos(addr)
+            if code == 0 and ready:
+                return 0  # 정상 완료.
+            if code == 7:
+                # 미초기화 = 아직 준비 안 됨(계속 폴링) + 셋업 캐시 무효화(2026-07-18 브릭 봉합). 7 은
+                #   홈을 잃었다는 재초기화 신호라, 위치추적을 리셋한다(홈 재탐색 중이라 위치가 뛴다).
+                self._initialized.discard(addr)
+                if self._log is not None:
+                    self._log.warn(
+                        "펌프 홈 상실(Code 7) — 재초기화 예약",
+                        stage=STAGE_STEP_EXEC,
+                        pumpAddr=addr,
+                        engineCode=7,
+                    )
+                last_pos = None
+                stable = 0
                 time.sleep(POLL_INTERVAL_S)
                 continue
             if code in (9, 10):
                 # 오버로드 — TR 로 latched 에러 지우고 재초기화 강제(v1.1.0 parity·씰/모터 보호).
-                try:
-                    self._txn(addr, TERMINATE)
-                except Exception:  # noqa: BLE001 — TR 실패가 에러 보고를 막지 않는다.
-                    pass
-                self._initialized.discard(addr)
-                if self._log is not None:
-                    self._log.warn(
-                        "펌프 오버로드 래치 — TR+재초기화 강제",
-                        stage=STAGE_STEP_EXEC,
-                        pumpAddr=addr,
-                        engineCode=code,
-                    )
+                self._terminate_and_flag_reinit(addr, code, "펌프 오버로드 래치 — TR+재초기화 강제")
                 return code
+            # ── 멈춤 감지(2026-07-20 "무한정 대기 금지") — 플런저 위치가 N폴 연속 무변이면 모터가
+            #    섰다. Busy(15)라도 위치가 안 변하면 "도는 중"이 아니라 스톨이다. 40s 모션 timeout
+            #    까지 매달리지 않는다(하드웨어 안전 책임은 SW·CLAUDE.md 제1원칙). ──
+            if pos is not None and pos == last_pos:
+                stable += 1
+            else:
+                stable = 0
+                last_pos = pos
+            if stable >= _STALL_STABLE_POLLS:
+                if self._is_move_complete(pos, target_steps):
+                    # 끝까지(≈목표) 갔다 → 완료로 인정하고 진행(latched busy/err 무시). "끝까지 갔으면 끝낸다".
+                    if code != 0 and self._log is not None:
+                        self._log.warn(
+                            "이동 근접완료 후 정지 — 완료 인정(진행)",
+                            stage=STAGE_STEP_EXEC,
+                            pumpAddr=addr,
+                            engineCode=code,
+                            position=pos,
+                            target=target_steps,
+                        )
+                    return 0
+                # 크게 미달한 채 정지 = 진짜 스톨 → latched 에러 지우고 재초기화 예약 + 정직한 실패
+                #   (거짓 성공 금지). code 0 인데 미달 정지면 오버로드(11·transient)로 정직 실패.
+                self._terminate_and_flag_reinit(
+                    addr, code, "플런저 스톨(목표 미달) — TR+재초기화 예약, 실패 보고",
+                    position=pos, target=target_steps,
+                )
+                return code if code != 0 else 11
+            # 아직 도는 중(위치 변화) — 무응답·Busy(15)는 계속 폰다(15 를 즉시 실패로 태우면 바쁜
+            #   펌프가 영구 고장으로 오판·2026-07-19 15:54 실기기). 정지 감지는 위에서 별도로 한다.
+            if code == _NO_RESPONSE or code == 15:
+                time.sleep(POLL_INTERVAL_S)
+                continue
             if code != 0:
                 return code  # 그 외 하드웨어 에러 — 즉시 상위 분류로.
-            if ready:
-                return 0
-            time.sleep(POLL_INTERVAL_S)  # Busy — 모터가 도는 중.
+            time.sleep(POLL_INTERVAL_S)  # code 0·미준비 — 모터가 도는 중.
         return _NO_RESPONSE  # 폴링 상한 초과 = ENGINE_TIMEOUT
 
     # ── 속도 프로파일 ───────────────────────────────────────────────────────
@@ -534,6 +647,7 @@ class Sy01bEngineAdapter:
         *,
         poll: bool = False,
         ack_tolerant: bool = False,
+        target_steps: "int | None" = None,
         _busy_retry: bool = True,
     ) -> int:
         """명령 송신 → 즉답 판정 → (poll 이면) 완료까지 폴링. 반환 = error_code.
@@ -585,7 +699,8 @@ class Sy01bEngineAdapter:
             if not _busy_retry:
                 return 15  # 재전송 후에도 Busy — 비정상 지속, 정직하게 보고(무한 재귀 방지).
             return self._settle(
-                addr, command, timeout_s, poll=poll, ack_tolerant=ack_tolerant, _busy_retry=False
+                addr, command, timeout_s, poll=poll, ack_tolerant=ack_tolerant,
+                target_steps=target_steps, _busy_retry=False,
             )
         if not garbled and code != 0:
             # ⚠️ **즉답 재초기화-필수 에러(7 미초기화·9/10 오버로드)는 셋업 캐시를 무효화**한다
@@ -606,7 +721,7 @@ class Sy01bEngineAdapter:
                 command=command,
                 response=(_printable(raw.strip()) or "(무응답)"),
             )
-        return self._poll_until_ready(addr, timeout_s)
+        return self._poll_until_ready(addr, timeout_s, target_steps=target_steps)
 
     def _setup(self, addr: int, spec: SyringeSpec) -> int:
         """부팅 셋업 — 스톨전류 + 초기화힘. **전부 시린지 용량에서 파생**된다.
@@ -822,8 +937,15 @@ class Sy01bEngineAdapter:
                 code = self._settle(addr, f"I{cmd.in_port}R", self.read_timeout_s, poll=True)
                 if code != 0:
                     return EngineResult(raw_error_code=code, detail=f"valve I{cmd.in_port}")
-            # ② 흡입 — 플런저 후퇴. 속도 프로파일을 같은 프레임에 실어 보낸다.
-            code = self._settle(addr, f"{speed_in}P{cmd.steps}R", self.motion_timeout_s, poll=True)
+            # ② 흡입 — 플런저 후퇴. **절대 이동 `A{steps}`**(v1.1.0 `movePlungerAbs(steps)` 복원).
+            #   이 사이클은 홈(0)에서 시작한다(_ensure_ready 가 원점을 잡고, 매 배출이 `A0` 로 홈 복귀).
+            #   상대 `P{steps}` 는 시작 위치가 0 이 아니면 목표가 어긋나고, 그 뒤 상대 배출 `D{steps}`
+            #   가 가용 하강거리를 초과해 거부(operand out of range)됐다 — 2026-07-20 QA "점검시 용량
+            #   조절 X"(용량↑ 배출만 실패)의 근본. 절대 이동은 현 위치와 무관해 이 축이 사라진다.
+            code = self._settle(
+                addr, f"{speed_in}A{cmd.steps}R", self.motion_timeout_s,
+                poll=True, target_steps=cmd.steps,
+            )
             if code != 0:
                 return EngineResult(raw_error_code=code, detail="aspirate")
             if aspirate_only:
@@ -835,8 +957,11 @@ class Sy01bEngineAdapter:
                 code = self._settle(addr, f"O{cmd.out_port}R", self.read_timeout_s, poll=True)
                 if code != 0:
                     return EngineResult(raw_error_code=code, detail=f"valve O{cmd.out_port}")
-            # ④ 배출 — 플런저 전진.
-            code = self._settle(addr, f"{speed_out}D{cmd.steps}R", self.motion_timeout_s, poll=True)
+            # ④ 배출 — 플런저 전진. **절대 홈 `A0`**(v1.1.0 `dispenseAll`=`movePlungerAbs(0)` 복원).
+            #   현 위치와 무관하게 항상 완전 배출 → 잔량·언더슛 없음(상대 `D{steps}` 회귀 봉합).
+            code = self._settle(
+                addr, f"{speed_out}A0R", self.motion_timeout_s, poll=True, target_steps=0
+            )
             if code != 0:
                 return EngineResult(raw_error_code=code, detail="dispense")
             return EngineResult(raw_error_code=0)
@@ -923,7 +1048,8 @@ class Sy01bEngineAdapter:
             #   프레임 파손(즉답 `C`·`\x07`·무응답)이 즉시 permanent 로 오판되던 것을 봉합.
             speed = self._speed_cmd(None, None)  # 정비 이동은 프리셋 기본 속도.
             code = self._settle(
-                addr, f"{speed}A{target}R", self.motion_timeout_s, poll=True, ack_tolerant=True
+                addr, f"{speed}A{target}R", self.motion_timeout_s,
+                poll=True, ack_tolerant=True, target_steps=target,
             )
             return EngineResult(raw_error_code=code, detail=cmd.op)
         except Exception as e:  # noqa: BLE001

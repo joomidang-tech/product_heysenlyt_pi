@@ -128,13 +128,16 @@ class TestAckTolerantPlungerMoves:
         assert 1 not in a._initialized  # 9 = 재초기화-필수 → 셋업 캐시 무효화 유지.
 
     def test_dispense_path_stays_strict_ep03(self):
-        """토출 경로는 비관대 유지 — 흡입(`P…R`) 즉답이 깨지면 기존대로 실패(EP-03 경계)."""
+        """토출 경로는 비관대 유지 — 흡입(절대 `A{steps}R`) 즉답이 깨지면 기존대로 실패(EP-03 경계)."""
+
+        import re as _re
 
         class GarbledDispenseSerial(FakeSerial):
             def write(self, data: bytes) -> int:
                 txt = data.decode("ascii")
                 self.written.append(txt)
-                if "P" in txt.rstrip("\r") and txt.rstrip("\r").endswith("R"):
+                # 흡입 플런저 프레임(`…A{steps}R`, steps>0) 만 파손 — 배출 홈 `A0R` 은 건드리지 않는다.
+                if _re.search(r"A[1-9]\d*R$", txt.rstrip("\r")):
                     self._buf.extend(b"C")  # 토출 흡입 명령 즉답 파손.
                 else:
                     self._buf.extend(status_frame(0, ready=True))
