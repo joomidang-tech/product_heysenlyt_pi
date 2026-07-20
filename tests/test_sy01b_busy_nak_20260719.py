@@ -131,9 +131,9 @@ class TestBusyWaitBudget:
         polled: list[float] = []
         orig = ad._poll_until_ready
 
-        def record(addr, timeout_s, target_steps=None):
+        def record(addr, timeout_s):
             polled.append(timeout_s)
-            return orig(addr, timeout_s, target_steps=target_steps)
+            return orig(addr, timeout_s)
 
         ad._poll_until_ready = record  # type: ignore[method-assign]
         code = ad._settle(1, "I12R", 1.0, poll=True, ack_tolerant=True)

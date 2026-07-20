@@ -863,9 +863,11 @@ class TestEstopPreemption:
         assert not a._estop.is_set()
 
 
-# ── 8. 스톨 감지·근접완료 (2026-07-20 "점검시 용량 조절 X" 실기기 봉합) ──────────
-#   실기기: 흡입 A9600 이 위치 9583(99.8%)에서 멈췄는데 폴이 40s 매달리다 실패 → 배출 못 감.
-#   수정: 멈춤 즉시 감지(위치 무변) + 근접완료 인정 + 미달 스톨은 정직한 실패(거짓 성공 금지).
+# ── 8. Bit5 완료판정 (2026-07-20 "점검시 용량 조절 X" 봉합) ─────────────────────
+#   실기기: 흡입 A9600 이 9583 정지(idle+latched err15)했는데 폴이 40s 매달리다 실패 → 배출 못 감.
+#   근본원인 = parse_status 의 ready=Bit5&&err0 이 idle+err15 에서 ready=False → blanket 15=계속 폴.
+#   수정: 완료 판정을 raw Bit5(idle)로 하고 err 는 별도 분류(매뉴얼 §4.6.1) — idle+err15 는 즉시
+#   TR+재초기화+정직한 실패(거짓 성공 금지), busy-15 는 계속 폴.
 
 
 def status_pos_frame(code: int, ready: bool, position: int | None) -> bytes:
@@ -891,51 +893,65 @@ class ScriptedPollSerial(FakeSerial):
         return len(data)
 
 
-class TestStallDetection:
-    def test_near_complete_stall_is_success(self):
-        # 목표 9600 인데 9583(99.8%)에서 정지 → 완료로 인정(끝까지 갔으면 끝낸다) → 0 반환.
-        frames = [
-            status_pos_frame(0, False, 0),
-            status_pos_frame(0, False, 4800),
-            status_pos_frame(0, False, 9000),
-            status_pos_frame(15, True, 9583),  # 이후 반복(정지) → 스톨 감지 → 근접완료.
-        ]
-        a = adapter_with(ScriptedPollSerial(frames))
-        t0 = time.monotonic()
-        code = a._poll_until_ready(1, 40.0, target_steps=9600)
-        assert code == 0  # 근접완료 → 성공
-        assert time.monotonic() - t0 < 5.0  # 40s 안 매달림(무한 대기 금지)
+class TestParseStatusRaw:
+    def test_idle_latched_err15_exposes_idle(self):
+        # 0x6F = Bit5(idle)=1 + err=15. parse_status_raw 는 idle 을 err 와 안 섞고 그대로 노출한다.
+        from senlyt_pi.adapters.sy01b_engine_adapter import parse_status_raw
 
-    def test_short_stall_is_honest_failure(self):
-        # 목표 9600 인데 3000(31%)에서 정지 → 진짜 스톨 → 실패(거짓 성공 금지) + 빨리 반환.
-        frames = [
-            status_pos_frame(0, False, 0),
-            status_pos_frame(0, False, 2000),
-            status_pos_frame(15, True, 3000),  # 이후 반복(정지) → 미달 스톨.
-        ]
-        fake = ScriptedPollSerial(frames)
+        assert parse_status_raw(status_pos_frame(15, True, None).decode("ascii", "ignore")) == (
+            15,
+            True,
+            None,
+        )
+
+    def test_busy_err15_is_not_idle(self):
+        from senlyt_pi.adapters.sy01b_engine_adapter import parse_status_raw
+
+        assert parse_status_raw(status_pos_frame(15, False, None).decode("ascii", "ignore")) == (
+            15,
+            False,
+            None,
+        )
+
+    def test_idle_err0_is_idle(self):
+        from senlyt_pi.adapters.sy01b_engine_adapter import parse_status_raw
+
+        assert parse_status_raw(status_pos_frame(0, True, None).decode("ascii", "ignore")) == (
+            0,
+            True,
+            None,
+        )
+
+    def test_public_parse_status_still_folds_err(self):
+        # 공개 계약 불변: idle+err15 → ready=False(에러면 준비 안 됨), idle+err0 → ready=True.
+        assert parse_status(status_pos_frame(15, True, None).decode("ascii", "ignore")) == (15, False)
+        assert parse_status(status_pos_frame(0, True, None).decode("ascii", "ignore")) == (0, True)
+
+
+class TestBit5CompletionJudgement:
+    def test_idle_latched_err15_returns_fast_and_reinits(self):
+        # idle+err15(정지+latched Command Overflow) → timeout 훨씬 전에 15 반환 + TR + 캐시 무효화.
+        fake = ScriptedPollSerial([status_pos_frame(15, True, 9583)])  # 첫 폴부터 idle+err15(반복).
         a = adapter_with(fake)
+        a._initialized.add(1)
         t0 = time.monotonic()
-        code = a._poll_until_ready(1, 40.0, target_steps=9600)
-        assert code != 0  # 미달 → 정직한 실패
-        assert time.monotonic() - t0 < 5.0  # 무한 대기 금지
+        code = a._poll_until_ready(1, 40.0)
+        assert code == 15  # 정직한 실패(거짓 성공 금지)
+        assert time.monotonic() - t0 < 5.0  # 33초 매달림 부재(무한/과도 대기 금지)
         assert 1 not in a._initialized  # 재초기화 예약(캐시 무효화)
         assert any("TR" in w for w in fake.written)  # latched 에러 해제(안전 복구)
 
-    def test_no_target_stall_breaks_hang(self):
-        # 목표 미지정(선행 모션 대기 등)이라도 위치가 멈추면 40s 안 매달리고 코드 반환.
+    def test_busy_err15_keeps_polling_until_idle(self):
+        # busy(Bit5=0)+err15 는 "아직 도는 중" → 계속 폴 → idle+err0 오면 0 반환.
         frames = [
-            status_pos_frame(0, False, 5000),
-            status_pos_frame(15, True, 5000),  # 반복(정지).
+            status_pos_frame(15, False, 4000),  # busy-15 → 계속 폴
+            status_pos_frame(15, False, 8000),  # busy-15 → 계속 폴
+            status_pos_frame(0, True, 9600),  # idle+err0 → 완료
         ]
         a = adapter_with(ScriptedPollSerial(frames))
-        t0 = time.monotonic()
-        code = a._poll_until_ready(1, 40.0, target_steps=None)
-        assert code != 0
-        assert time.monotonic() - t0 < 5.0
+        assert a._poll_until_ready(1, 40.0) == 0
 
-    def test_normal_completion_still_works(self):
-        # 정상 완료(code 0 + ready) 는 위치 스크립트와 무관하게 즉시 0(하위호환).
+    def test_normal_completion_idle_err0(self):
         frames = [status_pos_frame(0, False, 3000), status_pos_frame(0, True, 9600)]
         a = adapter_with(ScriptedPollSerial(frames))
-        assert a._poll_until_ready(1, 40.0, target_steps=9600) == 0
+        assert a._poll_until_ready(1, 40.0) == 0
