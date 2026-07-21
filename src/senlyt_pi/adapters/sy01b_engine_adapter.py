@@ -674,7 +674,13 @@ class Sy01bEngineAdapter:
             )
         return self._poll_until_ready(addr, timeout_s)
 
-    def _setup(self, addr: int, spec: SyringeSpec) -> int:
+    def _setup(
+        self,
+        addr: int,
+        spec: SyringeSpec,
+        init_in_port: "int | None" = None,
+        init_out_port: "int | None" = None,
+    ) -> int:
         """부팅 셋업 — 스톨전류 + 초기화힘. **전부 시린지 용량에서 파생**된다.
 
         `U{typeCode},{stall}R` = 과부하 감지선("이보다 힘들면 멈춰라" → Code 9). 없으면 막힌 채
@@ -688,10 +694,35 @@ class Sy01bEngineAdapter:
         if code != 0:
             return code
         # 초기화 = 홈 탐색. 플런저가 끝까지 가므로 폴링 상한을 길게(인스턴스 값·F1 통제 가능).
-        return self._settle(addr, spec.init_command, self.init_timeout_s, poll=True)
+        #   포트가 오면 `Z{힘},{air},{output}R` — 흡입=air(액체 소모 0)·배출=output(잔여물이
+        #   정상 출구로). 없으면(구 서버·토출 경로 lazy 셋업) 기존 `Z{힘}R`(펌웨어 기본 포트).
+        code = self._settle(
+            addr,
+            spec.init_command_with(init_in_port, init_out_port),
+            self.init_timeout_s,
+            poll=True,
+        )
+        if code != 0:
+            return code
+        # 주차 = 배출구(2026-07-21 규칙 "밸브가 쉴 땐 언제나 배출구") — 대기 개방 포트(12) 주차가
+        #   잔여액 누수의 절반이었다. 포트를 모르면(구 서버) 주차 생략 = 기존 동작.
+        if init_out_port is not None:
+            code = self._settle(addr, f"I{init_out_port}R", self.read_timeout_s, poll=True)
+        return code
 
-    def _ensure_ready(self, addr: int, spec: SyringeSpec) -> int:
-        """이 펌프가 셋업됐는지 보장(펌프당 1회). 반환 = error_code."""
+    def _ensure_ready(
+        self,
+        addr: int,
+        spec: SyringeSpec,
+        init_in_port: "int | None" = None,
+        init_out_port: "int | None" = None,
+    ) -> int:
+        """이 펌프가 셋업됐는지 보장(펌프당 1회). 반환 = error_code.
+
+        init 포트는 명시적 initialize op(서버 해석값)에서만 온다 — 토출 경로 lazy 셋업은
+        None(기존 동작). D45 로 매 제조가 stage 0 초기화(포트 포함)를 선행하므로 lazy 셋업이
+        실제로 도는 창은 좁다(캐시 무효 직후 정비 토출 등).
+        """
         if addr in self._initialized:
             return 0
         # ── 상태 리셋(TR) — ⚠️ **결과를 검증하지 않는다**. ─────────────────────
@@ -702,7 +733,7 @@ class Sy01bEngineAdapter:
             self._txn(addr, TERMINATE)
         except Exception:  # noqa: BLE001 — TR 실패가 복구를 막으면 안 된다(그게 그 사고였다).
             pass
-        code = self._setup(addr, spec)
+        code = self._setup(addr, spec, init_in_port, init_out_port)
         if code == 0:
             self._initialized.add(addr)
         return code
@@ -763,7 +794,13 @@ class Sy01bEngineAdapter:
             conn.write(frame)
             time.sleep(WRITE_SETTLE_S)
 
-    def initialize_broadcast(self, addrs: "Sequence[int]", spec: SyringeSpec) -> "dict[int, int]":
+    def initialize_broadcast(
+        self,
+        addrs: "Sequence[int]",
+        spec: SyringeSpec,
+        init_in_port: "int | None" = None,
+        init_out_port: "int | None" = None,
+    ) -> "dict[int, int]":
         """전 펌프 **동시** 초기화 — **fire-and-forget**(open-loop·응답 무시, 2026-07-19 확정).
 
         `/_TR → /_U{tc},{stall}R → /_{initCommand} → /_I{safe}R` 를 **눈감고 한 발씩**
@@ -808,13 +845,16 @@ class Sy01bEngineAdapter:
         self._broadcast(f"U{self.preset.pump_syringe_type_code},{spec.stall_current}R")
         if not self._ff_wait(BROADCAST_STEP_GAP_S):
             return self._ff_abort(targets, results)
-        # [2/4] 원점 복귀(홈) — Z/Z1/Z2(힘은 spec.init_command 이 용량에서 파생).
+        # [2/4] 원점 복귀(홈) — 힘은 용량 파생, 포트가 오면 흡입=air·배출=output 지정
+        #   (`Z{힘},{air},{output}R` — 펌웨어 기본[흡입=포트1 액체] 의존 금지·2026-07-21 QA).
         #   ★ fire-and-forget — Ready 폴 없음. 홈 탐색 물리 시간만 고정 대기.
-        self._broadcast(spec.init_command)
+        self._broadcast(spec.init_command_with(init_in_port, init_out_port))
         if not self._ff_wait(HOME_SETTLE_S):
             return self._ff_abort(targets, results)
-        # [3/4] 안전 포트(Air) — 발사만(폴 없음).
-        self._broadcast(f"I{SAFE_PORT}R")
+        # [3/4] 주차 — **배출구(output)** (2026-07-21 규칙 "밸브가 쉴 땐 언제나 배출구").
+        #   구 SAFE_PORT(12=Air) 주차는 대기 개방 포트라 잔여액이 계속 배수됐다(실기기 확정).
+        #   포트를 모르면(구 서버) 기존 SAFE_PORT 폴백.
+        self._broadcast(f"I{init_out_port if init_out_port is not None else SAFE_PORT}R")
         if not self._ff_wait(BROADCAST_STEP_GAP_S):
             return self._ff_abort(targets, results)
         # ── 생존 게이트(2026-07-19 "기기 뽑혔는데 완료" 봉합) ────────────────────────────
@@ -1014,7 +1054,8 @@ class Sy01bEngineAdapter:
                 #   전에 서버 신호를 clear 하지만, 로컬 즉시 해제로 이중 방어).
                 self._estop.clear()
                 self._initialized.discard(addr)
-                code = self._ensure_ready(addr, cmd.spec)
+                # 홈 스트로크 포트(흡입=air·배출/주차=output) — 서버 해석값(2026-07-21 QA).
+                code = self._ensure_ready(addr, cmd.spec, cmd.init_in_port, cmd.init_out_port)
                 return EngineResult(raw_error_code=code, detail="initialize")
 
             # 절대 이동 — 원점이 잡혀 있어야 기준이 선다.

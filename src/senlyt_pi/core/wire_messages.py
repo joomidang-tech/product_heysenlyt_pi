@@ -130,7 +130,14 @@ class RecipeStep:
             #   흡입(plungerFull)=air / 배출(plungerHome)=output — 포트 배치 SoT=서버가 해석해
             #   실어 보낸다. 의미가 `I{n}` 회전 대상이라 기존 in_port 필드에 싣는다(새 필드 불요).
             #   부재(구 서버) = None → 어댑터가 회전 생략(하위호환).
+            # `initInPort`/`initOutPort`(2026-07-21 · QA 초기화 포트) = op=initialize 전용.
+            #   홈 스트로크 흡입=air·배출/주차=output — 펌웨어 Z 기본값(흡입=포트1 액체) 의존 금지.
+            #   valvePort(plunger 계열)와 상호배타라 in_port 를 공유하고, out_port 에 주차 포트를
+            #   싣는다. 부재(구 서버) = 기존 동작(포트 기본값·SAFE_PORT 주차) 하위호환.
             vp = j.get("valvePort")
+            if vp is None:
+                vp = j.get("initInPort")
+            iop = j.get("initOutPort")
             return RecipeStep(
                 idx=int(j["idx"]),
                 pump_addr=int(j["pumpAddr"]),
@@ -141,6 +148,11 @@ class RecipeStep:
                 op=str(j["op"]),
                 in_port=(
                     int(vp) if isinstance(vp, (int, float)) and not isinstance(vp, bool) else None
+                ),
+                out_port=(
+                    int(iop)
+                    if isinstance(iop, (int, float)) and not isinstance(iop, bool)
+                    else None
                 ),
             )
         if kind == VALVE_STEP_KIND:
@@ -222,7 +234,10 @@ class RecipeStep:
                 "volume": 0,
             }
             if self.in_port is not None:
-                out["valvePort"] = self.in_port  # 이동 전 회전 밸브(왕복 보존·from_json 대칭)
+                # initialize 는 initInPort/initOutPort, plunger 계열은 valvePort (from_json 대칭).
+                out["initInPort" if self.op == "initialize" else "valvePort"] = self.in_port
+            if self.out_port is not None and self.op == "initialize":
+                out["initOutPort"] = self.out_port
             return out
         if self.kind == BATCH_SYRINGE_STEP_KIND:
             # 정본 계약 대칭 방출(§9-1 v3) — wire.ts BatchSyringeStep 키 그대로(camelCase·바이트 동일).

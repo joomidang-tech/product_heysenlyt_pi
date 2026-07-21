@@ -140,17 +140,39 @@ class SyringeSpec:
         return 6
 
     @property
-    def init_command(self) -> str:
-        """초기화 실행 명령 — 용량 파생 (Manual V1.2 §4.4.1). `Z<n1>R`: n1=0 Full·1 Half·2 Third.
+    def _init_force(self) -> int:
+        """초기화 힘 코드 — 용량 파생 (Manual V1.2 §4.4.1). 0=Full·1=Half·2=Third.
 
-        ≥1.0mL → `ZR`(Full) · 250·500µL → `Z1R`(Half) · 50·100µL → `Z2R`(Third).
-        시린지 씰 보호가 목적이라 **작은 시린지에 Full 을 걸면 안 된다**.
+        시린지 씰 보호가 목적이라 **작은 시린지에 Full 을 걸면 안 된다**
+        (≥1.0mL → Full · 250·500µL → Half · 50·100µL → Third).
         """
         if self.syringe_capacity_ml >= 1.0:
-            return "ZR"
+            return 0
         if self.max_volume_ul >= 250:
-            return "Z1R"
-        return "Z2R"
+            return 1
+        return 2
+
+    @property
+    def init_command(self) -> str:
+        """초기화 실행 명령(포트 미지정) — `Z<n1>R`. 힘은 용량 파생(`_init_force`).
+
+        ⚠️ 포트 파라미터가 없으면 펌웨어 기본값(흡입=포트1·배출=마지막 포트)으로 돈다 —
+        포트1 액체가 매 초기화마다 빨렸다 버려진다(2026-07-21 실기기 확정). 서버가 포트를
+        실어주는 경로는 `init_command_with` 를 쓴다. 이 기본형은 하위호환(구 서버) 전용.
+        """
+        force = self._init_force
+        return "ZR" if force == 0 else f"Z{force}R"
+
+    def init_command_with(self, in_port: "int | None", out_port: "int | None") -> str:
+        """포트 지정 초기화 명령 — `Z<힘>,<흡입포트>,<배출포트>R` (Manual §4.4.2 n1,n2,n3).
+
+        흡입=air 포트(액체 소모 0·공기만) / 배출=output 포트(잔여물이 정상 출구로) —
+        2026-07-21 QA "초기화시 흡입/배출 포트 변경". 힘은 용량 파생 그대로(n1 명시 필수 —
+        포트를 주면서 힘을 생략할 수 없다). 어느 한쪽이라도 없으면 기본형으로 폴백.
+        """
+        if in_port is None or out_port is None:
+            return self.init_command
+        return f"Z{self._init_force},{in_port},{out_port}R"
 
 
 def fragrance_ml_to_ul(amount_ml: float) -> float:

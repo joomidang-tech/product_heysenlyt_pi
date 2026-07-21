@@ -89,6 +89,11 @@ class ResolvedOpStep:
     # 플런저 이동 **전** 회전할 밸브 포트(v1.1.0 시퀀스 복원·2026-07-19) — 흡입=air/배출=output.
     #   서버(포트 배치 SoT)가 해석해 실어 보낸다. None(구 서버) = 어댑터가 회전 생략(하위호환).
     valve_port: int | None = None
+    # (op=initialize 전용·2026-07-21 QA) 홈 스트로크 흡입 포트(=air)·배출/주차 포트(=output).
+    #   펌웨어 Z 기본값(흡입=포트1 액체·주차=대기개방 포트)이 향료 소모+누액의 원인이라 서버가
+    #   포트 매핑에서 파생해 싣는다. None(구 서버) = 기존 동작 하위호환.
+    init_in_port: int | None = None
+    init_out_port: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +252,9 @@ class RecipeResolver:
                     #   펌프 정지가 통째로 drop**됐다(정지가 가장 필요할 때 아무 것도 안 멈춤). 건너뛰면
                     #   1,2 는 정지한다. 전부 미매핑이면 아래 empty 가드가 실패로 잡는다(silent COMPLETE 금지).
                     continue
+                # 포트 유효성(1~12 밖·비정수는 안전측 무시 → 해당 동작 생략/기본값 폴백).
+                _vp = s.in_port if s.in_port is not None and 1 <= s.in_port <= 12 else None
+                _op_out = s.out_port if s.out_port is not None and 1 <= s.out_port <= 12 else None
                 resolved.append(
                     ResolvedOpStep(
                         idx=s.idx,
@@ -255,10 +263,11 @@ class RecipeResolver:
                         flavor=s.flavor,
                         spec=op_spec,
                         stage=stage,
-                        # 이동 전 밸브 회전 대상(1~12 밖·비정수는 안전측 무시 → 회전 생략).
-                        valve_port=(
-                            s.in_port if s.in_port is not None and 1 <= s.in_port <= 12 else None
-                        ),
+                        # 이동 전 밸브 회전 대상 — plunger 계열 전용(initialize 는 아래 init 포트).
+                        valve_port=(_vp if pi_op in ("plunger_full", "plunger_home") else None),
+                        # initialize 홈 스트로크 포트(흡입=air·배출/주차=output·2026-07-21 QA).
+                        init_in_port=(_vp if pi_op == "initialize" else None),
+                        init_out_port=(_op_out if pi_op == "initialize" else None),
                     )
                 )
                 pumps = stage_pumps.setdefault(stage, set())

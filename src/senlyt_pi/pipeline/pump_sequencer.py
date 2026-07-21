@@ -516,6 +516,13 @@ class PumpSequencer:
             return None  # Fake/구 어댑터 — 일반 per-pump 동시 실행으로 폴백.
         addrs = [s.pump_addr for s in stage_steps]
         spec = stage_steps[0].spec
+        # 초기화 포트(흡입=air·배출/주차=output·2026-07-21 QA) — 브로드캐스트는 전 펌프에 같은
+        #   명령 1발이라 **전 스텝 포트가 동일할 때만** 실을 수 있다. 펌프별 레이아웃이 달라
+        #   포트가 갈리면 브로드캐스트를 포기하고 per-pump 경로로 폴백(각자 자기 포트로 초기화).
+        port_pairs = {(s.init_in_port, s.init_out_port) for s in stage_steps}
+        if len(port_pairs) > 1:
+            return None
+        init_in_port, init_out_port = next(iter(port_pairs))
         # 브로드캐스트는 consume 스레드에서 직접 실행 — 발사 INFO·어댑터 로그(브로드캐스트 송신 등)가
         #   이 잡의 trace 로 엮이도록 여기서도 스레드 컨텍스트를 바인딩한다(2026-07-19).
         self._bind_step_log_ctx()
@@ -527,7 +534,9 @@ class PumpSequencer:
                 pumpAddrs=addrs,
             )
         try:
-            results = init_broadcast(addrs, spec)
+            results = init_broadcast(
+                addrs, spec, init_in_port=init_in_port, init_out_port=init_out_port
+            )
         except Exception as exc:  # noqa: BLE001 — 브로드캐스트 실패도 흡수(형제 완주 계약·다음 stage 미진입).
             if self._log is not None:
                 self._log.error(
@@ -697,6 +706,8 @@ class PumpSequencer:
                 op=step.op,
                 spec=step.spec,
                 valve_port=step.valve_port,
+                init_in_port=step.init_in_port,
+                init_out_port=step.init_out_port,
             )
         )
 
