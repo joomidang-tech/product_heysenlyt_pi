@@ -44,6 +44,26 @@ class EngineDispenseCommand:
 
 
 @dataclass(frozen=True, slots=True)
+class EngineBatchCommand:
+    """배치 흡입 명령(§9-1 v3 · 2026-07-21 "1향료 1펌핑") — 여러 흡입 → 한 번 배출.
+
+    한 주사기에 `aspirations` 순서대로 **누적 절대 흡입**(`I{in}` → `A{누적steps}`) 후 `out_port`
+    로 한 번 배출(`A0`)한다. 각 aspiration 은 `(in_port, steps, volume_ul, aspirate_speed_hz)`
+    — steps 는 SyringeSpec 파생값(하드코딩 금지)이고, 어댑터가 순서대로 **누적 합산**해 절대
+    이동한다. 누적합 ≤ 시린지 용량은 resolver 가 이미 검증(과충전 방지)했다.
+    """
+
+    pump_addr: int
+    out_port: int
+    # 배출 속도(Hz)·경사 — 서버가 배치 흡입 포트들의 오버라이드 중 min 으로 확정. None = 어댑터 기본.
+    dispense_speed_hz: int | None
+    slope: int | None
+    spec: SyringeSpec
+    # (in_port, steps, volume_ul, aspirate_speed_hz) — 흡입 순서 = 실행 순서(누적 절대이동).
+    aspirations: tuple[tuple[int, int, float, "int | None"], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class EngineResult:
     """엔진 실행 결과."""
 
@@ -86,6 +106,14 @@ class EnginePort(Protocol):
 
     def dispense(self, cmd: EngineDispenseCommand) -> EngineResult:
         """단일 스텝 배출(dispense). ⛔ 실토출 로직 = 이후 웨이브."""
+        ...
+
+    def dispense_batch(self, cmd: EngineBatchCommand) -> EngineResult:
+        """배치 흡입(§9-1 v3) — 여러 액체를 순서대로 누적 흡입 후 한 번 배출.
+
+        `I{in}` → `A{누적steps}`(절대·누적) 반복 → `O{out}` → `A0`(한 번 배출). 어느 단계든
+        에러면 즉시 반환하고, 분류·재시도는 상위 `EngineExecutor` 가 한다.
+        """
         ...
 
     def initialize(self) -> EngineResult:

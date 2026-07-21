@@ -110,6 +110,38 @@ class ResolvedValveStep:
     valve_op: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedAspiration:
+    """해석된 배치 흡입 1건(§9-1 v3) — steps 파생 완료."""
+
+    flavor: str
+    in_port: int
+    volume_ul: float
+    # SyringeSpec 파생 스텝수(§6-4·하드코딩 금지). 어댑터는 이걸 **누적 합산**해 절대 이동한다.
+    steps: int
+    aspirate_speed_hz: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedBatchStep:
+    """해석된 배치 흡입 스텝(§9-1 v3 · 2026-07-21 "1향료 1펌핑") — 여러 흡입 → 한 번 배출.
+
+    한 주사기에 aspirations 순서대로 **누적 절대 흡입**(`A{누적steps}`) 후 out_port 로 한 번
+    배출(`A0`)한다. 누적 흡입 합이 풀스트로크를 넘으면 Code 11 과충전 — resolve 가 **누적 부피 합
+    ≤ spec.max_volume_ul** 을 검증한다(서버 1차·pi 2차 자물쇠·물리 안전이라 pi 가 끝까지 쥔다).
+    """
+
+    idx: int
+    pump_addr: int
+    # 배출 구멍(공유)·배출 속도(min)·경사 — 배치 전체가 한 번에 이 구멍으로 배출.
+    out_port: int
+    dispense_speed_hz: int | None
+    slope: int | None
+    spec: SyringeSpec
+    aspirations: tuple[ResolvedAspiration, ...]
+    stage: int = 0
+
+
 class RecipeValidationError(Exception):
     """Resolver 실패 사유 — SoT §6-7 status.errorCode 로 매핑."""
 
@@ -151,8 +183,10 @@ class ResolvedRecipe:
     stage=idx 로 해석되어 그룹당 1스텝 = **기존 완전 직렬과 동일 동작**.
     """
 
-    steps: tuple["ResolvedStep | ResolvedValveStep | ResolvedOpStep", ...]
-    stages: tuple[tuple["ResolvedStep | ResolvedValveStep | ResolvedOpStep", ...], ...] = ()
+    steps: tuple["ResolvedStep | ResolvedValveStep | ResolvedOpStep | ResolvedBatchStep", ...]
+    stages: tuple[
+        tuple["ResolvedStep | ResolvedValveStep | ResolvedOpStep | ResolvedBatchStep", ...], ...
+    ] = ()
 
     @property
     def step_n(self) -> int:
@@ -191,7 +225,7 @@ class RecipeResolver:
         # stage-major 정렬(§9-1 v2) — tie 는 idx(전역 유일)·구계약은 stage=idx 라 기존과 동일.
         sorted_steps = sorted(steps, key=lambda s: (s.effective_stage, s.idx))
 
-        resolved: list[ResolvedStep | ResolvedValveStep | ResolvedOpStep] = []
+        resolved: list[ResolvedStep | ResolvedValveStep | ResolvedOpStep | ResolvedBatchStep] = []
         stage_pumps: dict[int, set[int]] = {}
         valve_count = 0
         for s in sorted_steps:
@@ -285,6 +319,89 @@ class RecipeResolver:
                 )
                 continue
 
+            if s.is_batch:
+                # ── 배치 흡입 게이트(§9-1 v3 · 2026-07-21 "1향료 1펌핑"). ─────────────────
+                #   여러 흡입 → 한 번 배출. syringe 와 동일하게 물리 모션이므로 stage 내 pumpAddr
+                #   유일(L2)에 참여한다(한 펌프 in-flight 모션 1). 배치는 재료 조립이라 미매핑은
+                #   dispense 와 같이 fail-closed(엉뚱 제품 방지).
+                pumps = stage_pumps.setdefault(stage, set())
+                if s.pump_addr in pumps:
+                    raise RecipeValidationError(
+                        "duplicate_pump_in_stage", idx=s.idx, pump_addr=s.pump_addr
+                    )
+                pumps.add(s.pump_addr)
+
+                spec = self.pump_map.get(s.pump_addr)
+                if spec is None:
+                    raise RecipeValidationError(
+                        "unmapped_pump_addr", idx=s.idx, pump_addr=s.pump_addr
+                    )
+                aspirations = s.aspirations or ()
+                if not aspirations:
+                    raise RecipeValidationError("empty_batch", idx=s.idx, pump_addr=s.pump_addr)
+                # 배출 구멍은 실재 범위(1~12)여야 한다(서버가 1차·pi 2차 자물쇠).
+                if not _is_port_valid(s.out_port):
+                    raise RecipeValidationError(
+                        "out_port_out_of_range", idx=s.idx, pump_addr=s.pump_addr
+                    )
+                resolved_asps: list[ResolvedAspiration] = []
+                cumulative_ul = 0.0
+                for a in aspirations:
+                    vol = float(a.volume)
+                    # 흡입 구멍 실재(1~12) + 흡입≠배출(같으면 밸브를 안 돌리고 빨아 그대로 뱉는 조립 버그).
+                    if not _is_port_valid(a.in_port):
+                        raise RecipeValidationError(
+                            "in_port_out_of_range", idx=s.idx, pump_addr=s.pump_addr
+                        )
+                    if a.in_port == s.out_port:
+                        raise RecipeValidationError(
+                            "in_port_equals_out_port", idx=s.idx, pump_addr=s.pump_addr
+                        )
+                    # RR-05(Q2): 음수·0·비유한 부피 → drop.
+                    if not math.isfinite(vol) or vol <= 0:
+                        raise RecipeValidationError(
+                            "non_positive_volume", idx=s.idx, pump_addr=s.pump_addr, volume_ul=vol
+                        )
+                    step_count = spec.steps_for_volume_ul(vol)
+                    if step_count < 1:
+                        raise RecipeValidationError(
+                            "derived_zero_steps", idx=s.idx, pump_addr=s.pump_addr, volume_ul=vol
+                        )
+                    cumulative_ul += vol
+                    resolved_asps.append(
+                        ResolvedAspiration(
+                            flavor=a.flavor,
+                            in_port=a.in_port,
+                            volume_ul=vol,
+                            steps=step_count,
+                            aspirate_speed_hz=a.aspirate_speed_hz,
+                        )
+                    )
+                # ── 누적 흡입 용량 게이트(과충전·Code 11 방지) — **물리 안전이라 pi 가 끝까지 쥔다.** ──
+                #   흡입이 절대이동 누적(A{합})이라 합이 시린지 용량(=풀스트로크)을 넘으면 플런저가
+                #   물리 한계를 초과해 오버로드(Code 11)가 난다. 단일 syringe 는 per-step maxVolume
+                #   게이트로 막지만, 배치는 **합**을 봐야 한다(개별은 통과해도 합이 넘칠 수 있다).
+                if cumulative_ul > spec.max_volume_ul:
+                    raise RecipeValidationError(
+                        "batch_over_capacity",
+                        idx=s.idx,
+                        pump_addr=s.pump_addr,
+                        volume_ul=cumulative_ul,
+                    )
+                resolved.append(
+                    ResolvedBatchStep(
+                        idx=s.idx,
+                        pump_addr=s.pump_addr,
+                        out_port=s.out_port,
+                        dispense_speed_hz=s.dispense_speed_hz,
+                        slope=s.slope,
+                        spec=spec,
+                        aspirations=tuple(resolved_asps),
+                        stage=stage,
+                    )
+                )
+                continue
+
             # ── stage 내 syringe pumpAddr 유일(L2 — 한 펌프 in-flight 모션 1). ──
             pumps = stage_pumps.setdefault(stage, set())
             if s.pump_addr in pumps:
@@ -371,7 +488,9 @@ class RecipeResolver:
                 raise RecipeValidationError(f"stage_gap_missing_{i}")
 
         # stage 그룹핑(배리어 단위) — resolved 는 이미 stage-major 정렬.
-        stages: list[tuple[ResolvedStep | ResolvedValveStep | ResolvedOpStep, ...]] = []
+        stages: list[
+            tuple[ResolvedStep | ResolvedValveStep | ResolvedOpStep | ResolvedBatchStep, ...]
+        ] = []
         for i in range(max_stage + 1):
             stages.append(tuple(r for r in resolved if r.stage == i))
 

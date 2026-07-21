@@ -18,9 +18,15 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
+from typing import Callable
 
 from ..core.pump_guard import EngineErrorClass, StatusErrorCode, classify_engine_error_code
-from ..ports.engine_port import EngineDispenseCommand, EnginePort
+from ..ports.engine_port import (
+    EngineBatchCommand,
+    EngineDispenseCommand,
+    EnginePort,
+    EngineResult,
+)
 from ..test_seam.fake_engine_sentinels import FAKE_EMPTY_RAW_CODE, FAKE_TIMEOUT_RAW_CODE
 
 
@@ -68,6 +74,21 @@ class EngineExecutor:
 
         빈응답(무응답) = 실패(EP-03). silent-success 0 — rawErrorCode 0 만 success.
         """
+        return self._run_with_retry(lambda: self.engine.dispense(cmd))
+
+    def run_batch(self, cmd: EngineBatchCommand) -> EngineStepResult:
+        """배치 흡입 스텝(§9-1 v3)을 재시도 정책과 함께 실행 — `run_step` 과 **동일 정책**.
+
+        배치 전체(여러 흡입 → 한 번 배출)가 하나의 재시도 단위다(부분 재개 없음). 재시도 시
+        어댑터가 홈(0)에서 다시 누적 흡입하므로 이중토출이 되지 않는다(_ensure_ready 가 원점 복구).
+        """
+        return self._run_with_retry(lambda: self.engine.dispense_batch(cmd))
+
+    def _run_with_retry(self, dispense: "Callable[[], EngineResult]") -> EngineStepResult:
+        """단일/배치 공통 재시도 루프 — EP-03·timeout·transient/permanent 분류가 동일하다.
+
+        빈응답(무응답) = 실패(EP-03). silent-success 0 — rawErrorCode 0 만 success.
+        """
         attempts = 0
         last_raw: int | None = None
         last_error_code = StatusErrorCode.ENGINE_ERROR_TRANSIENT
@@ -75,7 +96,7 @@ class EngineExecutor:
         # 첫 시도 + 최대 max_retries 재시도.
         for _ in range(self.max_retries + 1):
             attempts += 1
-            res = self.engine.dispense(cmd)
+            res = dispense()
             last_raw = res.raw_error_code
 
             # ── EP-03: 빈/무응답 판정을 성공보다 먼저 — silent-success 구조적 차단. ──

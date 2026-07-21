@@ -26,7 +26,12 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Mapping
 
-from ..ports.engine_port import EngineDispenseCommand, EngineOpCommand, EngineResult
+from ..ports.engine_port import (
+    EngineBatchCommand,
+    EngineDispenseCommand,
+    EngineOpCommand,
+    EngineResult,
+)
 from ..test_seam.fake_engine_sentinels import FAKE_EMPTY_RAW_CODE, FAKE_TIMEOUT_RAW_CODE
 
 # 각 물리 동작(aspirate/dispense/initialize)의 지연(ms) 주입 env — 기본 0(무지연).
@@ -89,6 +94,25 @@ class DispenseCall:
     steps: int
 
 
+@dataclass(frozen=True, slots=True)
+class BatchCall:
+    """한 번의 dispense_batch 호출 기록(관찰용·§9-1 v3).
+
+    `cumulative_steps` = 어댑터가 절대 이동에 쓸 **누적 흡입 스텝 시퀀스**(각 흡입 후 running total).
+    실어댑터가 `A{누적}R` 로 보내는 값과 동일하게 Fake 가 재현해, 배치가 올바른 누적-절대 흡입
+    시퀀스 + 단일 배출로 구성되는지를 하드웨어 없이 객관 검증한다(테스트 (c)).
+    """
+
+    pump_addr: int
+    out_port: int
+    # 각 흡입 후 running total(절대 이동 목표). 예: steps [960, 480] → (960, 1440).
+    cumulative_steps: tuple[int, ...]
+    # 흡입 부피(µL) 순서 — 관찰 편의.
+    volumes_ul: tuple[float, ...]
+    # 배출 횟수(배치 = 항상 1). silent-success/이중배출 관찰용.
+    dispense_once: bool = True
+
+
 class FakeEnginePort:
     """Fake EnginePort — dispense 호출 카운터 + 결과 주입.
 
@@ -109,6 +133,8 @@ class FakeEnginePort:
         self.default_outcome = FakeEngineOutcome.ACK
         # dispense 호출 이력(P0 관찰 렌즈).
         self.dispense_calls: list[DispenseCall] = []
+        # dispense_batch 호출 이력(§9-1 v3 · 누적-절대 흡입 시퀀스 관찰 렌즈).
+        self.batch_calls: list[BatchCall] = []
         # aspirate 호출 이력.
         self.aspirate_calls: list[DispenseCall] = []
         # initialize 호출 횟수.
@@ -200,6 +226,34 @@ class FakeEnginePort:
             return EngineResult(raw_error_code=FAKE_TIMEOUT_RAW_CODE, detail="estop")
         return _outcome_to_result(self._next_outcome(cmd.pump_addr))
 
+    def dispense_batch(self, cmd: EngineBatchCommand) -> EngineResult:
+        """배치 흡입 — 누적-절대 흡입 시퀀스를 기록(실어댑터 A{누적} 재현)하고 단일 배출로 판정.
+
+        각 흡입 steps 를 누적 합산해 `cumulative_steps` 로 남긴다 — 실 SY-01B 어댑터가 보내는
+        `A{running_total}R` 프레임과 동일하다. 결과 판정은 `dispense` 와 동일 스크립트/estop 계약
+        (배치 전체 = 한 재시도 단위이므로 pump_addr 스크립트 1개를 소비).
+        """
+        running = 0
+        cumulative: list[int] = []
+        volumes: list[float] = []
+        for _in_port, steps, volume_ul, _aspirate_speed_hz in cmd.aspirations:
+            running += steps
+            cumulative.append(running)
+            volumes.append(volume_ul)
+        self.batch_calls.append(
+            BatchCall(
+                pump_addr=cmd.pump_addr,
+                out_port=cmd.out_port,
+                cumulative_steps=tuple(cumulative),
+                volumes_ul=tuple(volumes),
+            )
+        )
+        # 물리 흡입+배출 시간 근사(기본 0·무지연) — 이 구간이 "제조 중" 크래시 주입 창.
+        self._delay()
+        if self._estop.is_set():
+            return EngineResult(raw_error_code=FAKE_TIMEOUT_RAW_CODE, detail="estop")
+        return _outcome_to_result(self._next_outcome(cmd.pump_addr))
+
     def initialize(self) -> EngineResult:
         self.initialize_count += 1
         # 물리 homing/purge 시간 근사(기본 0·무지연).
@@ -215,6 +269,7 @@ class FakeEnginePort:
     def reset(self) -> None:
         """관찰 상태 초기화(재기동 시나리오 사이 카운터 리셋)."""
         self.dispense_calls.clear()
+        self.batch_calls.clear()
         self.aspirate_calls.clear()
         self.op_calls.clear()
         self.estop_all_calls.clear()

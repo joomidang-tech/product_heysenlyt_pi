@@ -69,6 +69,7 @@ from ..ports.engine_port import (
     OP_INITIALIZE,
     OP_PLUNGER_FULL,
     OP_PLUNGER_HOME,
+    EngineBatchCommand,
     EngineDispenseCommand,
     EngineOpCommand,
     EngineResult,
@@ -917,6 +918,63 @@ class Sy01bEngineAdapter:
     def aspirate(self, cmd: EngineDispenseCommand) -> EngineResult:
         """흡입만(`I` → `P`) — 배출 없이 통에서 빨아올린다."""
         return self._cycle(cmd, aspirate_only=True)
+
+    def dispense_batch(self, cmd: EngineBatchCommand) -> EngineResult:
+        """배치 흡입 사이클(§9-1 v3 · 2026-07-21 "1향료 1펌핑") — v1.1.0 `_dispenseCurrentBatch` 복원.
+
+        한 주사기에 여러 액체를 밸브 돌려가며 **순서대로 누적 절대 흡입** 후 한 번 배출한다:
+
+            _ensure_ready
+            누적 = 0
+            for (in_port, steps, …) in aspirations:
+                I{in_port}R                         # 흡입 구멍으로 밸브 회전(poll)
+                누적 += steps
+                {흡입속도}A{누적}R                    # **절대 누적** 흡입(poll) — v1.1.0 movePlungerAbs
+            O{out_port}R                            # 배출 구멍으로 회전(poll)
+            {배출속도}A0R                            # 한 번에 홈으로 배출(poll)
+
+        `_cycle` 과 **동일한 실행 원리**(절대 이동 `A`·`_settle(poll=True)`·`_speed_cmd`·에러코드
+        즉시 반환)를 재사용한다 — 차이는 흡입이 1회가 아니라 **누적 절대이동 N회**라는 것뿐이다.
+        누적 절대이동이라 시작 위치(홈 0)에서 매 흡입이 이전 위치 **위에** 쌓인다. 합이 풀스트로크를
+        넘지 않음은 resolver 가 이미 보장(과충전·Code 11 방지)하지만, 실행 중 어느 흡입이든 에러면
+        즉시 반환하고 분류·재시도는 상위 `EngineExecutor` 가 한다(여기서 재시도하면 이중 재시도).
+        """
+        addr = cmd.pump_addr
+        try:
+            code = self._ensure_ready(addr, cmd.spec)
+            if code != 0:
+                return EngineResult(raw_error_code=code, detail="setup failed")
+
+            # ── 흡입 — 순서대로 밸브 회전 + **절대 누적** 흡입(A{누적}). ──────────────
+            #   이 사이클은 홈(0)에서 시작한다(_ensure_ready 가 원점을 잡음). 상대 P 대신 절대
+            #   A{누적} 을 써서 위치 드리프트에 안전하다(단일 _cycle 과 동일 원리·2026-07-20 회귀 봉합).
+            running_total_steps = 0
+            for in_port, steps, _volume_ul, aspirate_speed_hz in cmd.aspirations:
+                speed_in = self._speed_cmd(aspirate_speed_hz, cmd.slope)
+                # ① 흡입 구멍으로 밸브 회전(배치는 매 액체마다 다른 구멍이므로 항상 회전).
+                code = self._settle(addr, f"I{in_port}R", self.read_timeout_s, poll=True)
+                if code != 0:
+                    return EngineResult(raw_error_code=code, detail=f"valve I{in_port}")
+                # ② 절대 누적 흡입 — 이전 흡입 위에 쌓는다(A{누적steps}).
+                running_total_steps += steps
+                code = self._settle(
+                    addr, f"{speed_in}A{running_total_steps}R", self.motion_timeout_s, poll=True
+                )
+                if code != 0:
+                    return EngineResult(raw_error_code=code, detail=f"aspirate A{running_total_steps}")
+
+            # ── 배출 — 배출 구멍으로 회전 후 절대 홈 `A0`(한 번에 전량 배출·잔량 0). ──
+            speed_out = self._speed_cmd(cmd.dispense_speed_hz, cmd.slope)
+            code = self._settle(addr, f"O{cmd.out_port}R", self.read_timeout_s, poll=True)
+            if code != 0:
+                return EngineResult(raw_error_code=code, detail=f"valve O{cmd.out_port}")
+            code = self._settle(addr, f"{speed_out}A0R", self.motion_timeout_s, poll=True)
+            if code != 0:
+                return EngineResult(raw_error_code=code, detail="dispense")
+            return EngineResult(raw_error_code=0)
+        except Exception as e:  # noqa: BLE001
+            # 시리얼 예외(연결 끊김·pyserial 미설치 등) = 실패. 상위가 흡수해 형제 태스크를 완주시킨다.
+            return EngineResult(raw_error_code=_NO_RESPONSE, detail=f"serial error: {e}")
 
     # ── 엔진 조작(정비) — **의도 → 펌프 문법 번역은 여기서만** ──────────────────
     def run_op(self, cmd: EngineOpCommand) -> EngineResult:

@@ -13,6 +13,7 @@ from senlyt_pi.pipeline.recipe_resolver import (
     UNMAPPED_PUMP_ADDR,
     RecipeResolver,
     RecipeValidationError,
+    ResolvedBatchStep,
     flavor_recipe_to_steps,
     flavor_sour_ml,
     flavor_recipe_source_to_steps,
@@ -157,6 +158,90 @@ def test_flavor_recipe_sour_ml_is_not_dosed():
     steps = flavor_recipe_to_steps(payload, pump_addr_of={"grape": 1}.get, sweet_pump_addr=9)
     assert len(steps) == 1  # sour 스텝 없음.
     assert flavor_sour_ml(payload) == 0.2  # 판단값만 노출.
+
+
+# ── batchSyringe 배치 흡입 (§9-1 v3 · 2026-07-21 "1향료 1펌핑") ──────────────────
+
+
+def batch_step(idx, addr, out_port, asps, *, stage=0, dispense_speed=6000, slope=14):
+    """batchSyringe RecipeStep 조립 — asps = [(flavor, in_port, volume_ul, aspirate_speed_hz)]."""
+    return RecipeStep.from_json(
+        {
+            "idx": idx,
+            "stage": stage,
+            "kind": "batchSyringe",
+            "pumpAddr": addr,
+            "outPort": out_port,
+            "dispenseSpeedHz": dispense_speed,
+            "slope": slope,
+            "aspirations": [
+                {"flavor": f, "inPort": ip, "volume": v, "aspirateSpeedHz": sp}
+                for (f, ip, v, sp) in asps
+            ],
+        }
+    )
+
+
+def test_batch_accepts_valid_and_derives_per_aspiration_steps():
+    """(a) 누적 ≤ 용량인 배치 수락 + 흡입별 steps 파생(§6-4·하드코딩 금지).
+
+    addr 1 = FLAVOR_SPEC(1.25mL·maxVolumeUl=1250·stepsPerMl=9600). 100µL→960·200µL→1920.
+    누적합 300µL ≤ 1250 이라 통과. out_port·배출 속도·경사는 공유값.
+    """
+    r = RESOLVER.resolve(
+        [batch_step(0, 1, 12, [("grape", 1, 100, 2000), ("citrus", 3, 200, 1500)])]
+    )
+    assert len(r.steps) == 1
+    b = r.steps[0]
+    assert isinstance(b, ResolvedBatchStep)
+    assert b.pump_addr == 1
+    assert b.out_port == 12
+    assert b.dispense_speed_hz == 6000
+    assert b.slope == 14
+    # 흡입별 steps 파생 — 12000×100÷1250=960 · 12000×200÷1250=1920.
+    assert [a.steps for a in b.aspirations] == [960, 1920]
+    assert [a.in_port for a in b.aspirations] == [1, 3]
+    assert [a.aspirate_speed_hz for a in b.aspirations] == [2000, 1500]
+
+
+def test_batch_rejects_cumulative_over_capacity():
+    """(b) 누적 흡입 합 > 시린지 용량 → batch_over_capacity(CMD_VALIDATION_FAILED).
+
+    개별(800·600)은 각각 ≤ 1250 이라 단일 게이트는 통과하지만, **합 1400 > 1250** 이면 절대
+    누적 A{합}이 풀스트로크를 넘어 Code 11 과충전이 된다 — 배치는 합을 봐야 한다.
+    """
+    with pytest.raises(RecipeValidationError) as e:
+        RESOLVER.resolve([batch_step(0, 1, 12, [("a", 1, 800, 2000), ("b", 3, 600, 2000)])])
+    assert e.value.reason == "batch_over_capacity"
+    assert e.value.error_code is StatusErrorCode.CMD_VALIDATION_FAILED
+
+
+def test_batch_boundary_at_capacity_passes():
+    """경계값: 누적합 == maxVolumeUl(1250) 은 통과(≤)."""
+    r = RESOLVER.resolve([batch_step(0, 1, 12, [("a", 1, 1000, 2000), ("b", 3, 250, 2000)])])
+    assert isinstance(r.steps[0], ResolvedBatchStep)
+    # 12000×1250÷1250 = 12000(풀스트로크) — 누적 두 번째가 정확히 풀스트로크.
+
+
+def test_batch_rejects_in_port_equals_out_port():
+    """흡입 구멍 == 배출 구멍 = 조립 버그(밸브 안 돌리고 빨아 그대로 뱉음) → drop."""
+    with pytest.raises(RecipeValidationError) as e:
+        RESOLVER.resolve([batch_step(0, 1, 3, [("a", 3, 100, 2000)])])
+    assert e.value.reason == "in_port_equals_out_port"
+
+
+def test_batch_rejects_empty_aspirations():
+    """흡입 0건 배치 → empty_batch drop(0흡입 배출 금지)."""
+    with pytest.raises(RecipeValidationError) as e:
+        RESOLVER.resolve([batch_step(0, 1, 12, [])])
+    assert e.value.reason == "empty_batch"
+
+
+def test_batch_rejects_unmapped_pump():
+    """미매핑 pumpAddr 배치 → fail-closed(dispense 동형·엉뚱 제품 방지)."""
+    with pytest.raises(RecipeValidationError) as e:
+        RESOLVER.resolve([batch_step(0, 99, 12, [("a", 1, 100, 2000)])])
+    assert e.value.reason == "unmapped_pump_addr"
 
 
 def test_flavor_recipe_unmapped_channel_falls_to_rr_gate():

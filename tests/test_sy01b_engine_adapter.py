@@ -21,7 +21,7 @@ from senlyt_pi.adapters.sy01b_engine_adapter import (
     parse_status,
 )
 from senlyt_pi.core.pump_guard import SyringeSpec
-from senlyt_pi.ports.engine_port import EngineDispenseCommand
+from senlyt_pi.ports.engine_port import EngineBatchCommand, EngineDispenseCommand
 from senlyt_pi.test_seam.fake_engine_sentinels import (
     FAKE_EMPTY_RAW_CODE,
     FAKE_TIMEOUT_RAW_CODE,
@@ -955,3 +955,57 @@ class TestBit5CompletionJudgement:
         frames = [status_pos_frame(0, False, 3000), status_pos_frame(0, True, 9600)]
         a = adapter_with(ScriptedPollSerial(frames))
         assert a._poll_until_ready(1, 40.0) == 0
+
+
+# ── 배치 흡입 사이클 = I→A{누적}…→O→A0 (§9-1 v3 · 2026-07-21 "1향료 1펌핑") ──────
+
+
+class TestDispenseBatch:
+    def test_cumulative_absolute_aspirate_frames_single_dispense(self):
+        """배치 = 누적 절대 흡입(A{누적}) N회 + 단일 배출(A0). v1.1.0 `_dispenseCurrentBatch` 복원.
+
+        2흡입(steps 100·200, in_port 3·8) → 프레임 순서:
+          I3 → A100 → I8 → A300(누적!) → O12 → A0. 흡입마다 A0(배출)이 끼지 않는다(단일 배출).
+        """
+        fake = FakeSerial()
+        a = adapter_with(fake)
+        cmd = EngineBatchCommand(
+            pump_addr=2,
+            out_port=12,
+            dispense_speed_hz=6000,
+            slope=14,
+            spec=SPEC_05,
+            aspirations=((3, 100, 100.0, 2000), (8, 200, 50.0, 1500)),
+        )
+        res = a.dispense_batch(cmd)
+        assert res.raw_error_code == 0
+
+        # 셋업(TR·U200·Z) 이후의 모션 프레임만 추린다.
+        tokens = ("I3", "A100R", "I8", "A300R", "O12", "A0R")
+        moves = [w for w in fake.written if any(t in w for t in tokens)]
+        for w in moves:
+            assert w.startswith("/2"), w
+            assert w.endswith("\r"), w
+        seq = [next(t for t in tokens if t in w) for w in moves]
+        # 흡입은 **절대 누적**(A100 → A300, 두 번째가 100+200), 배출은 단 한 번(A0).
+        assert seq == ["I3", "A100R", "I8", "A300R", "O12", "A0R"]
+        assert seq.count("A0R") == 1, "단일 배출(흡입마다 배출 없음)"
+
+    def test_batch_aspirate_error_returns_immediately(self):
+        """흡입 중 에러(Code 9 오버로드)면 즉시 반환 — 배출까지 밀어붙이지 않는다(안전정지)."""
+        # 셋업 프레임들은 정상(ready), 첫 흡입 이동 폴에서 Code 9(오버로드) 응답.
+        fake = FakeSerial(default=status_frame(9, ready=True))
+        a = adapter_with(fake)
+        # 셋업(TR·U200·Z)은 통과시키기 위해 앞쪽 응답을 정상으로 스크립트.
+        fake._responses = [status_frame(0, ready=True)] * 6
+        cmd = EngineBatchCommand(
+            pump_addr=1,
+            out_port=12,
+            dispense_speed_hz=6000,
+            slope=14,
+            spec=SPEC_05,
+            aspirations=((3, 100, 100.0, 2000),),
+        )
+        res = a.dispense_batch(cmd)
+        assert res.raw_error_code == 9  # 오버로드 그대로 상위로(재분류 안 함).
+        assert "O12" not in "".join(fake.written), "흡입 실패 후 배출 회전 미발생"

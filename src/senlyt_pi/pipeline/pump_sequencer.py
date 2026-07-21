@@ -46,12 +46,18 @@ from ..core.wire_messages import RecipeStep
 from ..obs.log import STAGE_STEP_EXEC, StructuredLogger
 from ..persistence.file_idempotency_ledger import FileIdempotencyLedger
 from ..persistence.idempotency_ledger import LedgerVerdict
-from ..ports.engine_port import OP_INITIALIZE, EngineDispenseCommand, EnginePort
+from ..ports.engine_port import (
+    OP_INITIALIZE,
+    EngineBatchCommand,
+    EngineDispenseCommand,
+    EnginePort,
+)
 from ..ports.valve_port import ValvePort
 from .engine_executor import EngineExecutor
 from .recipe_resolver import (
     RecipeResolver,
     RecipeValidationError,
+    ResolvedBatchStep,
     ResolvedStep,
     ResolvedOpStep,
     ResolvedValveStep,
@@ -449,7 +455,10 @@ class PumpSequencer:
         return self._pool
 
     def _run_stage(
-        self, stage_steps: Sequence["ResolvedStep | ResolvedValveStep | ResolvedOpStep"]
+        self,
+        stage_steps: Sequence[
+            "ResolvedStep | ResolvedValveStep | ResolvedOpStep | ResolvedBatchStep"
+        ],
     ) -> list[tuple[bool, StatusErrorCode | None]]:
         """한 stage 의 스텝들을 동시 실행하고 (성공여부, 에러코드) 목록을 반환.
 
@@ -485,7 +494,8 @@ class PumpSequencer:
         return results
 
     def _maybe_broadcast_init(
-        self, stage_steps: "Sequence[ResolvedStep | ResolvedValveStep | ResolvedOpStep]"
+        self,
+        stage_steps: "Sequence[ResolvedStep | ResolvedValveStep | ResolvedOpStep | ResolvedBatchStep]",
     ) -> "list[tuple[bool, StatusErrorCode | None]] | None":
         """stage 가 **전부 initialize op** 이고 엔진이 브로드캐스트를 지원하면 1콜로 합쳐 실행.
 
@@ -544,7 +554,7 @@ class PumpSequencer:
         return out
 
     def _run_one(
-        self, step: "ResolvedStep | ResolvedValveStep | ResolvedOpStep"
+        self, step: "ResolvedStep | ResolvedValveStep | ResolvedOpStep | ResolvedBatchStep"
     ) -> tuple[bool, StatusErrorCode | None]:
         """스텝 1개 실행(태스크 본체 — 워커 스레드에서 돈다).
 
@@ -619,6 +629,23 @@ class PumpSequencer:
                     )
                 # 밸브 실패 = permanent(시간축 재시도는 과토출 위험 — 재시도 없음·설계 §8).
                 return (res.ok, None if res.ok else StatusErrorCode.ENGINE_ERROR_PERMANENT)
+
+            if isinstance(step, ResolvedBatchStep):
+                # 배치 흡입(§9-1 v3) — 여러 흡입 → 한 번 배출을 **하나의 재시도 단위**로 실행.
+                #   부분 재개 없음(재시도 = 홈에서 배치 전체 재실행)이라 이중토출이 되지 않는다.
+                batch = EngineBatchCommand(
+                    pump_addr=step.pump_addr,
+                    out_port=step.out_port,
+                    dispense_speed_hz=step.dispense_speed_hz,
+                    slope=step.slope,
+                    spec=step.spec,
+                    aspirations=tuple(
+                        (a.in_port, a.steps, a.volume_ul, a.aspirate_speed_hz)
+                        for a in step.aspirations
+                    ),
+                )
+                res = self._executor.run_batch(batch)
+                return (res.is_success, res.error_code)
 
             cmd = EngineDispenseCommand(
                 pump_addr=step.pump_addr,

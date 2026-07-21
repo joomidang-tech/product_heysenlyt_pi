@@ -15,6 +15,7 @@ from senlyt_pi.core.wire_messages import RecipeStep
 from senlyt_pi.persistence.file_idempotency_ledger import FileIdempotencyLedger
 from senlyt_pi.pipeline.pump_sequencer import JobOutcome, ProgressPublisher, PumpSequencer
 from senlyt_pi.pipeline.recipe_resolver import RecipeResolver
+from senlyt_pi.ports.engine_port import EngineBatchCommand
 
 SPEC = SyringeSpec(pump_full_stroke=12000, syringe_capacity_ml=1.25)
 
@@ -366,3 +367,84 @@ def test_op_failure_logs_raw_code_and_detail(ledger, fake):
     assert detail.get("engineCode") == 2
     assert detail.get("error") == "permanent"
     assert detail.get("pumpAddr") == 1
+
+
+# ── batchSyringe 배치 흡입 (§9-1 v3 · 2026-07-21 "1향료 1펌핑") ──────────────────
+
+
+def batch_step(idx, addr, out_port, asps, *, stage=0, dispense_speed=6000, slope=14):
+    """batchSyringe RecipeStep 조립 — asps = [(flavor, in_port, volume_ul, aspirate_speed_hz)]."""
+    return RecipeStep.from_json(
+        {
+            "idx": idx,
+            "stage": stage,
+            "kind": "batchSyringe",
+            "pumpAddr": addr,
+            "outPort": out_port,
+            "dispenseSpeedHz": dispense_speed,
+            "slope": slope,
+            "aspirations": [
+                {"flavor": f, "inPort": ip, "volume": v, "aspirateSpeedHz": sp}
+                for (f, ip, v, sp) in asps
+            ],
+        }
+    )
+
+
+def test_fake_records_cumulative_absolute_aspirate_and_single_dispense():
+    """(c) FakeEngine 이 2흡입 배치의 누적-절대 흡입 시퀀스 + 단일 배출을 기록한다.
+
+    steps [960, 480] → 누적 (960, 1440). 배치 = **한 번의 dispense_batch 호출**(단일 배출) —
+    흡입마다 별도 dispense 호출이 생기지 않는다(끊기는 토출이 사라진 것의 객관 증거).
+    """
+    fake = FakeEnginePort()
+    cmd = EngineBatchCommand(
+        pump_addr=1,
+        out_port=12,
+        dispense_speed_hz=6000,
+        slope=14,
+        spec=SPEC,
+        aspirations=((1, 960, 100.0, 2000), (3, 480, 50.0, 1500)),
+    )
+    res = fake.dispense_batch(cmd)
+    assert res.raw_error_code == 0
+    assert len(fake.batch_calls) == 1  # 단일 배출 = 배치 호출 1회.
+    call = fake.batch_calls[0]
+    assert call.pump_addr == 1
+    assert call.out_port == 12
+    assert call.cumulative_steps == (960, 1440)  # 절대 누적: 960, 960+480.
+    assert call.volumes_ul == (100.0, 50.0)
+    assert fake.dispense_count == 0  # 배치는 단일 dispense 경로를 쓰지 않는다.
+
+
+def test_batch_job_end_to_end_completed(ledger, fake):
+    """(d) 시퀀서가 배치 job 을 FakeEngine 으로 완주 → COMPLETED.
+
+    배치 스텝 1개(2흡입 합 300µL ≤ 1250) → step_n=1, batch_calls 1건(누적 절대 흡입 시퀀스).
+    """
+    seq = make_seq(ledger, fake)
+    r = seq.submit(
+        command_id="o:batch:1",
+        trace_id="t",
+        steps=[batch_step(0, 1, 12, [("grape", 1, 100, 2000), ("citrus", 3, 200, 1500)])],
+    )
+    assert r.outcome is JobOutcome.COMPLETED
+    assert r.step_n == 1
+    assert r.steps_done == 1
+    assert len(fake.batch_calls) == 1
+    # 12000×100÷1250=960 · 누적 960+1920=2880(200µL→1920).
+    assert fake.batch_calls[0].cumulative_steps == (960, 2880)
+    assert fake.batch_calls[0].out_port == 12
+
+
+def test_batch_job_transient_then_success_retries_whole_batch(ledger, fake):
+    """배치 = 한 재시도 단위 — transient(busy) 후 성공하면 배치 전체를 재실행(부분 재개 없음)."""
+    fake.script_for(1, [FakeEngineOutcome.BUSY, FakeEngineOutcome.ACK])
+    seq = make_seq(ledger, fake)
+    r = seq.submit(
+        command_id="o:batch:retry",
+        trace_id="t",
+        steps=[batch_step(0, 1, 12, [("grape", 1, 100, 2000)])],
+    )
+    assert r.outcome is JobOutcome.COMPLETED
+    assert len(fake.batch_calls) == 2  # busy 1회 재시도 → 배치 전체 2회 실행.
