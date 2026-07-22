@@ -137,6 +137,18 @@ BROADCAST_STEP_GAP_S = 0.5
 #   ⚠️ 실기기 프로브(특히 최대 용량 5.0mL)로 하향 조정 대상 — 확정 전엔 길게(안전 우선).
 HOME_SPEED_HZ = 500  # Manual §4.4.1 기본 초기화 속도(Z Full/Half/Third 공통·용량 무관).
 HOME_SETTLE_S = 30.0  # ≥ 12000/HOME_SPEED_HZ(=24.0s) + k-offset + 여유.
+# ── 초기화 폴 조기완료(2026-07-22 실기기 프로브 확정 — scripts/init_poll_probe.py) ────────
+#   주소지정 `?` 폴은 홈(Z) 모션 **중에도** 100% clean 이었다(2펌프 동시 홈·인터리브 폴 포함
+#   전 시나리오 177+ 폴에서 garbled 0·silent 0·err15 0 — 실기기 실측). 그래서 초기화 완료를
+#   HOME_SETTLE_S "무조건 대기"가 아니라 폴로 확인해 즉시 출발한다(end-to-end 31.5s→11.5s 실측).
+#   ⚠️ 브로드캐스트 직후 폴 금지(7/19 오염)는 불변 — 이 폴은 **주소지정 발사** 뒤에만 쓴다.
+#   HOME_SETTLE_S 의 의미는 "무조건 대기" → "폴이 완료를 못 잡을 때의 폴백 상한"으로 바뀐다
+#   (실측 최장 홈 ~10.9s ≪ 30s — 폴백은 현행과 동일한 시간·동일한 성공 처리 = 하방 0).
+INIT_POLL_CONSECUTIVE_IDLE = 2  # 유효 프레임 "연속 N회 idle"만 완료 — 우연 오독 조기출발(err15 재발) 차단.
+INIT_POLL_GRACE_S = 0.5  # Z 발사 후 첫 폴까지 유예 — stale-Ready(발사 직전 idle 프레임) 방어.
+INIT_POLL_INTERVAL_S = 0.2  # 프로브 스윕(0.05/0.2/0.5s) 결과 — 0.2s 로 감지 오버헤드 ~0.3s·버스 여유.
+INIT_POLL_READ_TIMEOUT_S = 0.5  # 폴 1회 수신 상한 — 무응답 펌프가 루프를 5s(기본)씩 세우지 않게.
+INIT_FIRE_STEP_GAP_S = 0.05  # 주소지정 발사 스텝(TR→U→Z) 간 간격 — 프로브 실측과 동일(err15 0).
 # 프로브(장착 감지) — read-only 라 짧게. 살아있는 펌프는 첫 폴에서 답한다.
 PROBE_READ_TIMEOUT_S = 1.5
 PROBE_MAX_ATTEMPTS = 5
@@ -906,6 +918,170 @@ class Sy01bEngineAdapter:
                 "정비 초기화 중단 — estop/shutdown 개입(캐시 미등록·재시도 필요)",
                 stage=STAGE_STEP_EXEC,
             )
+        return results
+
+    # ── 주소지정 폴링 초기화 (2026-07-22 — "물어보지 않는 30초" → "확인 즉시 출발") ──────
+    def initialize_polled(
+        self,
+        addrs: "Sequence[int]",
+        spec: SyringeSpec,
+        init_in_port: "int | None" = None,
+        init_out_port: "int | None" = None,
+        ports_by_addr: "dict[int, tuple[int | None, int | None]] | None" = None,
+    ) -> "dict[int, int]":
+        """전 펌프 **동시** 초기화 — 주소지정 발사 + Bit5 폴 조기완료(폴백 = HOME_SETTLE_S).
+
+        `initialize_broadcast`(fire-and-forget·30s 고정 대기)를 대체하는 기본 경로. 브로드캐스트
+        자체를 쓰지 않으므로 7/19 버스 오염(브로드캐스트 직후 `?` 깨짐 → -1000 오탐) 조건이
+        구조적으로 없다. 실기기 프로브(scripts/init_poll_probe.py·2026-07-22)가 확정한 근거:
+        주소지정 폴은 2펌프 동시 홈 중에도 177+ 폴 100% clean·err15 0·end-to-end 31.5s→11.5s.
+
+        3개의 안전 기둥(설계 2026-07-21 §3):
+          1. **폴은 조기 출발에만 쓴다 — 실패 판정에는 안 쓴다**: 깨짐/무응답 폴은 계속 폴,
+             deadline(HOME_SETTLE_S) 도달 시 **성공 간주**(현행 fire-and-forget 과 동일한
+             silent-success — 정비 한정 허용 근거는 `initialize_broadcast` docstring 그대로).
+             7/19 오탐(멀쩡한 펌프를 실패 판정)이 재발 불가능한 구조.
+          2. **브로드캐스트 뒤에 묻지 않는다**: 발사도 주소지정(펌프별 TR→U→Z, 발사만 순차 —
+             모터는 동시에 돈다). 펌프별 포트 각자 전달 가능(`ports_by_addr`) — 브로드캐스트의
+             "전 펌프 포트 동일" 제약이 덤으로 풀린다.
+          3. **조기 출발은 유효 프레임 연속 {INIT_POLL_CONSECUTIVE_IDLE}회 idle 일 때만**:
+             깨진 바이트의 우연 idle 오독으로 홈 도중 다음 명령이 나가는 것(err15 = 7/20 사고
+             재발)을 구조로 차단(무효 프레임은 연속 카운트 리셋).
+
+        현행 대비 **더 정직해지는** 지점: 폴 중 명시적 하드웨어 에러(Code 9/10 오버로드,
+        idle+err)는 TR+재초기화 예약 후 정직한 실패로 보고한다(구 경로는 무조건 성공 간주).
+        전 펌프 완전 무응답(silent)만은 구 경로와 동일하게 실패 보고(거짓 완료 방지) —
+        garbled 는 살아있음(12:09 오탐 교훈)이라 성공 유지.
+
+        반환 = {addr: error_code}(0=성공). estop/shutdown 개입 시 전 펌프 실패·캐시 미등록.
+        """
+        targets = [a for a in addrs if a >= 1]
+        results: dict[int, int] = {a: 0 for a in targets}
+        if not targets:
+            return results
+        # 초기화 = estop 복구 경로 — 로컬 래치 해제 + 셋업 캐시 무효화(브로드캐스트와 동일).
+        self._estop.clear()
+        for a in targets:
+            self._initialized.discard(a)
+
+        def ports_of(a: int) -> "tuple[int | None, int | None]":
+            if ports_by_addr is not None and a in ports_by_addr:
+                return ports_by_addr[a]
+            return (init_in_port, init_out_port)
+
+        stall = f"U{self.preset.pump_syringe_type_code},{spec.stall_current}R"
+        fire_t0 = time.monotonic()
+        # [phase 1] 펌프별 발사 — TR(결과 검증 없음·브릭 회귀 봉합 취지) → U → Z. 즉답은 관대
+        #   (기둥 1: ACK 품질은 실패 사유가 아니다 — 진짜 상태는 phase 2 폴이 판정). 프로브
+        #   실측: 0.05s 간격 순차 발사에서 err15 0 — 두 펌프의 홈이 겹쳐 돈다.
+        for a in targets:
+            for fire_cmd in (TERMINATE, stall, spec.init_command_with(*ports_of(a))):
+                # 송신 **전** estop/shutdown 게이트 — 브로드캐스트와 동일한 선-검사. 래치가
+                #   섰는데 물리 명령(Z 홈 등)이 한 발 더 나가는 창을 없앤다(2026-07-22 리뷰 P2-2).
+                if not self._ff_wait(INIT_FIRE_STEP_GAP_S):
+                    return self._ff_abort(targets, results)
+                try:
+                    self._txn(a, fire_cmd, read_timeout_s=INIT_POLL_READ_TIMEOUT_S)
+                except Exception:  # noqa: BLE001 — 발사 실패(핫플러그 등)도 폴이 최종 판정.
+                    pass
+        # [phase 2] 완료 폴 — 전 펌프 인터리브, deadline = 발사 완료 + HOME_SETTLE_S(폴백 상한).
+        deadline = fire_t0 + HOME_SETTLE_S
+        if not self._ff_wait(INIT_POLL_GRACE_S):
+            return self._ff_abort(targets, results)
+        consec: dict[int, int] = {a: 0 for a in targets}  # addr → 연속 clean idle 수
+        pending = set(targets)
+        any_valid_frame = False
+        while pending and time.monotonic() < deadline:
+            for a in sorted(pending):
+                if self._stop.is_set() or self._estop.is_set():
+                    return self._ff_abort(targets, results)
+                code, idle, _pos = self._query_status_raw(
+                    a, read_timeout_s=INIT_POLL_READ_TIMEOUT_S
+                )
+                if code == _NO_RESPONSE:
+                    consec[a] = 0  # 깨짐/무응답 = 실패 아님(기둥 1) — 연속성만 리셋, 계속 폴.
+                    continue
+                any_valid_frame = True
+                if code in (9, 10):
+                    # 오버로드 = 씰/모터 보호 최우선 — TR+재초기화 예약+정직한 실패(개선점).
+                    self._terminate_and_flag_reinit(
+                        a, code, "초기화 중 펌프 오버로드 — TR+재초기화·정직한 실패"
+                    )
+                    results[a] = code
+                    pending.discard(a)
+                    continue
+                if code == 7:
+                    continue  # 미초기화 = 홈 재탐색 중(캐시는 아직 미등록) — 계속 폴.
+                if idle:
+                    if code == 0:
+                        consec[a] += 1
+                        if consec[a] >= INIT_POLL_CONSECUTIVE_IDLE:
+                            pending.discard(a)  # ✅ 조기완료 — 이 펌프는 홈 확인됨.
+                            if self._log is not None:
+                                self._log.info(
+                                    "초기화 폴 조기완료 — 홈 확인 즉시 출발",
+                                    stage=STAGE_STEP_EXEC,
+                                    pumpAddr=a,
+                                    elapsedS=round(time.monotonic() - fire_t0, 2),
+                                )
+                        continue
+                    if code == 15:
+                        # latched Command Overflow + 정지 — TR 로 지우고 정직한 실패(transient).
+                        self._terminate_and_flag_reinit(
+                            a, 15, "초기화 중 명령 겹침 latched(err15)+정지 — TR·재초기화·실패"
+                        )
+                    results[a] = code  # idle + err = 정직히 상위 분류로(거짓 성공 금지·EP-03).
+                    pending.discard(a)
+                    continue
+                consec[a] = 0  # busy = 모터 회전 중(홈 진행) — 계속 폴.
+            if pending and not self._ff_wait(INIT_POLL_INTERVAL_S):
+                return self._ff_abort(targets, results)
+        # deadline 도달 펌프 = **성공 간주**(기둥 1 — 현행 fire-and-forget 과 동일 처리·하방 0).
+        if pending and self._log is not None:
+            self._log.info(
+                "초기화 폴 폴백 — deadline 도달·성공 간주(현행 fire-and-forget 동등)",
+                stage=STAGE_STEP_EXEC,
+                pumpAddrs=sorted(pending),
+                fallbackS=HOME_SETTLE_S,
+            )
+        # ── 생존 게이트(브로드캐스트와 동일 비대칭) — 유효 프레임이 하나도 없었을 때만 검사:
+        #   garbled = 살아있음(성공 유지) / **전 펌프 silent** = 거짓 완료 방지 위해 실패 보고.
+        if not any_valid_frame and all(self.health_probe(a) == "silent" for a in targets):
+            if self._log is not None:
+                self._log.warn(
+                    "초기화 — 전 펌프 무응답(연결·전원 확인 필요) → 실패 보고(거짓 완료 방지)",
+                    stage=STAGE_STEP_EXEC,
+                    pumpAddrs=list(targets),
+                )
+            for a in targets:
+                results[a] = _NO_RESPONSE
+            return results  # 캐시 미등록 — 다음 시도가 다시 셋업.
+        # [phase 3] 주차 — 배출구(2026-07-21 규칙 "밸브가 쉴 땐 언제나 배출구"). 성공 펌프만.
+        #   주차 실패는 초기화 성공에 불영향(로그만) — 잔여액 배수 이슈지 홈 상실이 아니다.
+        #   진입 전 estop/shutdown 재확인(리뷰 P2-2) — 래치가 섰으면 밸브 회전(I)도 안 보낸다.
+        if self._estop.is_set() or self._stop.is_set():
+            return self._ff_abort(targets, results)
+        for a in targets:
+            if results[a] != 0:
+                continue
+            _in, out = ports_of(a)
+            park = out if out is not None else SAFE_PORT
+            park_code = self._settle(
+                a, f"I{park}R", self.read_timeout_s, poll=True, ack_tolerant=True
+            )
+            if park_code != 0 and self._log is not None:
+                self._log.warn(
+                    "초기화 주차 실패 — 초기화 성공엔 불영향(밸브 위치만 미보장)",
+                    stage=STAGE_STEP_EXEC,
+                    pumpAddr=a,
+                    engineCode=park_code,
+                )
+        # [phase 4] estop 재확인 후 캐시 등록(브로드캐스트 :883~886 로직 그대로).
+        if self._estop.is_set() or self._stop.is_set():
+            return self._ff_abort(targets, results)
+        for a in targets:
+            if results[a] == 0:
+                self._initialized.add(a)
         return results
 
     # ── 토출 ────────────────────────────────────────────────────────────────

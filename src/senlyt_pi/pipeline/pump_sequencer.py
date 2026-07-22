@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 from typing import Callable, Sequence
 
 from ..core.order_status import DispensePhase
-from ..core.pump_guard import StatusErrorCode
+from ..core.pump_guard import EngineErrorClass, StatusErrorCode, classify_engine_error_code
 from ..core.wire_messages import RecipeStep
 from ..obs.log import STAGE_STEP_EXEC, StructuredLogger
 from ..persistence.file_idempotency_ledger import FileIdempotencyLedger
@@ -466,12 +466,13 @@ class PumpSequencer:
         - 다스텝 stage 는 ThreadPoolExecutor 로 병렬 — **전 future 완주 대기**(부분 취소 없음).
           per-step 재시도(EngineExecutor R=3)는 태스크 안에서 펌프별 **독립** 진행.
         """
-        # ── 정비 초기화 = fire-and-forget 브로드캐스트 (1펌프·다펌프 공통) ──────────
+        # ── 정비 초기화 = 합체 1콜 (1펌프·다펌프 공통) ─────────────────────────────
         #   initialize op stage 는 **`len==1` 이라도** 개별 run_op 경로(`_ensure_ready` 의
-        #   Ready 폴 — 깨진 시리얼 링크에서 -1000 오탐, 2026-07-19 실기기)로 보내지 않고
-        #   브로드캐스트 fire-and-forget 1콜로 처리한다(명령 1발·경합 없음·폴 없음).
-        #   브로드캐스트 미지원 엔진(Fake/구 어댑터)은 None → 아래 기존 경로로 폴백
-        #   (테스트·하위호환 무영향).
+        #   Ready 폴 — 깨진 시리얼 링크에서 -1000 **실패 보고** 오탐, 2026-07-19 실기기)로
+        #   보내지 않고 합체 1콜로 처리한다. 기본 = `initialize_polled`(주소지정 발사+폴
+        #   조기완료·2026-07-22 — 폴 실패는 실패 보고가 아니라 30s 폴백이라 오탐 재발 불가),
+        #   구 어댑터 = `initialize_broadcast`(fire-and-forget) 폴백. 둘 다 없으면(Fake 등)
+        #   None → 아래 기존 경로로 폴백(테스트·하위호환 무영향).
         coalesced = self._maybe_broadcast_init(stage_steps)
         if coalesced is not None:
             return coalesced
@@ -497,13 +498,17 @@ class PumpSequencer:
         self,
         stage_steps: "Sequence[ResolvedStep | ResolvedValveStep | ResolvedOpStep | ResolvedBatchStep]",
     ) -> "list[tuple[bool, StatusErrorCode | None]] | None":
-        """stage 가 **전부 initialize op** 이고 엔진이 브로드캐스트를 지원하면 1콜로 합쳐 실행.
+        """stage 가 **전부 initialize op** 이고 엔진이 합체 초기화를 지원하면 1콜로 합쳐 실행.
 
         반환: 해당·지원 시 per-step (ok, code) 목록 / 아니면 None(기존 경로 폴백).
-        어댑터 `initialize_broadcast` 는 **fire-and-forget**(2026-07-19) — 명령만 쏘고 `?` 판정
-        없이 전 펌프 성공({addr: 0})을 돌려준다. 진짜 죽은 펌프는 이후 토출 경로의 Ready 폴에서
-        드러난다(silent-success 는 정비 한정 허용). 비-0 은 estop/shutdown 이 시퀀스를 중단한
-        경우뿐이다(캐시 미등록·운영자 재시도).
+        경로 우선순위(getattr 사다리 — 2026-07-22 주소지정 폴링 도입):
+          1. `initialize_polled` — 주소지정 발사 + Bit5 폴 조기완료(평소 ~31.6s → ~11.5s 실측).
+             펌프별 포트 각자 전달(ports_by_addr) — "전 스텝 포트 동일" 제약이 없다.
+             폴 실패는 실패 보고가 아니라 HOME_SETTLE_S 폴백(성공 간주 — 7/19 오탐 재발 불가).
+             단 명시적 하드웨어 에러(오버로드 등)는 정직한 실패로 온다(현행보다 정직해지는 개선).
+          2. `initialize_broadcast` — fire-and-forget(2026-07-19·구 어댑터 폴백). 전 펌프에 같은
+             명령 1발이라 전 스텝 포트 동일할 때만. 비-0 = estop/shutdown 중단뿐.
+          3. 둘 다 없으면(Fake 등) None — 일반 per-pump 동시 실행으로 폴백.
         """
         if not stage_steps:
             return None  # 방어 — resolver 가 빈 stage 를 막지만, all([])==True 함정 차단.
@@ -511,36 +516,46 @@ class PumpSequencer:
             isinstance(s, ResolvedOpStep) and s.op == OP_INITIALIZE for s in stage_steps
         ):
             return None
+        init_polled = getattr(self._executor.engine, "initialize_polled", None)
         init_broadcast = getattr(self._executor.engine, "initialize_broadcast", None)
-        if not callable(init_broadcast):
+        if not callable(init_polled) and not callable(init_broadcast):
             return None  # Fake/구 어댑터 — 일반 per-pump 동시 실행으로 폴백.
         addrs = [s.pump_addr for s in stage_steps]
         spec = stage_steps[0].spec
-        # 초기화 포트(흡입=air·배출/주차=output·2026-07-21 QA) — 브로드캐스트는 전 펌프에 같은
-        #   명령 1발이라 **전 스텝 포트가 동일할 때만** 실을 수 있다. 펌프별 레이아웃이 달라
-        #   포트가 갈리면 브로드캐스트를 포기하고 per-pump 경로로 폴백(각자 자기 포트로 초기화).
-        port_pairs = {(s.init_in_port, s.init_out_port) for s in stage_steps}
-        if len(port_pairs) > 1:
-            return None
-        init_in_port, init_out_port = next(iter(port_pairs))
-        # 브로드캐스트는 consume 스레드에서 직접 실행 — 발사 INFO·어댑터 로그(브로드캐스트 송신 등)가
+        if callable(init_polled):
+            # 주소지정 폴링(기본 경로) — 펌프별 포트 각자(레이아웃이 달라도 각자 자기 포트로 초기화).
+            fire_fn = lambda: init_polled(  # noqa: E731 — 두 경로의 호출형만 다름(아래 공용 실행).
+                addrs,
+                spec,
+                ports_by_addr={
+                    s.pump_addr: (s.init_in_port, s.init_out_port) for s in stage_steps
+                },
+            )
+            fire_log = "정비 초기화 발사(주소지정·폴 조기완료)"
+        else:
+            # 초기화 포트(흡입=air·배출/주차=output·2026-07-21 QA) — 브로드캐스트는 전 펌프에 같은
+            #   명령 1발이라 **전 스텝 포트가 동일할 때만** 실을 수 있다. 펌프별 레이아웃이 달라
+            #   포트가 갈리면 브로드캐스트를 포기하고 per-pump 경로로 폴백(각자 자기 포트로 초기화).
+            port_pairs = {(s.init_in_port, s.init_out_port) for s in stage_steps}
+            if len(port_pairs) > 1:
+                return None
+            init_in_port, init_out_port = next(iter(port_pairs))
+            fire_fn = lambda: init_broadcast(  # noqa: E731
+                addrs, spec, init_in_port=init_in_port, init_out_port=init_out_port
+            )
+            fire_log = "정비 초기화 발사(fire-and-forget·폴 생략)"
+        # 합체 초기화는 consume 스레드에서 직접 실행 — 발사 INFO·어댑터 로그(조기완료/폴백 등)가
         #   이 잡의 trace 로 엮이도록 여기서도 스레드 컨텍스트를 바인딩한다(2026-07-19).
         self._bind_step_log_ctx()
         if self._log is not None:
-            # 폴 없이 발사만 하므로, "명령이 나갔다"는 사실 자체를 관측 흔적으로 남긴다.
-            self._log.info(
-                "정비 초기화 발사(fire-and-forget·폴 생략)",
-                stage=STAGE_STEP_EXEC,
-                pumpAddrs=addrs,
-            )
+            # 어느 경로를 탔는지 실기기 로그에서 즉시 판별되도록 문구를 경로별로 분기한다.
+            self._log.info(fire_log, stage=STAGE_STEP_EXEC, pumpAddrs=addrs)
         try:
-            results = init_broadcast(
-                addrs, spec, init_in_port=init_in_port, init_out_port=init_out_port
-            )
-        except Exception as exc:  # noqa: BLE001 — 브로드캐스트 실패도 흡수(형제 완주 계약·다음 stage 미진입).
+            results = fire_fn()
+        except Exception as exc:  # noqa: BLE001 — 합체 초기화 실패도 흡수(형제 완주 계약·다음 stage 미진입).
             if self._log is not None:
                 self._log.error(
-                    "브로드캐스트 초기화 실패 — 전 펌프",
+                    "합체 초기화 실패 — 전 펌프",
                     stage=STAGE_STEP_EXEC,
                     error=f"{type(exc).__name__}: {exc}",
                 )
@@ -551,7 +566,10 @@ class PumpSequencer:
         for s in stage_steps:
             code = results.get(s.pump_addr, -1)  # 목록에 없으면(방어) 실패 처리.
             ok = code == 0
-            # fire-and-forget 정상 경로에선 전부 0 — 비-0 = estop/shutdown 중단(+매핑 누락 방어).
+            # broadcast 경로의 비-0 = estop/shutdown 중단(_NO_RESPONSE)뿐. polled 경로는 **정직한
+            #   하드웨어 코드**(15=latched 겹침 등)도 반환한다 — SoT §6-7 분류로 라벨을 보존한다
+            #   (구 blanket PERMANENT 는 err15 "다시 누르면 복구"를 영구 실패로 오표시·리뷰 P2-1).
+            #   _NO_RESPONSE(-1000)/미분류는 classify 가 PERMANENT 라 기존 동작 불변.
             if not ok and self._log is not None:
                 self._log.error(
                     f"정비 초기화 미완 — pump={s.pump_addr}",
@@ -559,7 +577,14 @@ class PumpSequencer:
                     engineCode=code,
                     pumpAddr=s.pump_addr,
                 )
-            out.append((ok, None if ok else StatusErrorCode.ENGINE_ERROR_PERMANENT))
+            err: StatusErrorCode | None = None
+            if not ok:
+                err = (
+                    StatusErrorCode.ENGINE_ERROR_TRANSIENT
+                    if classify_engine_error_code(code) is EngineErrorClass.TRANSIENT
+                    else StatusErrorCode.ENGINE_ERROR_PERMANENT
+                )
+            out.append((ok, err))
         return out
 
     def _run_one(
