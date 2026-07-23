@@ -50,6 +50,12 @@ class DeviceIdentity:
     # 서버 배정 모드(TOFU 승인 시 하달·flavor|fragrance) — pi 의 SSE 구독/역보고 큐를 결정한다.
     #   부재(None)면 pi 는 env(SENLYT_MODE) 또는 flavor 폴백. SENLYT_MODE env 대체(서버가 SoT).
     mode: str | None = None
+    # 이 정체성을 등록·발급받은 서버 base URL(2026-07-23) — **서버 바인딩**. 토큰·deviceId 는 그 서버
+    #   레지스트리에서만 의미가 있다(서버마다 DB·HMAC 서명키가 다름). URL 만 바꿔 재설치하면
+    #   ensure_registered 가 이 값과 현재 서버를 비교해, 다르면 저장분을 버리고 그 서버에 **재등록**한다
+    #   (안 그러면 옛 서버 정체성을 재사용해 새 서버엔 register 가 안 가 admin 후보에 안 뜬다 — 페어링 실패).
+    #   부재(None)=구 정체성 파일(상위호환) → 서버 미상이므로 재등록 유도(안전한 fail-safe).
+    server_base_url: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -59,6 +65,8 @@ class DeviceIdentity:
         }
         if self.mode is not None:
             d["mode"] = self.mode
+        if self.server_base_url is not None:
+            d["serverBaseUrl"] = self.server_base_url
         return d
 
     @staticmethod
@@ -67,6 +75,7 @@ class DeviceIdentity:
 
         구 정체성 파일의 `hardwareId` 키가 있어도 무시한다(상위호환) — deviceId 가 곧 시리얼.
         구 파일(mode 부재)도 유효 — mode=None(폴백). 승인 재등록 시 mode 가 채워진다.
+        구 파일(serverBaseUrl 부재)도 유효 — None(서버 미상) → ensure_registered 가 재등록 유도.
         """
         if not isinstance(j, dict):
             return None
@@ -81,7 +90,15 @@ class DeviceIdentity:
             return None
         raw_mode = j.get("mode")
         mode = raw_mode if isinstance(raw_mode, str) and raw_mode else None
-        return DeviceIdentity(device_id=device_id, dispenser_token=token, exp=exp, mode=mode)
+        raw_server = j.get("serverBaseUrl")
+        server_base_url = raw_server if isinstance(raw_server, str) and raw_server else None
+        return DeviceIdentity(
+            device_id=device_id,
+            dispenser_token=token,
+            exp=exp,
+            mode=mode,
+            server_base_url=server_base_url,
+        )
 
 
 def is_identity_expired(identity: DeviceIdentity, *, now_seconds: int) -> bool:

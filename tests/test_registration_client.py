@@ -155,6 +155,21 @@ class TestIdentityStore:
         store.save(identity)
         assert store.load() == identity
 
+    def test_server_base_url_roundtrip(self, tmp_path: Path):
+        """서버 바인딩 필드(2026-07-23) 저장/복원 왕복 + JSON 키 serverBaseUrl."""
+        store = DeviceIdentityStore(tmp_path / "identity.json")
+        identity = DeviceIdentity(
+            device_id="10000000abcd1234",
+            dispenser_token="tok",
+            exp=123,
+            server_base_url="https://dev-env.senlyt.com",
+        )
+        store.save(identity)
+        assert store.load() == identity
+        assert '"serverBaseUrl": "https://dev-env.senlyt.com"' in (
+            tmp_path / "identity.json"
+        ).read_text(encoding="utf-8")
+
     def test_missing_and_corrupt_return_none(self, tmp_path: Path):
         store = DeviceIdentityStore(tmp_path / "identity.json")
         assert store.load() is None  # 부재.
@@ -222,6 +237,87 @@ class TestEnsureRegistered:
         identity = ensure_registered(store, client(t), now_seconds=1_000)
         assert len(t.calls) == 1
         assert identity.device_id == SERIAL  # 현재 시리얼로 승격.
+
+    def test_same_server_reuses_without_network(self, tmp_path: Path):
+        """서버 바인딩(2026-07-23): 저장 정체성의 서버 == 현재 서버 → 재사용(네트워크 0)."""
+        store = DeviceIdentityStore(tmp_path / "identity.json")
+        saved = DeviceIdentity(
+            device_id=SERIAL,
+            dispenser_token="tok-old",
+            exp=5_000,
+            server_base_url="https://dev-env.senlyt.com",
+        )
+        store.save(saved)
+        t = ScriptedTransport([])  # 호출되면 IndexError.
+        got = ensure_registered(
+            store, client(t), now_seconds=1_000, server_base_url="https://dev-env.senlyt.com"
+        )
+        assert got == saved
+        assert t.calls == []
+
+    def test_different_server_reregisters(self, tmp_path: Path):
+        """★핵심 회귀★: 저장 정체성이 **다른 서버** 것이면(URL 만 바꿔 재설치) → 현재 서버에 재등록.
+        (안 그러면 옛 서버 정체성을 재사용해 새 서버 admin 후보에 안 떠 페어링 실패 — 2026-07-23 dev 실측)"""
+        store = DeviceIdentityStore(tmp_path / "identity.json")
+        store.save(
+            DeviceIdentity(
+                device_id=SERIAL,
+                dispenser_token="tok-v120",
+                exp=5_000,
+                server_base_url="https://v1-2-0.env.senlyt.com",
+            )
+        )
+        t = ScriptedTransport([(200, OK_BODY)])
+        got = ensure_registered(
+            store, client(t), now_seconds=1_000, server_base_url="https://dev-env.senlyt.com"
+        )
+        assert len(t.calls) == 1  # 재등록 발생(네트워크 1회).
+        assert got.dispenser_token == "tok-1"  # 새 서버 토큰.
+        assert got.server_base_url == "https://dev-env.senlyt.com"  # 현재 서버로 각인.
+        assert store.load() == got  # 영속에도 새 서버 각인.
+
+    def test_legacy_identity_without_server_reregisters(self, tmp_path: Path):
+        """구 정체성 파일(serverBaseUrl 부재=None) + 서버 지정 → 서버 미상이라 재등록(안전 fail-safe).
+        배포된 기존 Pi 자가치유 경로 — 이미 승인된 서버면 서버가 즉시 200 재발급(무중단)."""
+        store = DeviceIdentityStore(tmp_path / "identity.json")
+        (tmp_path / "identity.json").write_text(
+            '{"deviceId": "hw-serial-1", "dispenserToken": "tok-old", "exp": 5000}',
+            encoding="utf-8",
+        )
+        assert store.load().server_base_url is None  # 구 파일 = 서버 미상.
+        t = ScriptedTransport([(200, OK_BODY)])
+        got = ensure_registered(
+            store, client(t), now_seconds=1_000, server_base_url="https://senlyt.com"
+        )
+        assert len(t.calls) == 1
+        assert got.server_base_url == "https://senlyt.com"
+
+    def test_server_compare_ignores_trailing_slash(self, tmp_path: Path):
+        """trailing slash 차이만이면 같은 서버로 보고 재사용(오탐 재등록 방지)."""
+        store = DeviceIdentityStore(tmp_path / "identity.json")
+        store.save(
+            DeviceIdentity(
+                device_id=SERIAL,
+                dispenser_token="tok-old",
+                exp=5_000,
+                server_base_url="https://senlyt.com",
+            )
+        )
+        t = ScriptedTransport([])
+        got = ensure_registered(
+            store, client(t), now_seconds=1_000, server_base_url="https://senlyt.com/"
+        )
+        assert t.calls == []  # 재사용(재등록 안 함).
+        assert got.dispenser_token == "tok-old"
+
+    def test_no_server_arg_preserves_legacy_reuse(self, tmp_path: Path):
+        """server_base_url 미지정(구 호출·테스트) → 서버 비교 스킵, 기존 재사용 동작 보존(하위호환)."""
+        store = DeviceIdentityStore(tmp_path / "identity.json")
+        saved = DeviceIdentity(device_id=SERIAL, dispenser_token="tok-old", exp=5_000)
+        store.save(saved)
+        t = ScriptedTransport([])
+        assert ensure_registered(store, client(t), now_seconds=1_000) == saved
+        assert t.calls == []
 
     def test_polls_pending_until_approved(self, tmp_path: Path):
         """TOFU: 202 pending 이 이어지면 운영자 승인(200)까지 폴링 — 사이마다 sleep."""

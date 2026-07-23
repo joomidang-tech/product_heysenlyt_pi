@@ -463,7 +463,9 @@ def build_components(
             name=environ.get(SENLYT_DEVICE_NAME_ENV) or None,
         )
         try:
-            identity = ensure_registered(store, client)
+            # server_base_url 전달 = 서버 바인딩(2026-07-23) — 저장된 정체성이 다른 서버 것이면(=URL 만
+            #   바꿔 재설치) 그 서버에 재등록해 admin 후보로 뜨게 한다(옛 서버 정체성 재사용 → 페어링 실패 방지).
+            identity = ensure_registered(store, client, server_base_url=server_config.base_url)
         except Exception as e:  # RegistrationError 포함 — fail-fast 표면화.
             log.error(
                 "디바이스 등록 실패 — 부팅 중단",
