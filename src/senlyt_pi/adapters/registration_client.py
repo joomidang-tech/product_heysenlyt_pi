@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -169,14 +170,22 @@ def ensure_registered(
     *,
     now_seconds: int | None = None,
     force: bool = False,
+    server_base_url: str | None = None,
     pending_max_polls: int = DEFAULT_PENDING_MAX_POLLS,
     pending_poll_interval_seconds: float = DEFAULT_PENDING_POLL_INTERVAL_SECONDS,
     sleep: Callable[[float], None] | None = None,
 ) -> DeviceIdentity:
-    """부팅 진입점 — 저장된 정체성이 유효(미만료·동일 deviceId)하면 재사용, 아니면 등록.
+    """부팅 진입점 — 저장된 정체성이 유효(미만료·동일 deviceId·**동일 서버**)하면 재사용, 아니면 등록.
 
     토큰 만료(계약상 장수명 10년·2026-07-19·사실상 안 만료) 시 재등록으로 재발급. [D-A] 저장된 deviceId 가 현재 시리얼과 다르면
     (기판 교체·구 dsp-<hash> 파일에서 승격 등) 저장분을 버리고 재등록(레지스트리 upsert 키 = deviceId=시리얼).
+
+    **서버 바인딩(2026-07-23)**: `server_base_url` 이 주어지면(부팅 시 항상), 저장된 정체성의
+    `server_base_url` 과 다를 때(=서버를 바꿔 재설치했을 때, 또는 구 파일이라 None일 때) 저장분을 버리고
+    **현재 서버에 재등록**한다. 토큰·deviceId 는 발급 서버 레지스트리에서만 의미가 있어(서버마다 DB·HMAC
+    서명키 상이), 옛 서버 정체성을 새 서버에 재사용하면 그 서버엔 register 가 안 가 admin 후보에 안 떠
+    페어링이 안 된다(2026-07-23 dev 검증에서 실측). 새로 발급된 정체성에는 현재 `server_base_url` 을 각인해
+    저장한다. 비교는 trailing slash 무시(server_config.base_url 은 이미 정규화되나 방어적으로 rstrip).
 
     **TOFU 승인 대기(2026-07-17)**: 등록이 202 pending(client.register()→None)이면 운영자가 /admin 에서
     승인할 때까지 `pending_poll_interval_seconds` 간격으로 재등록을 폴링한다(최대 `pending_max_polls`).
@@ -184,11 +193,21 @@ def ensure_registered(
     예외 → 컨테이너/서비스 restart 가 재시도(멱등·같은 deviceId).
     """
     now = now_seconds if now_seconds is not None else int(time.time())
+
+    def _same_server(a: str | None, b: str | None) -> bool:
+        # 둘 다 None(=서버 바인딩 미사용 경로)이면 같다고 본다. 한쪽만 None(구 파일)이면 다름 → 재등록.
+        if a is None and b is None:
+            return True
+        if a is None or b is None:
+            return False
+        return a.rstrip("/") == b.rstrip("/")
+
     if not force:
         existing = store.load()
         if (
             existing is not None
             and existing.device_id == client.device_id
+            and _same_server(existing.server_base_url, server_base_url)
             and not is_identity_expired(existing, now_seconds=now)
         ):
             return existing
@@ -197,6 +216,10 @@ def ensure_registered(
     for poll in range(pending_max_polls + 1):
         identity = client.register()
         if identity is not None:
+            # 발급 정체성에 현재 서버를 각인(서버 바인딩) — 서버가 응답에 base URL 을 주지 않으므로
+            #   pi 가 자신이 등록한 서버를 기록한다. server_base_url 미지정(테스트 등)이면 그대로 둔다.
+            if server_base_url is not None:
+                identity = replace(identity, server_base_url=server_base_url)
             store.save(identity)
             return identity
         # None = TOFU pending(202) — 운영자 승인 대기. 폴링 계속.
