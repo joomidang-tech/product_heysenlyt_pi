@@ -1,0 +1,92 @@
+# ═══════════════════════════════════════════════════════════════════
+# 베이스라인 run4 — 전원 ✕ · USB O (링크 생존 · 펌프 무음)
+# 일시: 2026-07-19 19:47~19:48 KST · 기기: 10000000b9166a1c
+# 데몬 커밋: 미확인 (run1과 동일 세션)
+# 요약: 전 명령 10.9~12.7s 대기 후 정직 실패 — 어댑터는 살아 명령이 전선까지 나가고
+#       펌프가 무음이라 read timeout·폴 예산을 소진하고 실패. "기다리는 것"이 올바른 동작
+#       (무음은 느린 응답과 순간 구분 불가). 거짓 done 0.
+# 지문: 10초대 = "전선까지 갔는데 펌프가 침묵" (펌프 전원·RS485 배선 축)
+# 부수 관찰: estop 해제 직후 복구 초기화가 INTERRUPTED — 해제 전파 창(fast-poll ~1s+유예) 타이밍
+# ═══════════════════════════════════════════════════════════════════
+
+heysenlyt@heysenlyt-dispensor:~ $ python senlyt_test_cli.py --operator "***MASKED***"
+기기: 10000000b9166a1c · online=True · engine=sy01b
+
+선택> 8
+
+▶ 약한 초기화(전 펌프)
+    발행됨: mnt-07abdf5b-4d93-4c…
+    [19:47:06.355] 발행 → queued  (+0.7s)
+    [19:47:07.310] queued → delivered  (+1.7s)
+    [19:47:08.273] delivered → running  (+2.6s)
+    [19:47:17.246] running → failed errorCode=ENGINE_ERROR_PERMANENT  (+11.6s)
+    ⇒ FAIL (11.6s)  기대: done
+
+▶ 1펌프 전량 흡입
+    발행됨: mnt-70c91ca6-5551-4c…
+    [19:47:22.629] 발행 → queued  (+0.4s)
+    [19:47:23.391] queued → delivered  (+1.2s)
+    [19:47:24.300] delivered → running  (+2.1s)
+    [19:47:34.244] running → failed errorCode=ENGINE_ERROR_PERMANENT  (+12.0s)
+    ⇒ FAIL (12.0s)
+
+▶ 1펌프 전량 배출
+    발행됨: mnt-a5f662e9-c247-40…
+    [19:47:37.501] 발행 → queued  (+0.4s)
+    [19:47:38.365] queued → delivered  (+1.3s)
+    [19:47:39.361] delivered → running  (+2.3s)
+    [19:47:49.751] running → failed errorCode=ENGINE_ERROR_PERMANENT  (+12.7s)
+    ⇒ FAIL (12.7s)
+
+▶ 2펌프 전량 흡입
+    발행됨: mnt-91ff8a76-a507-4f…
+    [19:47:50.872] 발행 → queued  (+0.1s)
+    [19:47:51.477] queued → running  (+0.7s)
+    [19:48:02.064] running → failed errorCode=ENGINE_ERROR_PERMANENT  (+11.3s)
+    ⇒ FAIL (11.3s)
+
+▶ 2펌프 전량 배출
+    발행됨: mnt-ec5a45c8-df25-43…
+    [19:48:03.837] 발행 → queued  (+0.3s)
+    [19:48:04.704] queued → delivered  (+1.2s)
+    [19:48:05.556] delivered → running  (+2.0s)
+    [19:48:15.761] running → failed errorCode=ENGINE_ERROR_PERMANENT  (+12.2s)
+    ⇒ FAIL (12.2s)
+
+▶ [에러경로] 초기화 직후 연타
+    초기화 발행: mnt-4a27ba0b-052…
+    [19:48:19.177] 발행 → queued  (+0.5s)
+    [19:48:20.071] queued → delivered  (+1.4s)
+    [19:48:21.064] delivered → running  (+2.4s)
+    [19:48:29.608] running → failed errorCode=ENGINE_ERROR_PERMANENT  (+10.9s)
+    (초기화가 failed → 연타 단계 미진행)
+
+▶ [에러경로] 긴급정지 큐 정리
+    [19:48:35.276] estop SET
+    [19:48:36.776] 발행 → queued  (+0.4s)
+    [19:48:37.660] queued → delivered  (+1.3s)
+    [19:48:38.270] delivered → running  (+1.9s)
+    [19:48:40.710] running → failed errorCode=INTERRUPTED  (+4.3s)
+    ⇒ FAIL — failed [INTERRUPTED] (4.3s)  (기대 failed [ESTOP_CANCELED])
+    [19:48:40.842] estop CLEAR — 복구 초기화 발행
+
+▶ estop 해제 후 복구 초기화
+    발행됨: mnt-a0d21a78-897a-4f…
+    [19:48:41.084] 발행 → queued  (+0.1s)
+    [19:48:42.296] queued → delivered  (+1.3s)
+    [19:48:42.901] delivered → running  (+1.9s)
+    [19:48:45.397] running → failed errorCode=INTERRUPTED  (+4.4s)
+    ⇒ FAIL — failed [INTERRUPTED] (4.4s)  기대: done
+    (부수 관찰: estop 해제 전파 창에 걸린 타이밍 — 몇 초 뒤 재시도 시 정상 진행 예상)
+
+══════════════════════════════════════════════════════════════════════════════
+결과 요약 — FAIL 8건 (펌프 무음 상태의 기대 동작 = 대기 예산 소진 후 정직 실패)
+══════════════════════════════════════════════════════════════════════════════
+  ❌ 약한 초기화(전 펌프)                       failed [ENGINE_ERROR_PERMANENT]  11.6s
+  ❌ 1펌프 전량 흡입                          failed [ENGINE_ERROR_PERMANENT]  12.0s
+  ❌ 1펌프 전량 배출                          failed [ENGINE_ERROR_PERMANENT]  12.7s
+  ❌ 2펌프 전량 흡입                          failed [ENGINE_ERROR_PERMANENT]  11.3s
+  ❌ 2펌프 전량 배출                          failed [ENGINE_ERROR_PERMANENT]  12.2s
+  ❌ Busy 연타 검증                         초기화가 failed                    0.0s
+  ❌ estop 중 발행 → 취소 기대                 failed [INTERRUPTED]           4.3s
+  ❌ estop 해제 후 복구 초기화                  failed [INTERRUPTED]           4.4s

@@ -1,0 +1,19 @@
+name: heysenlyt_pi
+description: >-
+  hey_senlyt v1.2.0 라즈베리파이4 headless 디스펜서 데몬 (순수 Dart CLI).
+  헥사고날 아키텍처. Firebase 무의존 — 서버 SSE 구독 + PATCH 역보고.
+  이 코드베이스는 v1.2.0 동결 계약 SoT(04_erd/..._frozen_contract_sot.md)를 바이트 동일 포팅한다.
+version: 1.2.0
+publish_to: none
+
+# 순수 Dart CLI — firebase / flutter 무의존 (SoT §1-1: Firestore 직결 0).
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+
+dependencies:
+  # 순수 Dart 표준 라이브러리만 사용 (crypto·http는 실어댑터 웨이브에서 추가).
+  # 이번 범위(골격+코어 계약 포팅)는 외부 의존 0을 목표로 한다.
+
+dev_dependencies:
+  test: ^1.25.0
+  lints: ^4.0.0

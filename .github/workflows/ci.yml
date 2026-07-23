@@ -1,0 +1,47 @@
+# heysenlyt-pi CI — 검증 게이트 (배포 아님).
+#
+# ⚠️ pi 는 "실배포(CD)" 개념이 없다(물리 기기·수동 프로비저닝). 그래서 이 CI 는 배포를 하지 않고
+#    **검증만** 한다(CI ≠ CD):
+#      ① pytest 전체 — 안전-크리티컬(서버타깃·펌프명령·전이표·멱등) 회귀 방지
+#      ② 브랜치→환경 규칙 검증 — 배포 브랜치(main·dev·vX.Y.Z)면 branch_to_env 파생이 성공해야 통과
+#    실기 서버 타겟 안전(브랜치→SENLYT_ENV)의 주(主) 관문은 로컬 provision(scripts/provision-env.sh)이고,
+#    이 CI 는 그 규칙·테스트가 push 마다 깨지지 않게 겹쳐 막는 defense-in-depth 다(02_infra §4.9).
+name: CI
+
+on:
+  push:
+    branches: [main, dev, "v*.*.*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install (editable + dev)
+        run: pip install -e ".[dev]"
+      - name: pytest (전체 — 안전 회귀 게이트)
+        run: python -m pytest -q
+      - name: 브랜치 → 환경 규칙 검증 (배포 브랜치는 env 파생 성공 필수)
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          case "$BRANCH" in
+            main|dev|v[0-9]*.[0-9]*.[0-9]*)
+              ENV="$(python -c "import sys; from senlyt_pi.config.server_target import branch_to_env; e=branch_to_env(sys.argv[1]); print(e) if e else sys.exit(1)" "$BRANCH")" \
+                || { echo "::error::배포 브랜치 '$BRANCH' 가 알려진 환경으로 매핑되지 않습니다(branch_to_env)."; exit 1; }
+              echo "✅ '$BRANCH' → SENLYT_ENV=$ENV (로컬 provision 이 실기에 각인할 값)"
+              ;;
+            *)
+              echo "ℹ️ 비배포 브랜치 '$BRANCH' — 환경 검증 스킵(테스트만)."
+              ;;
+          esac

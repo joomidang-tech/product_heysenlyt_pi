@@ -1,0 +1,75 @@
+# ═══════════════════════════════════════════════════════════════════
+# 베이스라인 run2 — 전원 O · USB ✕ (어댑터 뽑힘 = 시리얼 포트 소멸)
+# 일시: 2026-07-19 19:38~19:39 KST · 기기: 10000000b9166a1c
+# 데몬 커밋: 미확인 (run1과 동일 세션)
+# 요약: 전 명령 0.7~0.8s 즉시 정직 실패(죽은 핸들) · 거짓 done 0 · online=True 유지
+# 지문: <1s = "시리얼 포트 자체가 없다" (USB·어댑터 축)
+# ═══════════════════════════════════════════════════════════════════
+
+heysenlyt@heysenlyt-dispensor:~ $ python senlyt_test_cli.py --operator "***MASKED***"
+기기: 10000000b9166a1c · online=True · engine=sy01b
+
+선택> 8
+
+▶ 약한 초기화(전 펌프)
+    발행됨: mnt-ae6cabd8-c526-42…
+    [19:38:56.686] 발행 → queued  (+0.1s)
+    [19:38:57.359] queued → failed errorCode=ENGINE_ERROR_PERMANENT  (+0.8s)
+    ⇒ FAIL — failed [ENGINE_ERROR_PERMANENT] (0.8s)  기대: done
+
+▶ 1펌프 전량 흡입
+    발행됨: mnt-667eef57-6441-49…
+    [19:38:59.133] 발행 → queued  (+0.2s)
+    [19:38:59.735] queued → failed errorCode=ENGINE_ERROR_PERMANENT  (+0.8s)
+    ⇒ FAIL (0.8s)
+
+▶ 1펌프 전량 배출
+    발행됨: mnt-63e59024-48a6-41…
+    [19:39:01.133] 발행 → queued  (+0.2s)
+    [19:39:01.743] queued → failed errorCode=ENGINE_ERROR_PERMANENT  (+0.8s)
+    ⇒ FAIL (0.8s)
+
+▶ 2펌프 전량 흡입
+    발행됨: mnt-efec8d67-b5c6-4c…
+    [19:39:02.823] 발행 → queued  (+0.1s)
+    [19:39:03.446] queued → failed errorCode=ENGINE_ERROR_PERMANENT  (+0.8s)
+    ⇒ FAIL (0.8s)
+
+▶ 2펌프 전량 배출
+    발행됨: mnt-419ed60f-02b0-43…
+    [19:39:04.645] 발행 → queued  (+0.1s)
+    [19:39:05.245] queued → failed errorCode=ENGINE_ERROR_PERMANENT  (+0.7s)
+    ⇒ FAIL (0.7s)
+
+▶ [에러경로] 초기화 직후 연타
+    초기화 발행: mnt-68e10cb1-785…
+    [19:39:06.434] 발행 → queued  (+0.1s)
+    [19:39:07.083] queued → failed errorCode=ENGINE_ERROR_PERMANENT  (+0.8s)
+    (초기화가 failed → 연타 단계 미진행)
+
+▶ [에러경로] 긴급정지 큐 정리
+    [19:39:08.723] estop SET
+    [19:39:09.977] 발행 → queued  (+0.1s)
+    [19:39:10.582] queued → running  (+0.7s)
+    [19:39:13.021] running → failed errorCode=INTERRUPTED  (+3.2s)
+    ⇒ FAIL — failed [INTERRUPTED] (3.2s)  (기대 failed [ESTOP_CANCELED])
+    [19:39:13.138] estop CLEAR — 복구 초기화 발행
+
+▶ estop 해제 후 복구 초기화
+    발행됨: mnt-089e6dfb-1d11-4b…
+    [19:39:13.371] 발행 → queued  (+0.1s)
+    [19:39:13.977] queued → running  (+0.7s)
+    [19:39:14.591] running → failed errorCode=ENGINE_ERROR_PERMANENT  (+1.3s)
+    ⇒ FAIL (1.3s)  기대: done
+
+══════════════════════════════════════════════════════════════════════════════
+결과 요약 — FAIL 8건 (USB 뽑힘 상태의 기대 동작 = 전 명령 즉시 정직 실패)
+══════════════════════════════════════════════════════════════════════════════
+  ❌ 약한 초기화(전 펌프)                       failed [ENGINE_ERROR_PERMANENT]   0.8s
+  ❌ 1펌프 전량 흡입                          failed [ENGINE_ERROR_PERMANENT]   0.8s
+  ❌ 1펌프 전량 배출                          failed [ENGINE_ERROR_PERMANENT]   0.8s
+  ❌ 2펌프 전량 흡입                          failed [ENGINE_ERROR_PERMANENT]   0.8s
+  ❌ 2펌프 전량 배출                          failed [ENGINE_ERROR_PERMANENT]   0.7s
+  ❌ Busy 연타 검증                         초기화가 failed                    0.0s
+  ❌ estop 중 발행 → 취소 기대                 failed [INTERRUPTED]           3.2s
+  ❌ estop 해제 후 복구 초기화                  failed [ENGINE_ERROR_PERMANENT]   1.3s

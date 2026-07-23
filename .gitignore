@@ -1,0 +1,21 @@
+# Dart / Pub
+.dart_tool/
+.packages
+build/
+doc/api/
+*.dart.js
+*.info.json
+*.js.map
+.dart_tool/package_config.json
+
+# IDE
+.idea/
+*.iml
+
+# Python (배포 데몬 src/senlyt_pi)
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+.venv/
