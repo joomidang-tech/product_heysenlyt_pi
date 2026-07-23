@@ -62,9 +62,14 @@ done
 mkdir -p "$(dirname "$APP_DIR")"
 if [ -d "$APP_DIR/.git" ]; then
 	echo "  ↻ 기존 설치 갱신(pull)"
+	# FETCH_HEAD 로 리셋 — 기존 설치가 **다른 브랜치의 단일-브랜치 shallow clone**(예: 이전엔 v1.2.0)
+	#   이면 remote refspec 이 그 브랜치만 추적해 `origin/$BRANCH` 원격추적 ref 가 없다. 그 상태에서
+	#   `checkout origin/$BRANCH` 는 "not a commit" 으로 실패한다(브랜치 바꿔 재설치 시 발생). 반면
+	#   `git fetch origin $BRANCH` 는 어떤 refspec 이든 **FETCH_HEAD** 를 그 브랜치 tip 으로 세우므로,
+	#   여기서 FETCH_HEAD 로 로컬 브랜치를 만들고 hard reset 하면 브랜치 전환에도 삭제 없이 갱신된다.
 	git -C "$APP_DIR" fetch -q --depth 1 origin "$BRANCH"
-	git -C "$APP_DIR" checkout -q "$BRANCH" 2>/dev/null || git -C "$APP_DIR" checkout -q -B "$BRANCH" "origin/$BRANCH"
-	git -C "$APP_DIR" reset -q --hard "origin/$BRANCH"
+	git -C "$APP_DIR" checkout -q -B "$BRANCH" FETCH_HEAD
+	git -C "$APP_DIR" reset -q --hard FETCH_HEAD
 else
 	echo "  ⬇ 다운로드(clone)"
 	git clone -q --depth 1 --branch "$BRANCH" "$REPO" "$APP_DIR"

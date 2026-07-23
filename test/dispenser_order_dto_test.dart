@@ -18,7 +18,7 @@ void main() {
         'language': 'ko',
         'createdAt': '2026-07-03T12:34:56.789Z',
         'isDeleted': false,
-        'isDemo': false,
+        'isAuto': false,
         'deviceId': 'store-A',
         'attempt': 2,
         'traceId': 'trace-uuid',
@@ -59,7 +59,7 @@ void main() {
         'language': 'ko',
         'createdAt': '2026-07-03T00:00:00.000Z',
         'isDeleted': false,
-        'isDemo': false,
+        'isAuto': false,
         'deviceId': 'd',
         'attempt': 1,
         'traceId': 't',
@@ -82,7 +82,7 @@ void main() {
         'language': 'en',
         'createdAt': '2026-01-01T00:00:00.000Z',
         'isDeleted': false,
-        'isDemo': false,
+        'isAuto': false,
         // deviceId/attempt/traceId 부재.
         'fragrance': {'name': 'Rose'},
       });
@@ -93,7 +93,7 @@ void main() {
     });
   });
 
-  group('isDeleted/isDemo === true 강제(§5-3.5)', () {
+  group('isDeleted/isAuto === true 강제(§5-3.5)', () {
     test('truthy 아닌 값 → false', () {
       final dto = DispenserOrderDto.fromJson({
         'id': 'o',
@@ -102,14 +102,35 @@ void main() {
         'orderNumber': 1,
         'language': 'ko',
         'createdAt': '2026-07-03T00:00:00.000Z',
-        // isDeleted/isDemo 부재 → false.
+        // isDeleted/isAuto 부재 → false.
         'deviceId': 'd',
         'attempt': 1,
         'traceId': 't',
         'flavor': {'recipeId': 'r'},
       });
       expect(dto.isDeleted, isFalse);
-      expect(dto.isDemo, isFalse);
+      expect(dto.isAuto, isFalse);
+    });
+
+    test('구 isDemo(2026-07-12 리네임 이전) → isAuto 폴백 읽기', () {
+      final base = {
+        'id': 'o',
+        'mode': 'flavor',
+        'status': 'PENDING',
+        'orderNumber': 1,
+        'language': 'ko',
+        'createdAt': '2026-07-03T00:00:00.000Z',
+        'deviceId': 'd',
+        'attempt': 1,
+        'traceId': 't',
+        'flavor': {'recipeId': 'r'},
+      };
+      expect(DispenserOrderDto.fromJson({...base, 'isDemo': true}).isAuto, isTrue);
+      expect(DispenserOrderDto.fromJson({...base, 'isAuto': true}).isAuto, isTrue);
+      // 직렬화는 항상 새 키(isAuto)만 — 구 isDemo 키는 다시 내보내지 않는다.
+      final out = DispenserOrderDto.fromJson({...base, 'isDemo': true}).toJson();
+      expect(out['isAuto'], isTrue);
+      expect(out.containsKey('isDemo'), isFalse);
     });
   });
 
@@ -125,7 +146,7 @@ void main() {
         'language': 'ko',
         'createdAt': '2026-07-03T00:00:00.000Z',
         'isDeleted': false,
-        'isDemo': false,
+        'isAuto': false,
         'deviceId': 'd',
         'attempt': 12,
         'traceId': 't',
@@ -145,7 +166,7 @@ void main() {
         'language': 'ko',
         'createdAt': '2026-07-03T00:00:00.000Z',
         'isDeleted': false,
-        'isDemo': false,
+        'isAuto': false,
         'deviceId': 'd',
         'attempt': 1,
         'traceId': 't',
@@ -169,7 +190,7 @@ DispenserOrderDto _minDto({String createdAt = '2026-07-03T00:00:00.000Z'}) =>
       'language': 'ko',
       'createdAt': createdAt,
       'isDeleted': false,
-      'isDemo': false,
+      'isAuto': false,
       'deviceId': 'd',
       'attempt': 1,
       'traceId': 't',

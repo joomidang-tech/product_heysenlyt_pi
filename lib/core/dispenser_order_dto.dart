@@ -94,7 +94,7 @@ class DispenserOrderDto {
     required this.language,
     required this.createdAt,
     required this.isDeleted,
-    required this.isDemo,
+    required this.isAuto,
     required this.deviceId,
     required this.attempt,
     required this.traceId,
@@ -111,7 +111,7 @@ class DispenserOrderDto {
   final String language; // "ko" | "en" | "ja" | "vi"
   final String createdAt; // ISO8601, 항상 (재포맷 금지)
   final bool isDeleted;
-  final bool isDemo;
+  final bool isAuto; // admin 자동생성 주문 표식(구 isDemo 리네임 — ERD isAuto 수렴·2026-07-23)
 
   // net-new (필수·§5-1·O-5) — 마이그레이션 폴백(§5-4)으로 non-null 보장.
   final String deviceId;
@@ -140,7 +140,8 @@ class DispenserOrderDto {
       language: j['language'] as String,
       createdAt: j['createdAt'] as String,
       isDeleted: j['isDeleted'] == true,
-      isDemo: j['isDemo'] == true,
+      // isAuto 우선, 구 문서(isDemo) 폴백 — 리네임(2026-07-12 web·ERD) 이전 주문 하위호환.
+      isAuto: j['isAuto'] == true || j['isDemo'] == true,
       // §5-4 마이그레이션 폴백: 구버전 문서에 net-new 3필드 부재 시 기본값.
       deviceId: (j['deviceId'] as String?) ?? kDefaultDeviceId,
       attempt: (j['attempt'] as num?)?.toInt() ?? 1,
@@ -166,7 +167,7 @@ class DispenserOrderDto {
       'language': language,
       'createdAt': createdAt,
       'isDeleted': isDeleted,
-      'isDemo': isDemo,
+      'isAuto': isAuto,
       'deviceId': deviceId,
       'attempt': attempt,
       'traceId': traceId,
