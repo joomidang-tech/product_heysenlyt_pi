@@ -82,7 +82,7 @@ class DispenserOrderDto:
     language: str  # "ko" | "en" | "ja" | "vi"
     created_at: str  # ISO8601, 항상 (재포맷 금지)
     is_deleted: bool
-    is_demo: bool
+    is_auto: bool  # admin 자동생성 주문 표식(구 isDemo 리네임 — ERD isAuto 수렴·2026-07-23)
 
     # net-new (필수·§5-1·O-5) — 마이그레이션 폴백(§5-4)으로 non-null 보장.
     device_id: str
@@ -122,7 +122,8 @@ class DispenserOrderDto:
             language=j["language"],
             created_at=j["createdAt"],
             is_deleted=j.get("isDeleted") is True,
-            is_demo=j.get("isDemo") is True,
+            # isAuto 우선, 구 문서(isDemo) 폴백 — 리네임(2026-07-12 web·ERD) 이전 주문 하위호환.
+            is_auto=(j.get("isAuto") is True) or (j.get("isDemo") is True),
             # §5-4 마이그레이션 폴백: 구버전 문서에 net-new 3필드 부재 시 기본값.
             device_id=device_id if isinstance(device_id, str) else DEFAULT_DEVICE_ID,
             attempt=int(attempt) if isinstance(attempt, (int, float)) and not isinstance(attempt, bool) else 1,
@@ -147,7 +148,7 @@ class DispenserOrderDto:
             "language": self.language,
             "createdAt": self.created_at,
             "isDeleted": self.is_deleted,
-            "isDemo": self.is_demo,
+            "isAuto": self.is_auto,
             "deviceId": self.device_id,
             "attempt": self.attempt,
             "traceId": self.trace_id,

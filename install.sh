@@ -62,9 +62,14 @@ done
 mkdir -p "$(dirname "$APP_DIR")"
 if [ -d "$APP_DIR/.git" ]; then
 	echo "  ↻ 기존 설치 갱신(pull)"
+	# FETCH_HEAD 로 리셋 — 기존 설치가 **다른 브랜치의 단일-브랜치 shallow clone**(예: 이전엔 v1.2.0)
+	#   이면 remote refspec 이 그 브랜치만 추적해 `origin/$BRANCH` 원격추적 ref 가 없다. 그 상태에서
+	#   `checkout origin/$BRANCH` 는 "not a commit" 으로 실패한다(브랜치 바꿔 재설치 시 발생). 반면
+	#   `git fetch origin $BRANCH` 는 어떤 refspec 이든 **FETCH_HEAD** 를 그 브랜치 tip 으로 세우므로,
+	#   여기서 FETCH_HEAD 로 로컬 브랜치를 만들고 hard reset 하면 브랜치 전환에도 삭제 없이 갱신된다.
 	git -C "$APP_DIR" fetch -q --depth 1 origin "$BRANCH"
-	git -C "$APP_DIR" checkout -q "$BRANCH" 2>/dev/null || git -C "$APP_DIR" checkout -q -B "$BRANCH" "origin/$BRANCH"
-	git -C "$APP_DIR" reset -q --hard "origin/$BRANCH"
+	git -C "$APP_DIR" checkout -q -B "$BRANCH" FETCH_HEAD
+	git -C "$APP_DIR" reset -q --hard FETCH_HEAD
 else
 	echo "  ⬇ 다운로드(clone)"
 	git clone -q --depth 1 --branch "$BRANCH" "$REPO" "$APP_DIR"
@@ -90,7 +95,11 @@ SENLYT_SERVER_BASE_URL=$SERVER_URL
 SENLYT_RUN=1
 LOG_DIR=$LOG_DIR
 SENLYT_LEDGER_PATH=$STATE_DIR/queue/idempotency-ledger.log
-SENLYT_IDENTITY_PATH=$STATE_DIR/device-identity.json
+# 정체성은 **서버(환경)별로 분리** 저장한다($STATE_DIR/identities/{서버host}.json) — 데몬이 이 STATE_DIR 밑에
+#   서버 URL 로 파일명을 파생한다. 그래서 서버를 바꿔 재설치해도 각 서버의 등록·승인이 보존되고,
+#   다시 그 서버로 돌아오면 재승인 없이 즉시 재사용된다(2026-07-23). (SENLYT_IDENTITY_PATH 를 명시하면
+#   그 단일 파일로 고정 — 하위호환 override.)
+SENLYT_STATE_DIR=$STATE_DIR
 # 펌프 RS485 주소 → RecipeResolver pump_map(부트스트랩). 없으면 pump_map 이 비어
 # 모든 레시피 스텝이 CMD_VALIDATION_FAILED 로 drop(토출 0)되어 주문이 실패한다.
 #   flavor(식향)=addr 1,2(시린지 2펌프) · fragrance(향장향)=addr 1,2,3(3펌프).

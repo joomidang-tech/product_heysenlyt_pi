@@ -79,7 +79,13 @@ SENLYT_VALVE_FLOW_ENV = "SENLYT_VALVE_FLOW_ML_PER_SEC"
 # 최대 개방 클램프(s) — 밸브 영구개방 차단(기본 15.0).
 SENLYT_VALVE_MAX_OPEN_ENV = "SENLYT_VALVE_MAX_OPEN_SEC"
 
+# 상태(정체성 등) 기본 디렉터리 override — install.sh 가 /var/lib/senlyt 를 각인(로그 dir 과 분리).
+SENLYT_STATE_DIR_ENV = "SENLYT_STATE_DIR"
+
 DEFAULT_IDENTITY_FILENAME = "device-identity.json"
+# 환경별 정체성 파일 하위 디렉터리 — 서버(환경)마다 자기 신분증을 따로 둔다(2026-07-23).
+#   서버를 바꿔 재설치해도 각 서버의 등록·승인이 보존돼, 돌아오면 재승인·왕복 없이 즉시 재사용.
+IDENTITIES_SUBDIR = "identities"
 DEFAULT_LEDGER_FILENAME = "idempotency-ledger.log"
 DEFAULT_TRACE_SPILL_FILENAME = "trace-spill.jsonl"
 
@@ -266,12 +272,36 @@ def build_valve(
     return FakeValveAdapter(flow_ml_per_sec=flow, max_open_sec=max_open)
 
 
-def _identity_path(environ: Mapping[str, str]) -> Path:
+def _server_slug(server_base_url: str) -> str:
+    """서버 base URL → 파일명 안전 slug(호스트 기준). 환경별 정체성 파일 분리 키(2026-07-23).
+
+    예: https://dev-env.senlyt.com → "dev-env.senlyt.com" · https://senlyt.com/ → "senlyt.com".
+    영숫자·`.`·`-` 만 남기고 나머지는 `_`(포트 `:`·경로 `/` 등). 빈 값이면 "default".
+    """
+    from urllib.parse import urlsplit
+
+    s = server_base_url.strip()
+    parsed = urlsplit(s if "://" in s else f"//{s}")
+    host = (parsed.netloc or parsed.path).strip("/").lower()
+    slug = "".join(c if (c.isalnum() or c in ".-") else "_" for c in host)
+    return slug or "default"
+
+
+def _identity_path(environ: Mapping[str, str], server_base_url: str | None = None) -> Path:
+    """정체성 파일 경로. 우선순위:
+    1) SENLYT_IDENTITY_PATH 명시 → 그대로(단일 파일 override·하위호환).
+    2) server_base_url 있으면 → {state}/identities/{slug}.json (**환경별 분리** — 서버마다 신분증 따로).
+    3) 서버 미상 → {state}/device-identity.json (구 단일 파일 폴백).
+    state = SENLYT_STATE_DIR > LOG_DIR > cwd.
+    """
     explicit = environ.get(SENLYT_IDENTITY_PATH_ENV, "").strip()
     if explicit:
         return Path(explicit)
+    state_dir = environ.get(SENLYT_STATE_DIR_ENV, "").strip()
     log_dir = environ.get("LOG_DIR", "").strip()
-    base = Path(log_dir) if log_dir else Path.cwd()
+    base = Path(state_dir) if state_dir else (Path(log_dir) if log_dir else Path.cwd())
+    if server_base_url:
+        return base / IDENTITIES_SUBDIR / f"{_server_slug(server_base_url)}.json"
     return base / DEFAULT_IDENTITY_FILENAME
 
 
@@ -447,7 +477,7 @@ def build_components(
     server_config = ServerConfig.from_environ(environ)
 
     # 2) 정체성 확보 — 저장분 재사용 or 실 HTTP 등록.
-    store = identity_store or DeviceIdentityStore(_identity_path(environ))
+    store = identity_store or DeviceIdentityStore(_identity_path(environ, server_config.base_url))
     if register:
         # [D-A] 수집 HW 시리얼 = deviceId(서버 발급 없음). 부재 시 fail-fast(임의값 금지).
         device_id = read_hardware_id(env=environ)

@@ -17,7 +17,7 @@ def _min_dto(created_at: str = "2026-07-03T00:00:00.000Z") -> DispenserOrderDto:
         "language": "ko",
         "createdAt": created_at,
         "isDeleted": False,
-        "isDemo": False,
+        "isAuto": False,
         "deviceId": "d",
         "attempt": 1,
         "traceId": "t",
@@ -38,7 +38,7 @@ class TestRoundtripFlavor:
             "language": "ko",
             "createdAt": "2026-07-03T12:34:56.789Z",
             "isDeleted": False,
-            "isDemo": False,
+            "isAuto": False,
             "deviceId": "store-A",
             "attempt": 2,
             "traceId": "trace-uuid",
@@ -81,7 +81,7 @@ class TestIncludeIfNullFalse:
             "language": "ko",
             "createdAt": "2026-07-03T00:00:00.000Z",
             "isDeleted": False,
-            "isDemo": False,
+            "isAuto": False,
             "deviceId": "d",
             "attempt": 1,
             "traceId": "t",
@@ -106,7 +106,7 @@ class TestMigrationFallback:
             "language": "en",
             "createdAt": "2026-01-01T00:00:00.000Z",
             "isDeleted": False,
-            "isDemo": False,
+            "isAuto": False,
             # deviceId/attempt/traceId 부재.
             "fragrance": {"fragranceResult": {"notes": [{"name": "Rose"}]}},
         })
@@ -119,7 +119,7 @@ class TestMigrationFallback:
 
 
 class TestStrictBoolCoercion:
-    """isDeleted/isDemo === true 강제(§5-3.5)."""
+    """isDeleted/isAuto === true 강제(§5-3.5)."""
 
     def test_non_truthy_becomes_false(self):
         """truthy 아닌 값 → False."""
@@ -130,14 +130,34 @@ class TestStrictBoolCoercion:
             "orderNumber": 1,
             "language": "ko",
             "createdAt": "2026-07-03T00:00:00.000Z",
-            # isDeleted/isDemo 부재 → False.
+            # isDeleted/isAuto 부재 → False.
             "deviceId": "d",
             "attempt": 1,
             "traceId": "t",
             "flavor": {"recipeId": "r"},
         })
         assert dto.is_deleted is False
-        assert dto.is_demo is False
+        assert dto.is_auto is False
+
+    def test_legacy_isdemo_maps_to_is_auto(self):
+        """구 문서(isDemo·2026-07-12 리네임 이전) → is_auto 로 폴백 읽기(하위호환)."""
+        base = {
+            "id": "o",
+            "mode": "flavor",
+            "status": "PENDING",
+            "orderNumber": 1,
+            "language": "ko",
+            "createdAt": "2026-07-03T00:00:00.000Z",
+            "deviceId": "d",
+            "attempt": 1,
+            "traceId": "t",
+            "flavor": {"recipeId": "r"},
+        }
+        assert DispenserOrderDto.from_json({**base, "isDemo": True}).is_auto is True
+        assert DispenserOrderDto.from_json({**base, "isAuto": True}).is_auto is True
+        # 직렬화는 항상 새 키(isAuto)만 — 구 isDemo 키는 다시 내보내지 않는다.
+        out = DispenserOrderDto.from_json({**base, "isDemo": True}).to_json()
+        assert out["isAuto"] is True and "isDemo" not in out
 
 
 class TestCommandDerivedKey:
@@ -154,7 +174,7 @@ class TestCommandDerivedKey:
             "language": "ko",
             "createdAt": "2026-07-03T00:00:00.000Z",
             "isDeleted": False,
-            "isDemo": False,
+            "isAuto": False,
             "deviceId": "d",
             "attempt": 12,
             "traceId": "t",
@@ -176,7 +196,7 @@ class TestPiiSealing:
             "language": "ko",
             "createdAt": "2026-07-03T00:00:00.000Z",
             "isDeleted": False,
-            "isDemo": False,
+            "isAuto": False,
             "deviceId": "d",
             "attempt": 1,
             "traceId": "t",
