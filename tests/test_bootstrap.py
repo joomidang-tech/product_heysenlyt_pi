@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from senlyt_pi.adapters.device_identity_store import DeviceIdentity, DeviceIdentityStore
@@ -15,6 +17,8 @@ from senlyt_pi.adapters.sy01b_engine_adapter import Sy01bEngineAdapter
 from senlyt_pi.adapters.valve_adapter import FakeValveAdapter
 from senlyt_pi.app.bootstrap import (
     BootstrapError,
+    _identity_path,
+    _server_slug,
     build_components,
     build_engine,
     build_valve,
@@ -182,3 +186,47 @@ def test_pump_map_empty_env_is_empty_map() -> None:
     """미설정 → 빈 매핑(= 전 스텝 drop). install.sh 가 이 값을 반드시 각인해야 하는 이유."""
     assert pump_map_from_addresses_env(None) == {}
     assert pump_map_from_addresses_env("") == {}
+
+
+class TestPerEnvIdentityPath:
+    """환경별 정체성 파일(2026-07-23) — 서버 URL 로 파일명을 파생해 서버마다 신분증을 따로 둔다."""
+
+    def test_server_slug_from_url(self) -> None:
+        assert _server_slug("https://dev-env.senlyt.com") == "dev-env.senlyt.com"
+        assert _server_slug("https://v1-2-0.env.senlyt.com") == "v1-2-0.env.senlyt.com"
+        assert _server_slug("https://senlyt.com/") == "senlyt.com"
+        assert _server_slug("http://localhost:8080") == "localhost_8080"  # 포트 `:` → `_`
+        assert _server_slug("dev-env.senlyt.com") == "dev-env.senlyt.com"  # 스킴 없어도
+        assert _server_slug("") == "default"
+
+    def test_identity_path_per_server(self) -> None:
+        """server_base_url 다르면 파일 경로도 다르다(= 각 서버 신분증 분리)."""
+        env = {"SENLYT_STATE_DIR": "/var/lib/senlyt"}
+        dev = _identity_path(env, "https://dev-env.senlyt.com")
+        v120 = _identity_path(env, "https://v1-2-0.env.senlyt.com")
+        prod = _identity_path(env, "https://senlyt.com")
+        assert str(dev) == "/var/lib/senlyt/identities/dev-env.senlyt.com.json"
+        assert str(v120) == "/var/lib/senlyt/identities/v1-2-0.env.senlyt.com.json"
+        assert str(prod) == "/var/lib/senlyt/identities/senlyt.com.json"
+        assert dev != v120 != prod  # 서버별 분리 = 전환해도 서로 안 덮음.
+
+    def test_explicit_path_overrides(self) -> None:
+        """SENLYT_IDENTITY_PATH 명시 시 그 단일 파일로 고정(하위호환 override — 서버 파생 무시)."""
+        env = {"SENLYT_IDENTITY_PATH": "/custom/id.json", "SENLYT_STATE_DIR": "/var/lib/senlyt"}
+        assert str(_identity_path(env, "https://dev-env.senlyt.com")) == "/custom/id.json"
+
+    def test_no_server_falls_back_to_single_file(self) -> None:
+        """서버 미상(구 폴백) → 단일 device-identity.json."""
+        env = {"SENLYT_STATE_DIR": "/var/lib/senlyt"}
+        assert str(_identity_path(env)) == "/var/lib/senlyt/device-identity.json"
+
+    def test_state_dir_precedence(self) -> None:
+        """base = SENLYT_STATE_DIR > LOG_DIR > cwd."""
+        env = {"SENLYT_STATE_DIR": "/var/lib/senlyt", "LOG_DIR": "/var/log/senlyt"}
+        assert _identity_path(env, "https://senlyt.com").parent == Path(
+            "/var/lib/senlyt/identities"
+        )
+        env2 = {"LOG_DIR": "/var/log/senlyt"}  # state 없으면 log_dir
+        assert _identity_path(env2, "https://senlyt.com").parent == Path(
+            "/var/log/senlyt/identities"
+        )

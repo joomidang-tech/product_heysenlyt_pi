@@ -90,7 +90,11 @@ SENLYT_SERVER_BASE_URL=$SERVER_URL
 SENLYT_RUN=1
 LOG_DIR=$LOG_DIR
 SENLYT_LEDGER_PATH=$STATE_DIR/queue/idempotency-ledger.log
-SENLYT_IDENTITY_PATH=$STATE_DIR/device-identity.json
+# 정체성은 **서버(환경)별로 분리** 저장한다($STATE_DIR/identities/{서버host}.json) — 데몬이 이 STATE_DIR 밑에
+#   서버 URL 로 파일명을 파생한다. 그래서 서버를 바꿔 재설치해도 각 서버의 등록·승인이 보존되고,
+#   다시 그 서버로 돌아오면 재승인 없이 즉시 재사용된다(2026-07-23). (SENLYT_IDENTITY_PATH 를 명시하면
+#   그 단일 파일로 고정 — 하위호환 override.)
+SENLYT_STATE_DIR=$STATE_DIR
 # 펌프 RS485 주소 → RecipeResolver pump_map(부트스트랩). 없으면 pump_map 이 비어
 # 모든 레시피 스텝이 CMD_VALIDATION_FAILED 로 drop(토출 0)되어 주문이 실패한다.
 #   flavor(식향)=addr 1,2(시린지 2펌프) · fragrance(향장향)=addr 1,2,3(3펌프).
